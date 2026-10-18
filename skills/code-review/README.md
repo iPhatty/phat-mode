@@ -9,5 +9,5 @@ phat-mode's two reviewers always follow this copy, on every repo. A copy install
 To upgrade:
 
 1. Copy the new upstream `SKILL.md` here.
-2. Update the commit above and `PINNED` in `src/code-review.ts`.
+2. Update the commit above and `MATTPOCOCK_SKILLS` in `src/skills.ts` (shared with `pr`).
 3. Run `npm test`. It fails if the skill's layout changed so that the briefs or the smell baseline can no longer be read.

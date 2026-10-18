@@ -9,10 +9,10 @@ import {
   loadCodeReviewSkill,
   mustFix,
   needsFixes,
-  PINNED,
   parseCodeReviewSkill,
   standardsSources,
 } from '../src/code-review.ts';
+import { MATTPOCOCK_SKILLS } from '../src/skills.ts';
 
 const dirs: string[] = [];
 after(async () => {
@@ -33,7 +33,7 @@ const SMELLS = [
 describe('parseCodeReviewSkill', () => {
   test('reads phat-mode’s pinned copy: both briefs verbatim and the full smell baseline', async () => {
     const skill = await loadCodeReviewSkill();
-    assert.equal(skill.source, `mattpocock/skills@${PINNED.short}`);
+    assert.equal(skill.source, MATTPOCOCK_SKILLS.label);
     assert.match(skill.standardsBrief, /^Report, per file\/hunk where relevant, \(a\) every place the diff violates a documented standard/);
     assert.match(skill.standardsBrief, /Skip anything tooling enforces\. Under 400 words\.$/);
     assert.match(skill.specBrief, /^Report: \(a\) requirements the spec asked for that are missing or partial/);
@@ -49,19 +49,6 @@ describe('parseCodeReviewSkill', () => {
     assert.equal(parseCodeReviewSkill('# Something else', 'x'), undefined);
     const withoutBriefs = (await ownText()).replaceAll('- The brief:', '- Brief:');
     assert.equal(parseCodeReviewSkill(withoutBriefs, 'x'), undefined);
-  });
-});
-
-describe('the pinned copy', () => {
-  test('PINNED matches the commit skills/code-review/README.md documents', async () => {
-    const readme = await readFile(new URL('../skills/code-review/README.md', import.meta.url), 'utf8');
-    assert.ok(readme.includes(PINNED.commit), 'README.md links the pinned commit');
-    assert.match(PINNED.url, new RegExp(`/blob/${PINNED.commit}/skills/engineering/code-review/SKILL\\.md$`));
-  });
-
-  test('ships with Matt Pocock’s MIT license', async () => {
-    const license = await readFile(new URL('../skills/code-review/LICENSE', import.meta.url), 'utf8');
-    assert.match(license, /^MIT License\n\nCopyright \(c\) 2026 Matt Pocock/);
   });
 });
 

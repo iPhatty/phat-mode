@@ -14,6 +14,7 @@ import {
   type DoneReport,
   modelRole,
   type PlanReport,
+  type PrReport,
   type Report,
   ReportsDoc,
   ROLE_TOOLS,
@@ -31,6 +32,7 @@ import {
 } from './code-review.ts';
 import { eligibility, type Spec } from './spec.ts';
 import { branchFor, type Config, modelFor } from './config.ts';
+import { prSkill } from './pr.ts';
 import { commentMarker, type GitHub, type Issue, mergeLabels, progressChange } from './github.ts';
 import type { Logger } from './log.ts';
 import {
@@ -48,6 +50,7 @@ import {
   implementPrompt,
   NUDGE,
   planPrompt,
+  describePrompt,
   ROLE_INSTRUCTIONS,
   specReviewPrompt,
   standardsReviewPrompt,
@@ -65,7 +68,7 @@ export type Services = {
 export type PipelineInput = { repo: string; issue: number };
 
 type Conversations = Record<Agent, ConversationId>;
-type ReportData = { plan: PlanReport; done: DoneReport; standards: StandardsReport; spec: SpecReport };
+type ReportData = { plan: PlanReport; done: DoneReport; pr: PrReport; standards: StandardsReport; spec: SpecReport };
 
 /** Known once the workspace is ready. `spec`: what to build, from an Agent Brief or the issue body. */
 type Setup = { issue: Issue; spec: Spec; workspace: string; conversations: Conversations };
@@ -88,8 +91,10 @@ export type PipelineState =
   | (Work & { phase: 'verify' })
   /** `baseline`: per reviewer, as for implement. */
   | (Work & { phase: 'review'; baseline: { standards: number; spec: number } })
-  /** `unresolved`: the last review still had findings that must be fixed. */
-  | (Work & { phase: 'publish'; review: CodeReview | null; unresolved: boolean })
+  /** `unresolved`: the last review still had findings that must be fixed. `baseline`: as for implement. */
+  | (Work & { phase: 'describe'; review: CodeReview | null; unresolved: boolean; baseline: number })
+  /** `pr`: the description the implementer wrote, following the pr skill; null if it did not report one. */
+  | (Work & { phase: 'publish'; review: CodeReview | null; unresolved: boolean; pr: PrReport | null })
   | { phase: 'fail'; issue: number; reason: string };
 
 export type PipelineResult =
@@ -199,6 +204,15 @@ export function createPipeline(services: Services) {
       context,
     );
   };
+
+  /** The last step before publishing: the implementer writes the pull request description. */
+  const toDescribe = (runtime: Runtime, state: Work, review: CodeReview | null, unresolved: boolean, context: Context) =>
+    goWithBaseline(
+      runtime,
+      state.conversations.implement,
+      (baseline) => ({ ...work(state), phase: 'describe', review, unresolved, baseline }),
+      context,
+    );
 
   const work = <S extends Work>(state: S): Work => ({
     issue: state.issue,
@@ -415,15 +429,45 @@ export function createPipeline(services: Services) {
           number,
           `Review: Standards ${axisCount(review.standards)}, Spec ${axisCount(review.spec)}; ${fix.standards.length + fix.spec.length} must fix`,
         );
-        if (!needsFixes(review)) {
-          await go(runtime, { ...work(state), phase: 'publish', review, unresolved: false }, context);
-          return;
-        }
-        if (round >= limits.maxReviewRounds) {
-          await go(runtime, { ...work(state), phase: 'publish', review, unresolved: true }, context);
+        if (!needsFixes(review) || round >= limits.maxReviewRounds) {
+          await toDescribe(runtime, state, review, needsFixes(review), context);
           return;
         }
         await toImplement(runtime, work(state), fixReviewPrompt(review), context);
+      }),
+
+      describe: guarded<'describe'>(async (task, runtime, context) => {
+        const state = task.state.checkpoint;
+        const number = state.issue.number;
+        logger.step(number, `Writing the pull request description (${modelFor(config, 'implement').modelId})`);
+        const before = await workspaces.fingerprint(state.workspace);
+        const pr = await askForReport(
+          runtime,
+          {
+            conversation: state.conversations.implement,
+            requestId: `describe-${state.runs}`,
+            prompt: describePrompt(await prSkill(), state.unresolved),
+            baseline: state.baseline,
+            type: 'pr',
+            tool: 'report_pr',
+          },
+          context,
+        );
+        if ((await workspaces.fingerprint(state.workspace)) !== before) {
+          // Changes made now were neither checked nor reviewed: check and review them, as a new implementer run.
+          logger.step(number, 'Files changed while writing the description; verifying and reviewing again');
+          if (state.runs >= limits.maxImplementRuns) {
+            throw new StepFailure(`Stopped after ${state.runs} implementation attempts.`);
+          }
+          await go(runtime, { ...work(state), runs: state.runs + 1, phase: 'verify' }, context);
+          return;
+        }
+        if (pr === undefined) logger.step(number, 'No description reported; using a plain one');
+        await go(
+          runtime,
+          { ...work(state), phase: 'publish', review: state.review, unresolved: state.unresolved, pr: pr ?? null },
+          context,
+        );
       }),
 
       publish: guarded<'publish'>(async (task, runtime, context) => {
@@ -442,6 +486,7 @@ export function createPipeline(services: Services) {
           spec: state.spec,
           plan: state.plan,
           done: state.done ?? undefined,
+          pr: state.pr ?? undefined,
           review: state.review ?? undefined,
           unresolved: state.unresolved,
           checkCommand: config.checkCommand,

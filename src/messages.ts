@@ -1,5 +1,7 @@
-import type { DoneReport, PlanReport } from './agents.ts';
-import { type AxisReport, type CodeReview, needsFixes, PINNED, type SpecFinding, type StandardsFinding } from './code-review.ts';
+import type { DoneReport, PlanReport, PrReport } from './agents.ts';
+import { type AxisReport, type CodeReview, needsFixes, type SpecFinding, type StandardsFinding } from './code-review.ts';
+import type { Evidence } from './pr.ts';
+import { MATTPOCOCK_SKILLS } from './skills.ts';
 import type { Spec } from './spec.ts';
 import type { Issue } from './github.ts';
 
@@ -63,7 +65,7 @@ export function doneComment(prUrl: string): string {
   return `🤖 **phat-mode opened a draft pull request:** ${prUrl}`;
 }
 
-const SKILL_LINK = `[code-review @ ${PINNED.short}](${PINNED.url})`;
+const SKILL_LINK = `[code-review @ ${MATTPOCOCK_SKILLS.short}](${MATTPOCOCK_SKILLS.url('code-review')})`;
 
 const standardsItem = (finding: StandardsFinding) =>
   finding.kind === 'violation'
@@ -110,6 +112,8 @@ export type PullRequestDetails = {
   spec: Spec;
   plan: PlanReport;
   done: DoneReport | undefined;
+  /** The description the implementer wrote, following the pr skill; undefined if it did not. */
+  pr: PrReport | undefined;
   /** The last code review round; undefined when there was none. */
   review: CodeReview | undefined;
   /** The last review still had findings that must be fixed. */
@@ -121,9 +125,51 @@ export function pullRequestTitle(issue: Issue): string {
   return `${issue.title} (#${issue.number})`;
 }
 
+/** Continuation lines of a list item, indented so multi-line Markdown stays inside it. */
+const indent = (text: string) => text.trim().replaceAll('\n', '\n  ');
+
+/** The evidence, by source: the implementer's before/after, then what phat-mode ran itself. */
+export function evidence(details: Pick<PullRequestDetails, 'pr' | 'done' | 'checkCommand'>): Evidence[] {
+  const { pr, done, checkCommand } = details;
+  const claimed: Evidence[] =
+    pr !== undefined
+      ? pr.evidence.map((item) => ({ source: 'implementer', ...item }))
+      : done?.testing
+        ? [{ source: 'implementer', before: '', after: done.testing }]
+        : [];
+  return [...claimed, { source: 'phat-mode', before: '', after: `\`${checkCommand}\` passes on this code.` }];
+}
+
+function evidenceItem(item: Evidence): string {
+  if (item.source === 'phat-mode') return `- ✅ **Verified by phat-mode:** ${indent(item.after)}`;
+  const after = `**After:** ${indent(item.after)}`;
+  return item.before.trim() ? `- **Before:** ${indent(item.before)}\n  ${after}` : `- ${after}`;
+}
+
+function mergeDanger(pr: PrReport | undefined): string {
+  if (pr === undefined) return '## Merge Danger\n\nNot assessed: the implementer did not write a description.';
+  return [
+    '## Merge Danger',
+    `**Door:** ${pr.door}`,
+    pr.doorNote.trim(),
+    `**Blast Radius:** ${pr.blastRadius.trim()}`,
+    pr.blastNote.trim(),
+  ]
+    .filter((part) => part !== '')
+    .join('\n\n');
+}
+
+/**
+ * mattpocock/skills' `pr` template (Summary, Evidence, Merge Danger), then what phat-mode adds: the acceptance
+ * criteria to tick off, the code review, and the issue link.
+ */
 export function pullRequestBody(details: PullRequestDetails): string {
-  const { issue, spec, plan, done, review, unresolved, checkCommand } = details;
-  const sections = [`Closes #${issue.number}`, `## Summary\n\n${done?.summary ?? plan.summary}`];
+  const { issue, spec, plan, done, pr, review, unresolved } = details;
+  const sections = [
+    `## Summary\n\n${pr?.summary.trim() || done?.summary || plan.summary}`,
+    `## Evidence\n\n${evidence(details).map(evidenceItem).join('\n')}`,
+    mergeDanger(pr),
+  ];
   if (spec.acceptanceCriteria.length > 0) {
     const from = spec.source === 'brief' ? 'the Agent Brief' : 'the issue';
     sections.push(
@@ -132,11 +178,9 @@ export function pullRequestBody(details: PullRequestDetails): string {
         .join('\n')}`,
     );
   }
-  sections.push(
-    `## Plan\n\n${list(plan.plan)}`,
-    `## Testing\n\n${done?.testing ? `${done.testing}\n\n` : ''}✅ \`${checkCommand}\` passes.`,
-  );
   if (review !== undefined) sections.push(codeReviewSection(review, unresolved));
-  sections.push('---\n🤖 Opened by phat-mode. This is a draft: a human must review and merge it.');
+  sections.push(
+    `---\nCloses #${issue.number}\n\n🤖 Opened by phat-mode. Description written following the [pr @ ${MATTPOCOCK_SKILLS.short}](${MATTPOCOCK_SKILLS.url('pr')}) skill. This is a draft: a human must review and merge it.`,
+  );
   return sections.join('\n\n');
 }

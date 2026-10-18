@@ -7,6 +7,7 @@ import {
   type SpecFinding,
   type StandardsFinding,
 } from './code-review.ts';
+import type { PrSkill } from './pr.ts';
 import type { Spec } from './spec.ts';
 import type { Issue } from './github.ts';
 
@@ -194,3 +195,20 @@ Report by calling report_spec: one finding per item, kind "missing" for (a), "un
 
 export const NUDGE = (tool: string) =>
   `You ended your turn without calling ${tool}. Call ${tool} now with your result.`;
+
+export function describePrompt(skill: PrSkill, unresolved: boolean): string {
+  return `Your change passed the checks and the code review. Now write the pull request description, following the \`pr\` skill below. Do not change any files: the code is final.
+
+<skill name="pr" source="${skill.source}">
+${skill.text}
+</skill>
+
+How the skill applies here:
+- The skill mentions GLOSSARY.md: use the repo's domain glossary if it has one (GLOSSARY.md, CONTEXT.md or similar), otherwise the words the spec and the code use.
+- Evidence: there is no way to take screenshots here, so use execution-based evidence: the test that failed before and passes now (as pseudocode), and output you ran. Only evidence you actually observed; never invent output. phat-mode adds the result of its own check run, so do not repeat that.
+- Leave out \`Closes #…\`, the acceptance criteria and the code review: phat-mode adds those.${
+    unresolved ? '\n- Some code review findings are still open. Let Merge Danger reflect them.' : ''
+  }
+
+Finish by calling report_pr with each section of the template.`;
+}

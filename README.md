@@ -17,7 +17,8 @@ phat-mode is the **AFK agent** in a [mattpocock/skills](https://github.com/mattp
 3. **Implement** (AI, Claude Opus 5.5): changes the code and adds tests.
 4. **Verify** (code, not AI): runs `npm run check`. On failure, the output goes back to the implementer (up to 3 times).
 5. **Code review** (GPT-6.1 Sol, a different model family, read-only): two reviewers in parallel, following Matt Pocock's [code-review](https://github.com/mattpocock/skills/blob/main/skills/engineering/code-review/SKILL.md) skill. See [Code review](#code-review).
-6. **Publish** (code): commits, pushes, and opens a **draft** PR that closes the issue, lists the acceptance criteria for you to tick off, and is labelled `ready-for-human`.
+6. **Describe** (AI, the implementer): writes the PR description following Matt Pocock's [pr](https://github.com/mattpocock/skills/blob/main/skills/engineering/pr/SKILL.md) skill: **Summary** (the smallest diagram that makes the point), **Evidence** (before and after) and **Merge Danger** (one- or two-way door, blast radius). It must not change files; if it does, the change is checked and reviewed again.
+7. **Publish** (code): commits, pushes, and opens a **draft** PR labelled `ready-for-human`. The description is the pr skill's three sections, then what phat-mode adds: its own verified check result under Evidence, the acceptance criteria to tick off, the code review, and `Closes #N`.
 
 It never merges and never pushes to `main`. You review and merge every PR.
 
@@ -58,7 +59,11 @@ Each reviewer gets the skill's brief verbatim, from **phat-mode's own pinned cop
 - The **review process** belongs to phat-mode: identical on every repo, and exactly what the tests cover. The code under review cannot change how it is reviewed.
 - **What good code means** belongs to each repo: its `AGENTS.md`, `CONTRIBUTING.md` and similar, which the Standards reviewer reads. A documented repo rule overrides a baseline smell, as the skill says.
 
-To upgrade the skill: copy the new upstream `SKILL.md` into `skills/code-review/`, update `PINNED` in `src/code-review.ts` and the commit in `skills/code-review/README.md`, and run `npm test` (it fails if the skill's layout changed).
+Both of Matt's skills (`code-review`, `pr`) are pinned together in `skills/`. To upgrade: copy the new upstream files in, update `MATTPOCOCK_SKILLS` in `src/skills.ts` and the commit in each `skills/*/README.md`, and run `npm test` (it fails if a skill's layout changed).
+
+### Evidence
+
+Each piece of evidence in the PR records who supplied it: the implementer's before/after (what it says it observed), and phat-mode's own check run (verified). A verification agent is planned next; its evidence will be added as its own source.
 
 The skill gives no verdict, so phat-mode decides:
 
@@ -146,6 +151,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 
 - `src/pipeline.ts`: the durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again.
 - `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
+- `src/skills.ts`: the pinned mattpocock/skills version. `src/pr.ts`: the pr skill and evidence sources.
 - `src/code-review.ts`: reads phat-mode's pinned code-review skill, finds standards sources, and decides what must be fixed.
 - `src/agents.ts`: the four agents (planner, implementer, Standards and Spec reviewers), their tools, the report tools agents finish with, and the guard hook.
 - `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code.

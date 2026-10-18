@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { FileCredentialStore, importPiCredential } from '../src/credentials.ts';
 import { agentEnv } from '../src/exec.ts';
-import { pullRequestBody } from '../src/messages.ts';
+import { evidence, pullRequestBody } from '../src/messages.ts';
 
 const issue = { number: 7, title: 'Save progress', body: '', author: 'iPhatty', state: 'OPEN' as const, url: '', labels: [], comments: [] };
 const spec = { source: 'issue' as const, author: 'iPhatty', text: '', acceptanceCriteria: [], outOfScope: [], blockedBy: [] };
@@ -17,27 +17,42 @@ describe('pullRequestBody', () => {
     spec,
     plan,
     done: { summary: 'Progress is saved with AsyncStorage.', testing: 'Added progress tests.' },
+    pr: {
+      summary: '```text\non(lessonComplete)\n  save progress\n```',
+      evidence: [{ before: '```text\nFAIL progress-test.ts\n```', after: '```text\nPASS progress-test.ts\n```' }],
+      door: 'two-way' as const,
+      doorNote: '',
+      blastRadius: 'progress',
+      blastNote: 'Only learners with saved progress.',
+    },
+    review: undefined,
+    unresolved: false,
     checkCommand: 'npm run check',
   };
 
-  test('links the issue and lists summary, plan, testing and the code review', () => {
+  test('the pr skill’s template first, then acceptance criteria, code review and the issue link', () => {
     const body = pullRequestBody({
       ...details,
+      spec: { ...spec, acceptanceCriteria: ['Progress survives a restart'] },
       review: {
         round: 1,
         standards: { summary: 'Follows AGENTS.md.', worst: '', findings: [] },
         spec: { summary: 'Does what the issue asks.', worst: '', findings: [] },
       },
-      unresolved: false,
     });
-    assert.match(body, /^Closes #7/);
-    assert.match(body, /Progress is saved with AsyncStorage\./);
-    assert.match(body, /- Add storage\n- Test it/);
-    assert.match(body, /`npm run check` passes/);
+    const headings = [...body.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+    assert.deepEqual(headings, ['Summary', 'Evidence', 'Merge Danger', 'Acceptance criteria', 'Code review']);
+    assert.match(body, /^## Summary\n\n```text\non\(lessonComplete\)\n  save progress\n```/);
+    // Multi-line evidence stays inside its list item.
+    assert.match(
+      body,
+      /## Evidence\n\n- \*\*Before:\*\* ```text\n  FAIL progress-test\.ts\n  ```\n  \*\*After:\*\* ```text\n  PASS progress-test\.ts\n  ```\n- ✅ \*\*Verified by phat-mode:\*\* `npm run check` passes on this code\./,
+    );
+    assert.match(body, /## Merge Danger\n\n\*\*Door:\*\* two-way\n\n\*\*Blast Radius:\*\* progress\n\nOnly learners with saved progress\./);
+    assert.match(body, /- \[ \] Progress survives a restart/);
     assert.match(body, /after 1 round\. ✅ Nothing that must be fixed/);
-    assert.match(body, /### Standards\n\nFollows AGENTS\.md\.\n\n### Spec\n\nDoes what the issue asks\./);
-    assert.match(body, /\*\*Summary:\*\* Standards: no findings\. Spec: no findings\./);
-    assert.doesNotMatch(body, /Acceptance criteria/, 'no brief, no criteria section');
+    assert.match(body, /---\nCloses #7\n\n🤖 Opened by phat-mode\./);
+    assert.doesNotMatch(body, /## Plan|## Testing/);
   });
 
   test('flags must-fix findings that are still open; keeps the axes apart; notes a missing report', () => {
@@ -67,9 +82,24 @@ describe('pullRequestBody', () => {
     assert.doesNotMatch(body, /Nothing that must be fixed/);
   });
 
-  test('without a review: no review section', () => {
-    const body = pullRequestBody({ ...details, review: undefined, unresolved: false });
+  test('without a description or a review: plain summary, implementer’s testing as evidence', () => {
+    const body = pullRequestBody({ ...details, pr: undefined });
+    assert.match(body, /^## Summary\n\nProgress is saved with AsyncStorage\./);
+    assert.match(body, /## Evidence\n\n- \*\*After:\*\* Added progress tests\.\n- ✅ \*\*Verified by phat-mode:\*\*/);
+    assert.match(body, /Not assessed/);
     assert.doesNotMatch(body, /Code review/);
+  });
+});
+
+describe('evidence', () => {
+  test('records who supplied each piece, so a verifier can add its own later', () => {
+    assert.deepEqual(evidence({ pr: details().pr, done: undefined, checkCommand: 'npm test' }), [
+      { source: 'implementer', before: 'a', after: 'b' },
+      { source: 'phat-mode', before: '', after: '`npm test` passes on this code.' },
+    ]);
+  });
+  const details = () => ({
+    pr: { summary: '', evidence: [{ before: 'a', after: 'b' }], door: 'two-way' as const, doorNote: '', blastRadius: 'x', blastNote: '' },
   });
 });
 

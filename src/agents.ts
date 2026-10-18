@@ -46,9 +46,23 @@ export type PlanReport = {
 };
 export type DoneReport = { summary: string; testing: string };
 
+/** The pull request description, following mattpocock/skills' `pr` skill. Written by the implementer, last. */
+export type PrReport = {
+  /** Markdown: the smallest view that makes the key point clear (pseudocode, a tree, Mermaid, a diff-sketch…). */
+  summary: string;
+  /** Before and after, each as Markdown. */
+  evidence: { before: string; after: string }[];
+  door: 'one-way' | 'two-way';
+  doorNote: string;
+  /** One word. */
+  blastRadius: string;
+  blastNote: string;
+};
+
 export type Report =
   | { type: 'plan'; data: PlanReport }
   | { type: 'done'; data: DoneReport }
+  | { type: 'pr'; data: PrReport }
   | { type: 'standards'; data: StandardsReport }
   | { type: 'spec'; data: SpecReport };
 
@@ -102,6 +116,35 @@ export const reportDone = defineTool({
       (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'done', data: { ...args } });
     }, context);
     return recorded('Done recorded.');
+  },
+});
+
+export const reportPr = defineTool({
+  name: 'report_pr',
+  description: 'Report the pull request description. Call this exactly once, as your final action.',
+  parameters: Type.Object({
+    summary: Type.String({
+      description: 'The Summary section, in Markdown, without its heading: the smallest view that makes the key point clear.',
+    }),
+    evidence: Type.Array(
+      Type.Object({
+        before: Type.String({ description: 'Markdown: the behaviour, output or failing test run before the change.' }),
+        after: Type.String({ description: 'Markdown: the same after the change.' }),
+      }),
+      { description: 'Before and after evidence you actually observed. Never invent output.' },
+    ),
+    door: StringEnum(['one-way', 'two-way'], {
+      description: 'two-way: cheap to walk back. one-way: destructive or hard to reverse.',
+    }),
+    doorNote: Type.String({ description: 'Optional description of the door. Empty if none.' }),
+    blastRadius: Type.String({ description: 'One word for the potential impact or scope of the change.' }),
+    blastNote: Type.String({ description: 'Optional: potential ramifications of merging. Empty if none.' }),
+  }),
+  execute: async (args, api, context) => {
+    await api.commit(async (tx) => {
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'pr', data: { ...args } as PrReport });
+    }, context);
+    return recorded('Pull request description recorded.');
   },
 });
 
@@ -175,7 +218,7 @@ export const tools = {
 /** The tools each role may use. Only the implementer can change files. */
 export const ROLE_TOOLS: Record<Agent, ToolRegistration[]> = {
   plan: [tools.read, tools.bash, reportPlan],
-  implement: [tools.read, tools.bash, tools.write, tools.edit, reportDone],
+  implement: [tools.read, tools.bash, tools.write, tools.edit, reportDone, reportPr],
   standards: [tools.read, tools.bash, reportStandards],
   spec: [tools.read, tools.bash, reportSpec],
 };
@@ -220,5 +263,5 @@ export const Guard = defineExtension({
 
 export const Tools: Extension = defineExtension({
   name: 'phat.tools',
-  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportDone, reportStandards, reportSpec],
+  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportDone, reportPr, reportStandards, reportSpec],
 });
