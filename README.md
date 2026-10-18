@@ -13,10 +13,10 @@ phat-mode is the **AFK agent** in a [mattpocock/skills](https://github.com/mattp
 ```
 
 1. **Prepare**: only works on issues that are open, labelled `ready-for-agent`, specified by a trusted author, and not blocked by open issues. Anything else is left alone, with no reply. Labels it `phat-mode:working` and checks out branch `phat-mode/issue-12` in its own workspace.
-2. **Plan** (AI): reads the spec and the code, and plans *how* to build it. If the spec has a gap, it posts triage notes and moves the issue back to `needs-info`. If an agent shouldn't do it, it moves it to `ready-for-human`.
-3. **Implement** (AI): changes the code and adds tests.
+2. **Plan** (AI, Claude Opus 5.5): reads the spec and the code, and plans *how* to build it. If the spec has a gap, it posts triage notes and moves the issue back to `needs-info`. If an agent shouldn't do it, it moves it to `ready-for-human`.
+3. **Implement** (AI, Claude Opus 5.5): changes the code and adds tests.
 4. **Verify** (code, not AI): runs `npm run check`. On failure, the output goes back to the implementer (up to 3 times).
-5. **Review** (a different AI model, read-only): checks the diff against the acceptance criteria and the out-of-scope list. Findings go back to the implementer (up to 2 rounds).
+5. **Review** (GPT-6.1 Sol, a different model family, read-only): checks the diff against the acceptance criteria and the out-of-scope list. Findings go back to the implementer (up to 2 rounds).
 6. **Publish** (code): commits, pushes, and opens a **draft** PR that closes the issue, lists the acceptance criteria for you to tick off, and is labelled `ready-for-human`.
 
 It never merges and never pushes to `main`. You review and merge every PR.
@@ -73,7 +73,29 @@ Only one phat-mode process can use `~/.phat-mode` at a time (Pi Durable storage 
 
 ## Configuration
 
-Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`src/config.ts`](src/config.ts):
+Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`src/config.ts`](src/config.ts).
+
+### Models
+
+Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**) unless `models` overrides it for its role (`plan`, `implement`, `review`). Built in, `review` uses **GPT-6.1 Sol**, so a different model family checks the code.
+
+```json
+{
+  "defaultModel": { "provider": "github-copilot", "modelId": "claude-opus-5.5", "thinkingLevel": "medium" },
+  "models": {
+    "implement": { "thinkingLevel": "high" },
+    "review": { "modelId": "gpt-6.1-sol" }
+  }
+}
+```
+
+- An override only needs the fields it changes; the rest come from `defaultModel`.
+- `"review": null` drops the built-in reviewer model, so it follows `defaultModel`.
+- `thinkingLevel`: `minimal`, `low`, `medium` or `high`.
+- `node src/cli.ts doctor` shows the model each role uses and checks it is on your Copilot account.
+- A run keeps the models it started with, also when resumed. New runs use the new config.
+
+### Everything else
 
 ```json
 {
@@ -81,10 +103,6 @@ Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`sr
   "allowedAuthors": ["iPhatty"],
   "labels": { "readyForAgent": "ready-for-agent", "readyForHuman": "ready-for-human", "needsInfo": "needs-info" },
   "checkCommand": "npm run check",
-  "models": {
-    "implement": { "provider": "github-copilot", "modelId": "claude-sonnet-5.5" },
-    "review": { "provider": "github-copilot", "modelId": "gpt-6.1-sol" }
-  },
   "limits": { "maxCheckFixes": 3, "maxReviewRounds": 2 }
 }
 ```

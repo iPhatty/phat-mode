@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline/promises';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import type { TaskId } from '@earendil-works/pi-durable';
 import { setToolLogger } from './agents.ts';
-import { type Config, loadConfig, paths } from './config.ts';
+import { type Config, loadConfig, modelFor, paths, ROLES } from './config.ts';
 import { FileCredentialStore, importPiCredential } from './credentials.ts';
 import { run } from './exec.ts';
 import { GhGitHub } from './github.ts';
@@ -150,13 +150,14 @@ async function doctor(config: Config): Promise<number> {
     return `via ${auth.source}`;
   });
   if (!signedIn) return 1;
-  for (const [role, choice] of Object.entries(config.models)) {
+  for (const role of ROLES) {
+    const choice = modelFor(config, role);
     await check(`model for ${role}`, async () => {
       const available = await models.getAvailable();
       if (!available.some((model) => model.provider === choice.provider && model.id === choice.modelId)) {
         throw new Error(`${choice.provider}/${choice.modelId} is not available on this account`);
       }
-      return `${choice.provider}/${choice.modelId}`;
+      return `${choice.provider}/${choice.modelId} (thinking: ${choice.thinkingLevel})`;
     });
   }
   return ok ? 0 : 1;

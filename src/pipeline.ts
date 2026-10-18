@@ -19,7 +19,7 @@ import {
   type PlanReport,
 } from './agents.ts';
 import { eligibility, type Spec } from './spec.ts';
-import { branchFor, type Config } from './config.ts';
+import { branchFor, type Config, modelFor } from './config.ts';
 import { commentMarker, type GitHub, type Issue, mergeLabels, progressChange } from './github.ts';
 import type { Logger } from './log.ts';
 import {
@@ -229,11 +229,11 @@ export function createPipeline(services: Services) {
         await runtime.commit(async (tx) => {
           const conversations = {} as Conversations;
           for (const role of ['plan', 'implement', 'review'] as const) {
-            const model = config.models[role];
+            const model = modelFor(config, role);
             const created = await tx.createConversation({ ownership: { kind: 'task', taskId: runtime.taskId } });
             await configure(tx, created.id, {
               model: { provider: model.provider, modelId: model.modelId },
-              thinkingLevel: model.thinkingLevel ?? 'medium',
+              thinkingLevel: model.thinkingLevel,
               tools: ROLE_TOOLS[role],
               instructions: ROLE_INSTRUCTIONS[role],
               cwd: workspace,
@@ -248,7 +248,7 @@ export function createPipeline(services: Services) {
       plan: guarded<'plan'>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const { issue, spec } = state;
-        logger.step(issue.number, `Plan (${config.models.plan.modelId})`);
+        logger.step(issue.number, `Plan (${modelFor(config, 'plan').modelId})`);
         const plan = await askForReport(
           runtime,
           {
@@ -290,7 +290,7 @@ export function createPipeline(services: Services) {
 
       implement: guarded<'implement'>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
-        logger.step(state.issue.number, `Implement, run ${state.runs} (${config.models.implement.modelId})`);
+        logger.step(state.issue.number, `Implement, run ${state.runs} (${modelFor(config, 'implement').modelId})`);
         const done = await askForReport(
           runtime,
           {
@@ -341,7 +341,7 @@ export function createPipeline(services: Services) {
       review: guarded<'review'>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const number = state.issue.number;
-        logger.step(number, `Review, round ${state.reviewRounds} (${config.models.review.modelId})`);
+        logger.step(number, `Review, round ${state.reviewRounds} (${modelFor(config, 'review').modelId})`);
         const before = await workspaces.fingerprint(state.workspace);
         const diff = await workspaces.diff(state.workspace);
         const review = await askForReport(

@@ -12,7 +12,8 @@ import { createBashTool, createEditTool, createReadTool, createWriteTool } from 
 import { bashBlockReason, writeBlockReason } from './guards.ts';
 import { consoleLogger, type Logger, oneLine } from './log.ts';
 
-export type Role = 'plan' | 'implement' | 'review';
+export type { Role } from './config.ts';
+import type { Role } from './config.ts';
 
 /** Who a conversation is: stored with it, so hooks know its role and workspace, also after a restart. */
 export const RoleDoc = defineDoc<{ role: Role | null; issue: number | null; workspace: string | null }>({

@@ -175,11 +175,8 @@ async function fixture() {
   const config: Config = {
     ...defaultConfig(join(dir, 'home')),
     repo: 'test/repo',
-    models: {
-      plan: { provider: 'faux', modelId: 'faux-1' },
-      implement: { provider: 'faux', modelId: 'faux-1' },
-      review: { provider: 'faux', modelId: 'faux-1' },
-    },
+    defaultModel: { provider: 'faux', modelId: 'faux-1', thinkingLevel: 'medium' },
+    models: {},
   };
   const github = new FakeGitHub();
   const checks = new FakeChecks();

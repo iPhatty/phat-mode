@@ -7,8 +7,12 @@ export type ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high';
 export type ModelChoice = {
   provider: string;
   modelId: string;
-  thinkingLevel?: ThinkingLevel;
+  thinkingLevel: ThinkingLevel;
 };
+
+/** The agents phat-mode runs. */
+export type Role = 'plan' | 'implement' | 'review';
+export const ROLES: readonly Role[] = ['plan', 'implement', 'review'];
 
 export type Config = {
   /** GitHub repository, "owner/name". */
@@ -35,11 +39,10 @@ export type Config = {
   installCommand: string;
   /** Must exit 0 before a pull request is opened. */
   checkCommand: string;
-  models: {
-    plan: ModelChoice;
-    implement: ModelChoice;
-    review: ModelChoice;
-  };
+  /** The model every role uses unless `models` overrides it. */
+  defaultModel: ModelChoice;
+  /** Per-role overrides of `defaultModel`; any field left out comes from it. */
+  models: Partial<Record<Role, Partial<ModelChoice>>>;
   limits: {
     /** Times the implementer may try to fix failing checks. */
     maxCheckFixes: number;
@@ -70,10 +73,10 @@ export function defaultConfig(home = DEFAULT_HOME): Config {
       readyForHuman: 'ready-for-human',
       wontfix: 'wontfix',
     },
+    defaultModel: { provider: 'github-copilot', modelId: 'claude-opus-5.5', thinkingLevel: 'medium' },
     models: {
-      plan: { provider: 'github-copilot', modelId: 'claude-sonnet-5.5', thinkingLevel: 'medium' },
-      implement: { provider: 'github-copilot', modelId: 'claude-sonnet-5.5', thinkingLevel: 'medium' },
-      review: { provider: 'github-copilot', modelId: 'gpt-6.1-sol', thinkingLevel: 'medium' },
+      // A different model family reviews the code, so the review is independent of the model that wrote it.
+      review: { provider: 'github-copilot', modelId: 'gpt-6.1-sol' },
     },
     limits: {
       maxCheckFixes: 3,
@@ -96,15 +99,27 @@ export async function loadConfig(home = DEFAULT_HOME): Promise<Config> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return config;
     throw error;
   }
-  const overrides = JSON.parse(text) as Partial<Config>;
+  const overrides = JSON.parse(text) as Partial<Omit<Config, 'defaultModel'>> & { defaultModel?: Partial<ModelChoice> };
   return {
     ...config,
     ...overrides,
     labels: { ...config.labels, ...overrides.labels },
-    models: { ...config.models, ...overrides.models },
+    defaultModel: { ...config.defaultModel, ...overrides.defaultModel },
+    // `null` for a role drops its built-in override, so it follows defaultModel.
+    models: Object.fromEntries(
+      ROLES.map((role) => {
+        const override = (overrides.models as Record<Role, Partial<ModelChoice> | null> | undefined)?.[role];
+        return [role, override === null ? {} : { ...config.models[role], ...override }];
+      }),
+    ),
     limits: { ...config.limits, ...overrides.limits },
     home,
   };
+}
+
+/** The model a role runs with: its override, field by field, over `defaultModel`. */
+export function modelFor(config: Pick<Config, 'defaultModel' | 'models'>, role: Role): ModelChoice {
+  return { ...config.defaultModel, ...config.models[role] };
 }
 
 export const paths = {
