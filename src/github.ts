@@ -1,5 +1,11 @@
 import { run } from './exec.ts';
 
+export type Comment = {
+  author: string;
+  body: string;
+  createdAt: string;
+};
+
 export type Issue = {
   number: number;
   title: string;
@@ -8,6 +14,7 @@ export type Issue = {
   state: 'OPEN' | 'CLOSED';
   url: string;
   labels: string[];
+  comments: Comment[];
 };
 
 export type PullRequest = {
@@ -15,18 +22,24 @@ export type PullRequest = {
   url: string;
 };
 
-/** Labels phat-mode uses to show where an issue is. Only one status label is on an issue at a time. */
-export const STATUS_LABELS = {
+/**
+ * phat-mode's own progress labels. They only say what phat-mode is doing; the issue's triage state (ready-for-agent,
+ * needs-info, ...) stays with the triage labels.
+ */
+export const PROGRESS_LABELS = {
   working: { name: 'phat-mode:working', color: 'FBCA04', description: 'phat-mode is working on this' },
   done: { name: 'phat-mode:done', color: '0E8A16', description: 'phat-mode opened a pull request' },
-  needsInfo: { name: 'phat-mode:needs-info', color: 'D876E3', description: 'phat-mode needs more detail' },
   failed: { name: 'phat-mode:failed', color: 'B60205', description: 'phat-mode could not finish' },
 } as const;
 
-export type StatusLabel = keyof typeof STATUS_LABELS;
+export type Progress = keyof typeof PROGRESS_LABELS;
+
+/** Labels to add and remove. Removing a label that is not there is fine. */
+export type LabelChange = { add?: readonly string[]; remove?: readonly string[] };
 
 /** Everything phat-mode does on GitHub. Pipeline code calls these, never the model. */
 export interface GitHub {
+  /** The issue with its labels and comments. */
   getIssue(issue: number): Promise<Issue>;
   /** Post a comment, or update the one carrying `marker`, so a rerun never posts twice. */
   upsertComment(issue: number, marker: string, body: string): Promise<void>;
@@ -34,16 +47,33 @@ export interface GitHub {
   findPullRequest(branch: string): Promise<PullRequest | undefined>;
   createDraftPullRequest(options: { branch: string; base: string; title: string; body: string }): Promise<PullRequest>;
   updatePullRequestBody(pr: number, body: string): Promise<void>;
-  setStatus(issue: number, status: StatusLabel): Promise<void>;
+  /** Change labels on an issue or pull request. Missing labels are created; existing ones are never edited. */
+  editLabels(number: number, change: LabelChange): Promise<void>;
+  /** Which of `mentioned`, and of the issue's native "blocked by" dependencies, are still open. */
+  openBlockers(issue: number, mentioned: readonly number[]): Promise<number[]>;
 }
 
 /** Hidden marker that identifies a phat-mode comment. */
 export const commentMarker = (key: string) => `<!-- phat-mode:${key} -->`;
 
+/** The label change that shows `progress` (or no progress label at all) and removes the other progress labels. */
+export function progressChange(progress: Progress | null): Required<LabelChange> {
+  const all = Object.values(PROGRESS_LABELS).map((label) => label.name);
+  const add = progress === null ? [] : [PROGRESS_LABELS[progress].name];
+  return { add, remove: all.filter((name) => !add.includes(name)) };
+}
+
+/** Merge label changes; a label both added and removed is added. */
+export function mergeLabels(...changes: LabelChange[]): Required<LabelChange> {
+  const add = [...new Set(changes.flatMap((change) => change.add ?? []))];
+  const remove = [...new Set(changes.flatMap((change) => change.remove ?? []))].filter((name) => !add.includes(name));
+  return { add, remove };
+}
+
 /** GitHub through the `gh` CLI, using its existing login. */
 export class GhGitHub implements GitHub {
   readonly #repo: string;
-  #labelsReady = false;
+  #knownLabels: Set<string> | undefined;
 
   constructor(repo: string) {
     this.#repo = repo;
@@ -55,7 +85,10 @@ export class GhGitHub implements GitHub {
 
   async getIssue(issue: number): Promise<Issue> {
     const raw = JSON.parse(
-      await this.#gh(['issue', 'view', String(issue), '-R', this.#repo, '--json', 'number,title,body,author,state,url,labels']),
+      await this.#gh([
+        'issue', 'view', String(issue), '-R', this.#repo,
+        '--json', 'number,title,body,author,state,url,labels,comments',
+      ]),
     ) as {
       number: number;
       title: string;
@@ -64,6 +97,7 @@ export class GhGitHub implements GitHub {
       state: 'OPEN' | 'CLOSED';
       url: string;
       labels: { name: string }[];
+      comments: { author: { login: string } | null; body: string; createdAt: string }[];
     };
     return {
       number: raw.number,
@@ -73,6 +107,11 @@ export class GhGitHub implements GitHub {
       state: raw.state,
       url: raw.url,
       labels: raw.labels.map((label) => label.name),
+      comments: raw.comments.map((comment) => ({
+        author: comment.author?.login ?? 'ghost',
+        body: comment.body,
+        createdAt: comment.createdAt,
+      })),
     };
   }
 
@@ -117,24 +156,53 @@ export class GhGitHub implements GitHub {
     await this.#gh(['pr', 'edit', String(pr), '-R', this.#repo, '--body-file', '-'], body);
   }
 
-  async setStatus(issue: number, status: StatusLabel): Promise<void> {
-    if (!this.#labelsReady) {
-      for (const label of Object.values(STATUS_LABELS)) {
-        await this.#gh([
-          'label', 'create', label.name, '-R', this.#repo,
-          '--color', label.color, '--description', label.description, '--force',
-        ]);
-      }
-      this.#labelsReady = true;
+  async #ensureLabel(name: string): Promise<void> {
+    if (this.#knownLabels === undefined) {
+      const labels = JSON.parse(
+        await this.#gh(['label', 'list', '-R', this.#repo, '--limit', '1000', '--json', 'name']),
+      ) as { name: string }[];
+      this.#knownLabels = new Set(labels.map((label) => label.name));
     }
-    const current = (await this.getIssue(issue)).labels;
-    const wanted = STATUS_LABELS[status].name;
-    const remove = Object.values(STATUS_LABELS)
-      .map((label) => label.name)
-      .filter((name) => name !== wanted && current.includes(name));
-    if (current.includes(wanted) && remove.length === 0) return;
-    const args = ['issue', 'edit', String(issue), '-R', this.#repo, '--add-label', wanted];
-    for (const name of remove) args.push('--remove-label', name);
-    await this.#gh(args);
+    if (this.#knownLabels.has(name)) return;
+    // Create only. Never --force: that would overwrite the colour and description someone else chose.
+    const progress = Object.values(PROGRESS_LABELS).find((label) => label.name === name);
+    const args = ['label', 'create', name, '-R', this.#repo];
+    if (progress) args.push('--color', progress.color, '--description', progress.description);
+    await run('gh', args, { allowFailure: true });
+    this.#knownLabels.add(name);
+  }
+
+  async openBlockers(issue: number, mentioned: readonly number[]): Promise<number[]> {
+    const open = new Set<number>();
+    // GitHub's native issue dependencies.
+    const native = await run('gh', ['api', `repos/${this.#repo}/issues/${issue}/dependencies/blocked_by`], { allowFailure: true });
+    if (native.code === 0) {
+      for (const blocker of JSON.parse(native.stdout) as { number: number; state: string }[]) {
+        if (blocker.state === 'open') open.add(blocker.number);
+      }
+    }
+    // "Blocked by" references written in the issue or brief.
+    for (const number of mentioned) {
+      if (open.has(number)) continue;
+      const result = await run('gh', ['api', `repos/${this.#repo}/issues/${number}`, '--jq', '.state'], { allowFailure: true });
+      // A reference that does not resolve cannot block.
+      if (result.code === 0 && result.stdout.trim() === 'open') open.add(number);
+    }
+    return [...open].sort((a, b) => a - b);
+  }
+
+  async editLabels(number: number, change: LabelChange): Promise<void> {
+    // The issues label API works for pull requests too.
+    const current = JSON.parse(await this.#gh(['api', `repos/${this.#repo}/issues/${number}/labels`])) as { name: string }[];
+    const names = new Set(current.map((label) => label.name));
+    const add = (change.add ?? []).filter((name) => !names.has(name));
+    const remove = (change.remove ?? []).filter((name) => names.has(name) && !(change.add ?? []).includes(name));
+    for (const name of add) await this.#ensureLabel(name);
+    if (add.length > 0) {
+      await this.#gh(['api', '--method', 'POST', `repos/${this.#repo}/issues/${number}/labels`, '--input', '-'], JSON.stringify({ labels: add }));
+    }
+    for (const name of remove) {
+      await this.#gh(['api', '--method', 'DELETE', `repos/${this.#repo}/issues/${number}/labels/${encodeURIComponent(name)}`]);
+    }
   }
 }

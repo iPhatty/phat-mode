@@ -7,14 +7,16 @@ import { FileCredentialStore, importPiCredential } from '../src/credentials.ts';
 import { agentEnv } from '../src/exec.ts';
 import { pullRequestBody } from '../src/messages.ts';
 
-const issue = { number: 7, title: 'Save progress', body: '', author: 'iPhatty', state: 'OPEN' as const, url: '', labels: [] };
-const triage = { decision: 'proceed' as const, kind: 'feature' as const, summary: 'Save lesson progress.', plan: ['Add storage', 'Test it'], questions: [] };
+const issue = { number: 7, title: 'Save progress', body: '', author: 'iPhatty', state: 'OPEN' as const, url: '', labels: [], comments: [] };
+const spec = { source: 'issue' as const, author: 'iPhatty', text: '', acceptanceCriteria: [], outOfScope: [], blockedBy: [] };
+const plan = { decision: 'proceed' as const, summary: 'Save lesson progress.', plan: ['Add storage', 'Test it'], established: [], questions: [], reason: '' };
 
 describe('pullRequestBody', () => {
   test('links the issue and lists summary, plan, testing and the approval', () => {
     const body = pullRequestBody({
       issue,
-      triage,
+      spec,
+      plan,
       done: { summary: 'Progress is saved with AsyncStorage.', testing: 'Added progress tests.' },
       review: { verdict: 'approve', summary: 'Looks right.', findings: [] },
       unresolved: [],
@@ -26,12 +28,14 @@ describe('pullRequestBody', () => {
     assert.match(body, /`npm run check` passes/);
     assert.match(body, /Approved by the reviewer agent/);
     assert.doesNotMatch(body, /Unresolved/);
+    assert.doesNotMatch(body, /Acceptance criteria/, 'no brief, no criteria section');
   });
 
   test('lists unresolved findings instead of an approval', () => {
     const body = pullRequestBody({
       issue,
-      triage,
+      spec,
+      plan,
       done: undefined,
       review: { verdict: 'changes', summary: '', findings: ['src/a.ts: missing test'] },
       unresolved: ['src/a.ts: missing test'],

@@ -6,18 +6,45 @@ Turns GitHub issues into **draft pull requests**, unattended. Built on [Pi Durab
 
 ## What it does
 
+phat-mode is the **AFK agent** in a [mattpocock/skills](https://github.com/mattpocock/skills) workflow. You and the skills decide *what* to build; phat-mode builds it.
+
 ```
-phat-mode run 12
+/triage, /to-tickets or /to-spec  →  issue labelled ready-for-agent  →  phat-mode run 12  →  draft PR
 ```
 
-1. **Prepare**: checks the issue was opened by an allowed author, labels it `phat-mode:working`, and checks out branch `phat-mode/issue-12` in its own workspace.
-2. **Triage** (AI): reads the issue and the code. Proceeds with a plan (posted on the issue), asks questions (`phat-mode:needs-info`), or declines.
+1. **Prepare**: only works on issues that are open, labelled `ready-for-agent`, specified by a trusted author, and not blocked by open issues. Anything else is left alone, with no reply. Labels it `phat-mode:working` and checks out branch `phat-mode/issue-12` in its own workspace.
+2. **Plan** (AI): reads the spec and the code, and plans *how* to build it. If the spec has a gap, it posts triage notes and moves the issue back to `needs-info`. If an agent shouldn't do it, it moves it to `ready-for-human`.
 3. **Implement** (AI): changes the code and adds tests.
 4. **Verify** (code, not AI): runs `npm run check`. On failure, the output goes back to the implementer (up to 3 times).
-5. **Review** (a different AI model, read-only): checks the diff. Findings go back to the implementer (up to 2 rounds).
-6. **Publish** (code): commits, pushes, opens a **draft** PR that closes the issue, and labels it `phat-mode:done`.
+5. **Review** (a different AI model, read-only): checks the diff against the acceptance criteria and the out-of-scope list. Findings go back to the implementer (up to 2 rounds).
+6. **Publish** (code): commits, pushes, and opens a **draft** PR that closes the issue, lists the acceptance criteria for you to tick off, and is labelled `ready-for-human`.
 
 It never merges and never pushes to `main`. You review and merge every PR.
+
+### The spec
+
+phat-mode builds from, in order:
+
+1. the newest **Agent Brief** comment by a trusted author (`allowedAuthors`), from `/triage`, either the `## Agent Brief` template or a short inline `Agent brief: …`. The issue body is then background.
+2. otherwise the **issue body**, if a trusted author opened the issue, as `/to-tickets` and `/to-spec` write them.
+
+Acceptance criteria, out-of-scope lists and `Blocked by` references are read from either. Blockers are also read from GitHub's native issue dependencies.
+
+### Labels
+
+| Label | Set by | Meaning |
+|---|---|---|
+| `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` | the triage skills, and phat-mode when it hands back | the issue's triage state (names configurable under `labels`) |
+| `phat-mode:working` / `phat-mode:done` / `phat-mode:failed` | phat-mode | its own progress; one at a time |
+
+| Outcome | Issue labels afterwards |
+|---|---|
+| Draft PR opened | `ready-for-agent` + `phat-mode:done` (the PR gets `ready-for-human`; the issue closes when the PR merges) |
+| Spec has gaps | `needs-info`, with triage notes in the skills' format |
+| Not for an agent | `ready-for-human`, with the reason |
+| Gave up (e.g. checks keep failing) | `ready-for-human` + `phat-mode:failed`, with the reason |
+
+To retry, label the issue `ready-for-agent` again and run it.
 
 ## Setup
 
@@ -52,6 +79,7 @@ Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`sr
 {
   "repo": "iPhatty/phatty-lingo",
   "allowedAuthors": ["iPhatty"],
+  "labels": { "readyForAgent": "ready-for-agent", "readyForHuman": "ready-for-human", "needsInfo": "needs-info" },
   "checkCommand": "npm run check",
   "models": {
     "implement": { "provider": "github-copilot", "modelId": "claude-sonnet-5.5" },
@@ -65,8 +93,8 @@ Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`sr
 
 ## Safety
 
-- Only issues opened by `allowedAuthors` are worked on; others are ignored without any reply.
-- Issue text is treated as untrusted input in every prompt.
+- Only `ready-for-agent` issues (a label only people with triage access can set) specified by `allowedAuthors` are worked on; others are ignored without any reply. Briefs from anyone else are ignored.
+- Issue and brief text is treated as untrusted input in every prompt.
 - Agents never touch git history or GitHub: `git push/commit/checkout/...` and `gh` are blocked. The pipeline does those itself.
 - Only the implementer can write files, and only inside its workspace (never `.git`).
 - Agent commands run without your tokens in their environment, and credential folders are blocked.
@@ -75,7 +103,8 @@ Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`sr
 ## How it works
 
 - `src/pipeline.ts`: the durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again.
-- `src/agents.ts`: the three roles, their tools, the report tools agents finish with, and the guard hook.
+- `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
+- `src/agents.ts`: the three roles (plan, implement, review), their tools, the report tools agents finish with, and the guard hook.
 - `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code.
 - Issue comments carry hidden markers, so a rerun updates its comment instead of posting again.
 

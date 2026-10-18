@@ -23,7 +23,7 @@ const USAGE = `phat-mode: turn GitHub issues into draft pull requests
 Usage:
   phat-mode login [--from-pi]   Sign in to GitHub Copilot (or copy the pi coding agent's login)
   phat-mode doctor              Check that everything phat-mode needs is set up
-  phat-mode run <issue>         Work on an issue until a draft PR is open (resumes if interrupted)
+  phat-mode run <issue>         Work on a ready-for-agent issue until a draft PR is open (resumes if interrupted)
   phat-mode resume              Continue every run that was interrupted
   phat-mode status              List runs and where they are
   phat-mode abort <issue>       Stop the run for an issue
@@ -69,9 +69,9 @@ function describe(result: PipelineResult): string {
     case 'pr_opened':
       return `✅ Draft pull request opened: ${result.url}`;
     case 'needs_info':
-      return '❓ The issue needs more detail. phat-mode asked questions on the issue.';
-    case 'rejected':
-      return '🚫 Triage decided not to work on this issue (see the comment on it).';
+      return '❓ The spec has gaps. phat-mode posted triage notes and moved the issue to needs-info.';
+    case 'needs_human':
+      return '🧑 phat-mode decided a human should do this and moved the issue to ready-for-human.';
     case 'ignored':
       return `⏭️  Ignored: ${result.reason}`;
   }

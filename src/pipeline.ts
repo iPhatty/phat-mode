@@ -16,28 +16,29 @@ import {
   type Role,
   ROLE_TOOLS,
   RoleDoc,
-  type TriageReport,
+  type PlanReport,
 } from './agents.ts';
+import { eligibility, type Spec } from './spec.ts';
 import { branchFor, type Config } from './config.ts';
-import { commentMarker, type GitHub, type Issue } from './github.ts';
+import { commentMarker, type GitHub, type Issue, mergeLabels, progressChange } from './github.ts';
 import type { Logger } from './log.ts';
 import {
   doneComment,
   failedComment,
+  needsHumanComment,
   needsInfoComment,
   planComment,
   pullRequestBody,
   pullRequestTitle,
-  rejectedComment,
 } from './messages.ts';
 import {
   fixChecksPrompt,
   fixReviewPrompt,
   implementPrompt,
   NUDGE,
+  planPrompt,
   ROLE_INSTRUCTIONS,
   reviewPrompt,
-  triagePrompt,
 } from './prompts.ts';
 import { type Checks, tail, type Workspaces } from './workspace.ts';
 
@@ -52,14 +53,14 @@ export type Services = {
 export type PipelineInput = { repo: string; issue: number };
 
 type Conversations = Record<Role, ConversationId>;
-type ReportData = { triage: TriageReport; done: DoneReport; review: ReviewReport };
+type ReportData = { plan: PlanReport; done: DoneReport; review: ReviewReport };
 
-/** Known once the workspace is ready. */
-type Setup = { issue: Issue; workspace: string; conversations: Conversations };
+/** Known once the workspace is ready. `spec`: what to build, from an Agent Brief or the issue body. */
+type Setup = { issue: Issue; spec: Spec; workspace: string; conversations: Conversations };
 
-/** Known once triage decided to proceed. */
+/** Known once the planner decided to proceed. */
 type Work = Setup & {
-  triage: TriageReport;
+  plan: PlanReport;
   /** Implementer runs so far; also names each run's request. */
   runs: number;
   checkFixes: number;
@@ -69,7 +70,7 @@ type Work = Setup & {
 
 export type PipelineState =
   | { phase: 'prepare' }
-  | (Setup & { phase: 'triage' })
+  | (Setup & { phase: 'plan' })
   /** `baseline`: how many reports the agent had made before this request, so only new ones count. */
   | (Work & { phase: 'implement'; prompt: string; baseline: number })
   | (Work & { phase: 'verify' })
@@ -80,7 +81,7 @@ export type PipelineState =
 export type PipelineResult =
   | { status: 'pr_opened'; url: string }
   | { status: 'needs_info' }
-  | { status: 'rejected' }
+  | { status: 'needs_human' }
   | { status: 'ignored'; reason: string };
 
 type Runtime = TaskRuntime<PipelineInput, PipelineState, PipelineResult, object>;
@@ -89,11 +90,11 @@ type Phase<P extends PipelineState['phase']> = RunningTask<PipelineInput, Extrac
 /** A failure the pipeline reports on the issue, instead of a crash. */
 class StepFailure extends Error {}
 
-const MARKERS = { triage: commentMarker('triage'), result: commentMarker('result') };
+const MARKERS = { plan: commentMarker('plan'), result: commentMarker('result') };
 
 export function createPipeline(services: Services) {
   const { config, github, workspaces, checks, logger } = services;
-  const { limits } = config;
+  const { limits, labels } = config;
 
   const go = (runtime: Runtime, next: PipelineState, context: Context) =>
     runtime.commit(() => ({ status: 'running', checkpoint: next }), context);
@@ -182,9 +183,10 @@ export function createPipeline(services: Services) {
 
   const work = <S extends Work>(state: S): Work => ({
     issue: state.issue,
+    spec: state.spec,
     workspace: state.workspace,
     conversations: state.conversations,
-    triage: state.triage,
+    plan: state.plan,
     runs: state.runs,
     checkFixes: state.checkFixes,
     reviewRounds: state.reviewRounds,
@@ -198,26 +200,35 @@ export function createPipeline(services: Services) {
     phases: {
       prepare: guarded<'prepare'>(async (task, runtime, context) => {
         const number = task.input.issue;
-        const issue = await github.getIssue(number);
-        if (!config.allowedAuthors.includes(issue.author)) {
-          // Never engage with issues from people who are not allowed to use phat-mode.
-          const reason = `#${number} was opened by ${issue.author}, who is not in allowedAuthors.`;
+        const fetched = await github.getIssue(number);
+        const eligible = eligibility(fetched, config);
+        if (!eligible.ok) {
+          // Not ready, or not specified by someone trusted: leave the issue alone, without any reply.
+          logger.error(eligible.reason);
+          await finish(runtime, { status: 'ignored', reason: eligible.reason }, context);
+          return;
+        }
+        const { spec } = eligible;
+        const blockers = await github.openBlockers(number, spec.blockedBy);
+        if (blockers.length > 0) {
+          const reason = `#${number} is blocked by ${blockers.map((blocker) => `#${blocker}`).join(', ')}, still open.`;
           logger.error(reason);
           await finish(runtime, { status: 'ignored', reason }, context);
           return;
         }
-        if (issue.state !== 'OPEN') {
-          await finish(runtime, { status: 'ignored', reason: `#${number} is closed.` }, context);
-          return;
-        }
-        logger.step(number, `Preparing workspace for "${issue.title}"`);
-        await github.setStatus(number, 'working');
+        // The spec is kept on its own; comments are not needed again.
+        const issue: Issue = { ...fetched, comments: [] };
+        logger.step(
+          number,
+          `Preparing workspace for "${issue.title}" (spec: ${spec.source === 'brief' ? `Agent Brief by ${spec.author}` : `issue body by ${spec.author}`})`,
+        );
+        await github.editLabels(number, progressChange('working'));
         const workspace = await workspaces.prepare(number);
         logger.step(number, `Workspace ready: ${workspace}`);
 
         await runtime.commit(async (tx) => {
           const conversations = {} as Conversations;
-          for (const role of ['triage', 'implement', 'review'] as const) {
+          for (const role of ['plan', 'implement', 'review'] as const) {
             const model = config.models[role];
             const created = await tx.createConversation({ ownership: { kind: 'task', taskId: runtime.taskId } });
             await configure(tx, created.id, {
@@ -230,44 +241,51 @@ export function createPipeline(services: Services) {
             Object.assign(await tx.doc(RoleDoc, created.id), { role, issue: number, workspace });
             conversations[role] = created.id;
           }
-          return { status: 'running', checkpoint: { phase: 'triage', issue, workspace, conversations } };
+          return { status: 'running', checkpoint: { phase: 'plan', issue, spec, workspace, conversations } };
         }, context);
       }),
 
-      triage: guarded<'triage'>(async (task, runtime, context) => {
+      plan: guarded<'plan'>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
-        const { issue } = state;
-        logger.step(issue.number, `Triage (${config.models.triage.modelId})`);
-        const triage = await askForReport(
+        const { issue, spec } = state;
+        logger.step(issue.number, `Plan (${config.models.plan.modelId})`);
+        const plan = await askForReport(
           runtime,
           {
-            conversation: state.conversations.triage,
-            requestId: 'triage',
-            prompt: triagePrompt(issue),
+            conversation: state.conversations.plan,
+            requestId: 'plan',
+            prompt: planPrompt(issue, spec),
             baseline: 0,
-            type: 'triage',
-            tool: 'report_triage',
+            type: 'plan',
+            tool: 'report_plan',
           },
           context,
         );
-        if (triage === undefined) throw new StepFailure('The triage agent did not give a decision.');
-        logger.step(issue.number, `Triage: ${triage.decision} (${triage.kind}): ${triage.summary}`);
+        if (plan === undefined) throw new StepFailure('The planner did not give a plan.');
+        logger.step(issue.number, `Plan: ${plan.decision}: ${plan.summary}`);
 
-        if (triage.decision === 'needs_info') {
-          await github.upsertComment(issue.number, MARKERS.triage, needsInfoComment(triage));
-          await github.setStatus(issue.number, 'needsInfo');
+        // Hand back with the triage labels; phat-mode's own progress label goes.
+        if (plan.decision === 'needs_info') {
+          await github.upsertComment(issue.number, MARKERS.plan, needsInfoComment(plan, issue, labels));
+          await github.editLabels(
+            issue.number,
+            mergeLabels(progressChange(null), { add: [labels.needsInfo], remove: [labels.readyForAgent] }),
+          );
           await finish(runtime, { status: 'needs_info' }, context);
           return;
         }
-        if (triage.decision === 'reject') {
-          await github.upsertComment(issue.number, MARKERS.triage, rejectedComment(triage));
-          await github.setStatus(issue.number, 'failed');
-          await finish(runtime, { status: 'rejected' }, context);
+        if (plan.decision === 'needs_human') {
+          await github.upsertComment(issue.number, MARKERS.plan, needsHumanComment(plan, labels));
+          await github.editLabels(
+            issue.number,
+            mergeLabels(progressChange(null), { add: [labels.readyForHuman], remove: [labels.readyForAgent] }),
+          );
+          await finish(runtime, { status: 'needs_human' }, context);
           return;
         }
-        await github.upsertComment(issue.number, MARKERS.triage, planComment(triage));
-        const start: Work = { ...state, triage, runs: 0, checkFixes: 0, reviewRounds: 0, done: null };
-        await toImplement(runtime, start, implementPrompt(issue, triage), context);
+        await github.upsertComment(issue.number, MARKERS.plan, planComment(plan));
+        const start: Work = { ...state, plan, runs: 0, checkFixes: 0, reviewRounds: 0, done: null };
+        await toImplement(runtime, start, implementPrompt(issue, spec, plan), context);
       }),
 
       implement: guarded<'implement'>(async (task, runtime, context) => {
@@ -331,7 +349,7 @@ export function createPipeline(services: Services) {
           {
             conversation: state.conversations.review,
             requestId: `review-${state.reviewRounds}`,
-            prompt: reviewPrompt(state.issue, state.triage, state.done ?? undefined, diff),
+            prompt: reviewPrompt(state.issue, state.spec, state.plan, state.done ?? undefined, diff),
             baseline: state.baseline,
             type: 'review',
             tool: 'report_review',
@@ -377,7 +395,8 @@ export function createPipeline(services: Services) {
 
         const body = pullRequestBody({
           issue,
-          triage: state.triage,
+          spec: state.spec,
+          plan: state.plan,
           done: state.done ?? undefined,
           review: state.review ?? undefined,
           unresolved: state.unresolved,
@@ -389,16 +408,23 @@ export function createPipeline(services: Services) {
         } else {
           await github.updatePullRequestBody(pr.number, body);
         }
+        // On a pull request, ready-for-human means: ready for a human to review and merge.
+        await github.editLabels(pr.number, { add: [labels.readyForHuman] });
         await github.upsertComment(issue.number, MARKERS.result, doneComment(pr.url));
-        await github.setStatus(issue.number, 'done');
+        // The issue keeps ready-for-agent until the PR closes it; phat-mode:done shows an agent already did it.
+        await github.editLabels(issue.number, progressChange('done'));
         logger.step(issue.number, `Draft pull request: ${pr.url}`);
         await finish(runtime, { status: 'pr_opened', url: pr.url }, context);
       }),
 
       fail: async (task, runtime, context) => {
         const { issue, reason } = task.state.checkpoint;
-        await github.upsertComment(issue, MARKERS.result, failedComment(reason));
-        await github.setStatus(issue, 'failed');
+        await github.upsertComment(issue, MARKERS.result, failedComment(reason, labels));
+        // An agent could not do it: a human should.
+        await github.editLabels(
+          issue,
+          mergeLabels(progressChange('failed'), { add: [labels.readyForHuman], remove: [labels.readyForAgent] }),
+        );
         await runtime.commit(
           () => ({ status: 'terminal', outcome: { status: 'failed', error: { message: reason } } }),
           context,

@@ -12,7 +12,7 @@ import { createBashTool, createEditTool, createReadTool, createWriteTool } from 
 import { bashBlockReason, writeBlockReason } from './guards.ts';
 import { consoleLogger, type Logger, oneLine } from './log.ts';
 
-export type Role = 'triage' | 'implement' | 'review';
+export type Role = 'plan' | 'implement' | 'review';
 
 /** Who a conversation is: stored with it, so hooks know its role and workspace, also after a restart. */
 export const RoleDoc = defineDoc<{ role: Role | null; issue: number | null; workspace: string | null }>({
@@ -24,18 +24,22 @@ export const RoleDoc = defineDoc<{ role: Role | null; issue: number | null; work
   initial: () => ({ role: null, issue: null, workspace: null }),
 });
 
-export type TriageReport = {
-  decision: 'proceed' | 'needs_info' | 'reject';
-  kind: 'bug' | 'feature' | 'chore' | 'docs' | 'question';
+export type PlanReport = {
+  /** proceed: build it. needs_info: the spec has gaps only the author can fill. needs_human: an agent should not do it. */
+  decision: 'proceed' | 'needs_info' | 'needs_human';
   summary: string;
   plan: string[];
+  /** For needs_info: what is already clear, for the triage notes. */
+  established: string[];
   questions: string[];
+  /** For needs_human: why. */
+  reason: string;
 };
 export type DoneReport = { summary: string; testing: string };
 export type ReviewReport = { verdict: 'approve' | 'changes'; summary: string; findings: string[] };
 
 export type Report =
-  | { type: 'triage'; data: TriageReport }
+  | { type: 'plan'; data: PlanReport }
   | { type: 'done'; data: DoneReport }
   | { type: 'review'; data: ReviewReport };
 
@@ -51,24 +55,28 @@ export const ReportsDoc = defineDoc<{ items: Report[] }>({
 
 const recorded = (text: string) => ({ output: [{ type: 'text' as const, text }], control: { terminate: true as const } });
 
-export const reportTriage = defineTool({
-  name: 'report_triage',
-  description:
-    'Report your triage decision. Call this exactly once, as your final action. Your turn ends when you call it.',
+export const reportPlan = defineTool({
+  name: 'report_plan',
+  description: 'Report your plan, or hand the issue back. Call this exactly once, as your final action. Your turn ends when you call it.',
   parameters: Type.Object({
-    decision: StringEnum(['proceed', 'needs_info', 'reject'], {
-      description: 'proceed: clear enough to implement. needs_info: ask the author questions. reject: out of scope or unsafe.',
+    decision: StringEnum(['proceed', 'needs_info', 'needs_human'], {
+      description:
+        'proceed: the spec is clear and you have a plan. needs_info: the spec has gaps only its author can fill. ' +
+        'needs_human: it needs judgment calls, design decisions, external access or manual testing an agent cannot do.',
     }),
-    kind: StringEnum(['bug', 'feature', 'chore', 'docs', 'question']),
-    summary: Type.String({ description: 'One or two sentences: what the issue asks for, in your own words.' }),
+    summary: Type.String({ description: 'One or two sentences: what the change is, in your own words.' }),
     plan: Type.Array(Type.String(), { description: 'Implementation steps, when proceeding. Empty otherwise.' }),
-    questions: Type.Array(Type.String(), { description: 'Questions for the author, when needs_info. Empty otherwise.' }),
+    established: Type.Array(Type.String(), { description: 'For needs_info: what is already clear. Empty otherwise.' }),
+    questions: Type.Array(Type.String(), {
+      description: 'For needs_info: specific, actionable questions for the author. Empty otherwise.',
+    }),
+    reason: Type.String({ description: 'For needs_human: why an agent should not do this. Empty otherwise.' }),
   }),
   execute: async (args, api, context) => {
     await api.commit(async (tx) => {
-      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'triage', data: { ...args } as TriageReport });
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'plan', data: { ...args } as PlanReport });
     }, context);
-    return recorded('Triage recorded.');
+    return recorded('Plan recorded.');
   },
 });
 
@@ -117,7 +125,7 @@ export const tools = {
 
 /** The tools each role may use. Only the implementer can change files. */
 export const ROLE_TOOLS: Record<Role, ToolRegistration[]> = {
-  triage: [tools.read, tools.bash, reportTriage],
+  plan: [tools.read, tools.bash, reportPlan],
   implement: [tools.read, tools.bash, tools.write, tools.edit, reportDone],
   review: [tools.read, tools.bash, reportReview],
 };
@@ -162,5 +170,5 @@ export const Guard = defineExtension({
 
 export const Tools: Extension = defineExtension({
   name: 'phat.tools',
-  tools: [tools.read, tools.bash, tools.write, tools.edit, reportTriage, reportDone, reportReview],
+  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportDone, reportReview],
 });

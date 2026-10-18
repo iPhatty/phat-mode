@@ -15,14 +15,28 @@ export type Config = {
   repo: string;
   /** Branch pull requests target. */
   baseBranch: string;
-  /** Only issues opened by these GitHub users are worked on. */
+  /**
+   * GitHub users phat-mode trusts. Their Agent Briefs are used as the spec; an issue without a brief is only worked on
+   * when one of them opened it.
+   */
   allowedAuthors: string[];
+  /**
+   * Triage labels, as mapped in the repo's triage-labels.md (mattpocock/skills). phat-mode only works on issues labelled
+   * `readyForAgent`, and hands issues back with `needsInfo` or `readyForHuman`.
+   */
+  labels: {
+    needsTriage: string;
+    needsInfo: string;
+    readyForAgent: string;
+    readyForHuman: string;
+    wontfix: string;
+  };
   /** Runs once in a fresh workspace. */
   installCommand: string;
   /** Must exit 0 before a pull request is opened. */
   checkCommand: string;
   models: {
-    triage: ModelChoice;
+    plan: ModelChoice;
     implement: ModelChoice;
     review: ModelChoice;
   };
@@ -49,8 +63,15 @@ export function defaultConfig(home = DEFAULT_HOME): Config {
     allowedAuthors: ['iPhatty'],
     installCommand: 'npm ci',
     checkCommand: 'npm run check',
+    labels: {
+      needsTriage: 'needs-triage',
+      needsInfo: 'needs-info',
+      readyForAgent: 'ready-for-agent',
+      readyForHuman: 'ready-for-human',
+      wontfix: 'wontfix',
+    },
     models: {
-      triage: { provider: 'github-copilot', modelId: 'claude-sonnet-5.5', thinkingLevel: 'medium' },
+      plan: { provider: 'github-copilot', modelId: 'claude-sonnet-5.5', thinkingLevel: 'medium' },
       implement: { provider: 'github-copilot', modelId: 'claude-sonnet-5.5', thinkingLevel: 'medium' },
       review: { provider: 'github-copilot', modelId: 'gpt-6.1-sol', thinkingLevel: 'medium' },
     },
@@ -79,6 +100,7 @@ export async function loadConfig(home = DEFAULT_HOME): Promise<Config> {
   return {
     ...config,
     ...overrides,
+    labels: { ...config.labels, ...overrides.labels },
     models: { ...config.models, ...overrides.models },
     limits: { ...config.limits, ...overrides.limits },
     home,
