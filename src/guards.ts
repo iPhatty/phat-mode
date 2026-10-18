@@ -1,4 +1,5 @@
 import { isAbsolute, relative, resolve } from 'node:path';
+import { isProtectedSkillPath } from './verify.ts';
 
 /**
  * Shell commands agents may not run. Git history, branches and remotes, and everything on GitHub, belong to the
@@ -61,6 +62,9 @@ export function writeBlockReason(path: string, workspace: string): string | unde
   }
   if (inside === '.git' || inside.startsWith(`.git/`)) {
     return 'Blocked: the .git directory is managed by phat-mode.';
+  }
+  if (isProtectedSkillPath(inside)) {
+    return `Blocked: ${inside} is part of the repo's verification skill, which only humans change (via /maintain-verification-skill). You may update its features/ files when you change behaviour on purpose.`;
   }
   return undefined;
 }

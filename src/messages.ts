@@ -1,7 +1,9 @@
 import type { DoneReport, PlanReport, PrReport } from './agents.ts';
 import { type AxisReport, type CodeReview, needsFixes, type SpecFinding, type StandardsFinding } from './code-review.ts';
 import type { Evidence } from './pr.ts';
+import { basename, extname } from 'node:path';
 import { MATTPOCOCK_SKILLS } from './skills.ts';
+import { type FeatureResult, IMAGE_TYPES, type Verification } from './verify.ts';
 import type { Spec } from './spec.ts';
 import type { Issue } from './github.ts';
 
@@ -107,6 +109,76 @@ export function codeReviewSection(review: CodeReview, unresolved: boolean): stri
   ].join('\n\n');
 }
 
+const STATUS = { verified: '✅', failed: '❌', not_verified: '⚪' } as const;
+
+/** One piece of evidence: an image inline, anything else as a link. Not published: its file name only. */
+function evidenceLink(path: string, urls: ReadonlyMap<string, string>): string {
+  const name = basename(path).replace(/^\d+-/, '');
+  const url = urls.get(path);
+  if (url === undefined) return `\`${name}\``;
+  return IMAGE_TYPES.includes(extname(path).toLowerCase())
+    ? `<img src="${url}" width="260" alt="${name}">`
+    : `[${name}](${url})`;
+}
+
+const evidenceList = (paths: readonly string[], urls: ReadonlyMap<string, string>) => {
+  const images = paths.filter((path) => IMAGE_TYPES.includes(extname(path).toLowerCase()));
+  const others = paths.filter((path) => !images.includes(path));
+  return [images.map((path) => evidenceLink(path, urls)).join(' '), others.map((path) => evidenceLink(path, urls)).join(' · ')]
+    .filter((part) => part !== '')
+    .join('<br>');
+};
+
+function featureItem(result: FeatureResult, urls: ReadonlyMap<string, string>, newFeatureNote: string): string {
+  const subs = result.subFeatures.length > 0 ? ` (${result.subFeatures.map((id) => `\`${id}\``).join(', ')})` : '';
+  const cause =
+    result.status === 'failed' ? (result.preExisting ? ' Also fails on the base branch: not caused by this change.' : ' Caused by this change.') : '';
+  const lines = [`- ${STATUS[result.status]} **${result.feature}**${subs}: ${indent(result.detail)}${cause}`];
+  if (result.status !== 'not_verified') {
+    lines.push(
+      `  **Before:** ${result.before.length > 0 ? evidenceList(result.before, urls) : newFeatureNote || 'Nothing to show before.'}`,
+      `  **After:** ${result.after.length > 0 ? evidenceList(result.after, urls) : 'No evidence captured.'}`,
+    );
+  }
+  if (result.checks.length > 0) {
+    lines.push(`  <details><summary>Checks (${result.checks.length})</summary>\n\n${result.checks.map((check) => `  - \`${check.replaceAll('`', "'")}\``).join('\n')}\n\n  </details>`);
+  }
+  return lines.join('\n');
+}
+
+/** The verifier's evidence from the real app: its own source, ahead of the implementer's claims. */
+export function verificationEvidence(verification: Verification | undefined, urls: ReadonlyMap<string, string>): string[] {
+  if (verification === undefined) return [];
+  if (verification.kind === 'skipped') return [`- ⚪ **Not verified in the app.** ${verification.reason}`];
+  const { skill, round, report, reverted, featureMapChanged, unresolved } = verification;
+  const rounds = `${round} round${round === 1 ? '' : 's'}`;
+  const items: string[] = [];
+  if (report === null) {
+    items.push(`- ⚪ **Not verified in the app:** the verifier using \`${skill}\` did not report.`);
+  } else if (report.couldNotRun.trim()) {
+    items.push(`- ⚪ **Verification with \`${skill}\` could not run:** ${indent(report.couldNotRun)}`);
+  } else {
+    const heading = unresolved
+      ? `⚠️ **Verified with \`${skill}\`, after ${rounds}: failures this change caused are still open.**`
+      : `**Verified in the app with \`${skill}\`**, after ${rounds}.`;
+    items.push(`- ${heading} ${indent(report.summary)}`);
+    for (const result of report.features) items.push(featureItem(result, urls, report.beforeNote.trim()));
+    if (report.features.length === 0) items.push('- ⚪ No features of the feature map are affected by this change.');
+    if (report.drift.length > 0) {
+      items.push(`- ⚠️ **Feature map drift**, for \`/maintain-verification-skill\`:\n${report.drift.map((drift) => `  - ${drift}`).join('\n')}`);
+    }
+  }
+  if (featureMapChanged.length > 0) {
+    items.push(`- ℹ️ **This change edits the feature map** (${featureMapChanged.map((path) => `\`${path}\``).join(', ')}). Check the new expectations.`);
+  }
+  if (reverted.length > 0) {
+    items.push(
+      `- ⚠️ **The implementer changed the verification skill** (${reverted.map((path) => `\`${path}\``).join(', ')}). Those changes were reverted before verifying and are not in this PR.`,
+    );
+  }
+  return items;
+}
+
 export type PullRequestDetails = {
   issue: Issue;
   spec: Spec;
@@ -114,6 +186,10 @@ export type PullRequestDetails = {
   done: DoneReport | undefined;
   /** The description the implementer wrote, following the pr skill; undefined if it did not. */
   pr: PrReport | undefined;
+  /** What the verifier proved in the real app. */
+  verification?: Verification;
+  /** Published evidence: local path → URL. */
+  evidenceUrls?: ReadonlyMap<string, string>;
   /** The last code review round; undefined when there was none. */
   review: CodeReview | undefined;
   /** The last review still had findings that must be fixed. */
@@ -167,7 +243,10 @@ export function pullRequestBody(details: PullRequestDetails): string {
   const { issue, spec, plan, done, pr, review, unresolved } = details;
   const sections = [
     `## Summary\n\n${pr?.summary.trim() || done?.summary || plan.summary}`,
-    `## Evidence\n\n${evidence(details).map(evidenceItem).join('\n')}`,
+    `## Evidence\n\n${[
+      ...verificationEvidence(details.verification, details.evidenceUrls ?? new Map()),
+      ...evidence(details).map(evidenceItem),
+    ].join('\n')}`,
     mergeDanger(pr),
   ];
   if (spec.acceptanceCriteria.length > 0) {

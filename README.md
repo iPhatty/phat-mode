@@ -17,8 +17,9 @@ phat-mode is the **AFK agent** in a [mattpocock/skills](https://github.com/mattp
 3. **Implement** (AI, Claude Opus 5.5): changes the code and adds tests.
 4. **Verify** (code, not AI): runs `npm run check`. On failure, the output goes back to the implementer (up to 3 times).
 5. **Code review** (GPT-6.1 Sol, a different model family, read-only): two reviewers in parallel, following Matt Pocock's [code-review](https://github.com/mattpocock/skills/blob/main/skills/engineering/code-review/SKILL.md) skill. See [Code review](#code-review).
-6. **Describe** (AI, the implementer): writes the PR description following Matt Pocock's [pr](https://github.com/mattpocock/skills/blob/main/skills/engineering/pr/SKILL.md) skill: **Summary** (the smallest diagram that makes the point), **Evidence** (before and after) and **Merge Danger** (one- or two-way door, blast radius). It must not change files; if it does, the change is checked and reviewed again.
-7. **Publish** (code): commits, pushes, and opens a **draft** PR labelled `ready-for-human`. The description is the pr skill's three sections, then what phat-mode adds: its own verified check result under Evidence, the acceptance criteria to tick off, the code review, and `Closes #N`.
+6. **Verify** (AI, read-only, in the real app): follows the repo's own verification skill. See [Verification](#verification).
+7. **Describe** (AI, the implementer): writes the PR description following Matt Pocock's [pr](https://github.com/mattpocock/skills/blob/main/skills/engineering/pr/SKILL.md) skill: **Summary** (the smallest diagram that makes the point), **Evidence** (before and after) and **Merge Danger** (one- or two-way door, blast radius). It must not change files; if it does, the change is checked and reviewed again.
+8. **Publish** (code): commits, pushes, and opens a **draft** PR labelled `ready-for-human`. The description is the pr skill's three sections, then what phat-mode adds: its own verified check result under Evidence, the acceptance criteria to tick off, the code review, and `Closes #N`.
 
 It never merges and never pushes to `main`. You review and merge every PR.
 
@@ -63,7 +64,21 @@ Both of Matt's skills (`code-review`, `pr`) are pinned together in `skills/`. To
 
 ### Evidence
 
-Each piece of evidence in the PR records who supplied it: the implementer's before/after (what it says it observed), and phat-mode's own check run (verified). A verification agent is planned next; its evidence will be added as its own source.
+Each piece of evidence in the PR records who supplied it: the verifier's, from the real app; the implementer's before/after (what it says it observed); and phat-mode's own check run.
+
+## Verification
+
+How to prove an app works differs per project, so the **project** owns it: run pstack's [`/create-verification-skill`](https://github.com/cursor/plugins/blob/main/pstack/skills/create-verification-skill/SKILL.md) in the repo once, commit the `verify-<app>` skill it generates (launch, doctor, drive, evidence, cleanup, plus a feature map), and keep it current with `/maintain-verification-skill`. phat-mode finds and follows it.
+
+1. **Find** (code): a `verify-*/SKILL.md` under `.agents/skills`, `.claude/skills` or `.cursor/skills`, read from the commit the work is based on (a symlinked copy counts once). None: verification is skipped and the PR says how to add one.
+2. **Protect** (code): the implementer cannot change the skill's `SKILL.md` or scripts (blocked, and reverted before verifying if changed anyway). It may update `features/` when it changes behaviour on purpose, as the skill expects; the PR flags such edits.
+3. **Verify** (AI, the verifier, `defaultModel`, reads screenshots): picks the features the change touches, then
+   - **before**, only if there genuinely is one: drives the same user path on a clean checkout of the base branch. A new feature has no before, and the PR says so;
+   - **after**: drives and checks each feature as the feature map says, in the change's checkout;
+   - a failure is re-run on the base branch: if it fails there too, this change did not cause it.
+   It always runs the skill's cleanup. Whatever it changes in the change's files is discarded (snapshot and restore).
+4. **Decide** (code): a failure this change caused goes back to the implementer, then checks, review and verification run again (`maxVerifyRounds`: 2). Not verified (missing capability), drift and pre-existing failures never block; they are shown.
+5. **Publish** (code): evidence files (screenshots, accessibility trees, logs) inside the two checkouts are copied, pushed to the **`phat-mode/evidence`** branch (never the PR branch), and shown in the PR's Evidence section as before/after images, pinned to the evidence commit.
 
 The skill gives no verdict, so phat-mode decides:
 
@@ -151,6 +166,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 
 - `src/pipeline.ts`: the durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again.
 - `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
+- `src/verify.ts`: finds the repo's verify skill, protects it, collects evidence, and decides what blocks.
 - `src/skills.ts`: the pinned mattpocock/skills version. `src/pr.ts`: the pr skill and evidence sources.
 - `src/code-review.ts`: reads phat-mode's pinned code-review skill, finds standards sources, and decides what must be fixed.
 - `src/agents.ts`: the four agents (planner, implementer, Standards and Spec reviewers), their tools, the report tools agents finish with, and the guard hook.

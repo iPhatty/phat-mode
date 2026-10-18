@@ -31,8 +31,18 @@ import {
   standardsSources,
 } from './code-review.ts';
 import { eligibility, type Spec } from './spec.ts';
-import { branchFor, type Config, modelFor } from './config.ts';
+import { join, relative } from 'node:path';
+import { branchFor, type Config, modelFor, paths } from './config.ts';
 import { prSkill } from './pr.ts';
+import {
+  changedFeatureMap,
+  collectEvidence,
+  findVerifySkills,
+  newFailures,
+  restoreProtectedSkillFiles,
+  type Verification,
+  type VerificationReport,
+} from './verify.ts';
 import { commentMarker, type GitHub, type Issue, mergeLabels, progressChange } from './github.ts';
 import type { Logger } from './log.ts';
 import {
@@ -51,11 +61,13 @@ import {
   NUDGE,
   planPrompt,
   describePrompt,
+  fixVerificationPrompt,
   ROLE_INSTRUCTIONS,
   specReviewPrompt,
   standardsReviewPrompt,
+  verifyPrompt,
 } from './prompts.ts';
-import { type Checks, tail, type Workspaces } from './workspace.ts';
+import { type Checks, EVIDENCE_BRANCH, tail, type Workspaces } from './workspace.ts';
 
 export type Services = {
   config: Config;
@@ -68,7 +80,14 @@ export type Services = {
 export type PipelineInput = { repo: string; issue: number };
 
 type Conversations = Record<Agent, ConversationId>;
-type ReportData = { plan: PlanReport; done: DoneReport; pr: PrReport; standards: StandardsReport; spec: SpecReport };
+type ReportData = {
+  plan: PlanReport;
+  done: DoneReport;
+  pr: PrReport;
+  standards: StandardsReport;
+  spec: SpecReport;
+  verification: VerificationReport;
+};
 
 /** Known once the workspace is ready. `spec`: what to build, from an Agent Brief or the issue body. */
 type Setup = { issue: Issue; spec: Spec; workspace: string; conversations: Conversations };
@@ -80,21 +99,26 @@ type Work = Setup & {
   runs: number;
   checkFixes: number;
   reviewRounds: number;
+  verifyRounds: number;
   done: DoneReport | null;
 };
+
+/** The outcome of the code review, carried to the pull request. */
+type Reviewed = { review: CodeReview | null; unresolved: boolean };
 
 export type PipelineState =
   | { phase: 'prepare' }
   | (Setup & { phase: 'plan' })
   /** `baseline`: how many reports the agent had made before this request, so only new ones count. */
   | (Work & { phase: 'implement'; prompt: string; baseline: number })
-  | (Work & { phase: 'verify' })
+  | (Work & { phase: 'check' })
   /** `baseline`: per reviewer, as for implement. */
   | (Work & { phase: 'review'; baseline: { standards: number; spec: number } })
   /** `unresolved`: the last review still had findings that must be fixed. `baseline`: as for implement. */
-  | (Work & { phase: 'describe'; review: CodeReview | null; unresolved: boolean; baseline: number })
+  | (Work & Reviewed & { phase: 'verify'; baseline: number })
+  | (Work & Reviewed & { phase: 'describe'; verification: Verification; baseline: number })
   /** `pr`: the description the implementer wrote, following the pr skill; null if it did not report one. */
-  | (Work & { phase: 'publish'; review: CodeReview | null; unresolved: boolean; pr: PrReport | null })
+  | (Work & Reviewed & { phase: 'publish'; verification: Verification; pr: PrReport | null })
   | { phase: 'fail'; issue: number; reason: string };
 
 export type PipelineResult =
@@ -110,6 +134,9 @@ type Phase<P extends PipelineState['phase']> = RunningTask<PipelineInput, Extrac
 class StepFailure extends Error {}
 
 const MARKERS = { plan: commentMarker('plan'), result: commentMarker('result') };
+
+const NO_VERIFY_SKILL =
+  'This repo has no verification skill (a `verify-*` skill in `.agents/skills`, `.claude/skills` or `.cursor/skills`). Create one with `/create-verification-skill`.';
 
 const axisCount = (report: AxisReport<unknown> | null) =>
   report === null ? 'no report' : `${report.findings.length} finding${report.findings.length === 1 ? '' : 's'}`;
@@ -205,12 +232,38 @@ export function createPipeline(services: Services) {
     );
   };
 
+  /**
+   * Push the verification evidence to the evidence branch, never the pull request's branch. Returns the URL of each
+   * local evidence file, pinned to the evidence commit.
+   */
+  async function publishEvidence(issue: number, verification: Verification): Promise<Map<string, string>> {
+    const urls = new Map<string, string>();
+    if (verification.kind !== 'ran' || verification.report === null) return urls;
+    const local = [
+      ...new Set(verification.report.features.flatMap((result) => [...result.before, ...result.after])),
+    ];
+    if (local.length === 0) return urls;
+    const root = paths.evidence(config, issue);
+    const files = local.map((source) => ({ source, path: `issue-${issue}/${relative(root, source).replaceAll('\\', '/')}` }));
+    logger.step(issue, `Publishing ${files.length} evidence file(s) to ${EVIDENCE_BRANCH}`);
+    const commit = await workspaces.publishEvidence(files);
+    for (const file of files) urls.set(file.source, `https://github.com/${config.repo}/blob/${commit}/${file.path}?raw=true`);
+    return urls;
+  }
+
   /** The last step before publishing: the implementer writes the pull request description. */
-  const toDescribe = (runtime: Runtime, state: Work, review: CodeReview | null, unresolved: boolean, context: Context) =>
+  const toDescribe = (runtime: Runtime, state: Work & Reviewed, verification: Verification, context: Context) =>
     goWithBaseline(
       runtime,
       state.conversations.implement,
-      (baseline) => ({ ...work(state), phase: 'describe', review, unresolved, baseline }),
+      (baseline) => ({
+        ...work(state),
+        phase: 'describe',
+        review: state.review,
+        unresolved: state.unresolved,
+        verification,
+        baseline,
+      }),
       context,
     );
 
@@ -223,6 +276,7 @@ export function createPipeline(services: Services) {
     runs: state.runs,
     checkFixes: state.checkFixes,
     reviewRounds: state.reviewRounds,
+    verifyRounds: state.verifyRounds,
     done: state.done,
   });
 
@@ -317,7 +371,7 @@ export function createPipeline(services: Services) {
           return;
         }
         await github.upsertComment(issue.number, MARKERS.plan, planComment(plan));
-        const start: Work = { ...state, plan, runs: 0, checkFixes: 0, reviewRounds: 0, done: null };
+        const start: Work = { ...state, plan, runs: 0, checkFixes: 0, reviewRounds: 0, verifyRounds: 0, done: null };
         await toImplement(runtime, start, implementPrompt(issue, spec, plan), context);
       }),
 
@@ -336,10 +390,10 @@ export function createPipeline(services: Services) {
           },
           context,
         );
-        await go(runtime, { ...work(state), phase: 'verify', done: done ?? state.done }, context);
+        await go(runtime, { ...work(state), phase: 'check', done: done ?? state.done }, context);
       }),
 
-      verify: guarded<'verify'>(async (task, runtime, context) => {
+      check: guarded<'check'>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const number = state.issue.number;
         if ((await workspaces.diff(state.workspace)).trim() === '') {
@@ -419,8 +473,8 @@ export function createPipeline(services: Services) {
         ]);
         if ((await workspaces.fingerprint(state.workspace)) !== before) {
           // The reviewers are told not to edit; if files changed anyway, verify again before trusting them.
-          logger.step(number, 'Files changed during review; verifying again');
-          await go(runtime, { ...work(state), phase: 'verify' }, context);
+          logger.step(number, 'Files changed during review; checking again');
+          await go(runtime, { ...work(state), phase: 'check' }, context);
           return;
         }
         const review: CodeReview = { round, standards: standards ?? null, spec: spec ?? null };
@@ -430,10 +484,102 @@ export function createPipeline(services: Services) {
           `Review: Standards ${axisCount(review.standards)}, Spec ${axisCount(review.spec)}; ${fix.standards.length + fix.spec.length} must fix`,
         );
         if (!needsFixes(review) || round >= limits.maxReviewRounds) {
-          await toDescribe(runtime, state, review, needsFixes(review), context);
+          await goWithBaseline(
+            runtime,
+            state.conversations.verify,
+            (baseline) => ({
+              ...work(state),
+              phase: 'verify',
+              verifyRounds: state.verifyRounds + 1,
+              review,
+              unresolved: needsFixes(review),
+              baseline,
+            }),
+            context,
+          );
           return;
         }
         await toImplement(runtime, work(state), fixReviewPrompt(review), context);
+      }),
+
+      verify: guarded<'verify'>(async (task, runtime, context) => {
+        const state = task.state.checkpoint;
+        const number = state.issue.number;
+        const round = state.verifyRounds;
+        const skills = await findVerifySkills(state.workspace);
+        const skill = skills[0];
+        if (skill === undefined) {
+          logger.step(number, 'No verification skill in this repo; skipping verification in the app');
+          await toDescribe(runtime, state, { kind: 'skipped', reason: NO_VERIFY_SKILL }, context);
+          return;
+        }
+        if (skills.length > 1) logger.step(number, `Several verification skills; using ${skill.name}`);
+        logger.step(number, `Verifying in the app, round ${round}, with ${skill.name} (${modelFor(config, 'verify').modelId})`);
+        // The skill runs as the repo defines it: protected skill files the implementer touched are reverted for good.
+        const reverted = await restoreProtectedSkillFiles(state.workspace);
+        if (reverted.length > 0) logger.step(number, `Reverted changes to the verification skill: ${reverted.join(', ')}`);
+        const featureMapChanged = await changedFeatureMap(state.workspace);
+        const diff = await workspaces.diff(state.workspace);
+        const baseCheckout = await workspaces.prepareBase();
+        // Whatever the verifier changes in the change's files is thrown away afterwards.
+        await workspaces.snapshot(state.workspace);
+        const reported = await askForReport(
+          runtime,
+          {
+            conversation: state.conversations.verify,
+            requestId: `verify-${round}`,
+            prompt: verifyPrompt({
+              skill,
+              issue: state.issue,
+              spec: state.spec,
+              workspace: state.workspace,
+              baseCheckout,
+              baseRef,
+              diff,
+              featureMapChanged,
+              round,
+            }),
+            baseline: state.baseline,
+            type: 'verification',
+            tool: 'report_verification',
+          },
+          context,
+        );
+        let report: VerificationReport | null = null;
+        if (reported !== undefined) {
+          const collected = await collectEvidence(reported, {
+            roots: [state.workspace, baseCheckout],
+            destination: join(paths.evidence(config, number), `verify-${round}`),
+          });
+          if (collected.skipped.length > 0) logger.step(number, `Left out evidence: ${collected.skipped.join(', ')}`);
+          report = collected.report;
+        }
+        const discarded = await workspaces.restoreSnapshot(state.workspace);
+        if (discarded.length > 0) logger.step(number, `Discarded changes the verifier made: ${discarded.join(', ')}`);
+
+        const failures = report === null ? [] : newFailures(report);
+        logger.step(
+          number,
+          report === null
+            ? 'The verifier did not report'
+            : report.couldNotRun.trim()
+              ? `Verification could not run: ${report.couldNotRun}`
+              : `Verification: ${report.features.map((result) => `${result.feature} ${result.status}`).join(', ') || 'no features'}`,
+        );
+        if (failures.length > 0 && round < limits.maxVerifyRounds) {
+          await toImplement(runtime, work(state), fixVerificationPrompt(failures), context);
+          return;
+        }
+        const verification: Verification = {
+          kind: 'ran',
+          skill: skill.name,
+          round,
+          report,
+          reverted,
+          featureMapChanged,
+          unresolved: failures.length > 0,
+        };
+        await toDescribe(runtime, state, verification, context);
       }),
 
       describe: guarded<'describe'>(async (task, runtime, context) => {
@@ -454,18 +600,25 @@ export function createPipeline(services: Services) {
           context,
         );
         if ((await workspaces.fingerprint(state.workspace)) !== before) {
-          // Changes made now were neither checked nor reviewed: check and review them, as a new implementer run.
+          // Changes made now were neither checked, reviewed nor verified: do all three, as a new implementer run.
           logger.step(number, 'Files changed while writing the description; verifying and reviewing again');
           if (state.runs >= limits.maxImplementRuns) {
             throw new StepFailure(`Stopped after ${state.runs} implementation attempts.`);
           }
-          await go(runtime, { ...work(state), runs: state.runs + 1, phase: 'verify' }, context);
+          await go(runtime, { ...work(state), runs: state.runs + 1, phase: 'check' }, context);
           return;
         }
         if (pr === undefined) logger.step(number, 'No description reported; using a plain one');
         await go(
           runtime,
-          { ...work(state), phase: 'publish', review: state.review, unresolved: state.unresolved, pr: pr ?? null },
+          {
+            ...work(state),
+            phase: 'publish',
+            review: state.review,
+            unresolved: state.unresolved,
+            verification: state.verification,
+            pr: pr ?? null,
+          },
           context,
         );
       }),
@@ -474,6 +627,8 @@ export function createPipeline(services: Services) {
         const state = task.state.checkpoint;
         const { issue, workspace } = state;
         const branch = branchFor(issue.number);
+        // A crash during verification can leave its local snapshot commit behind.
+        await workspaces.undoSnapshot(workspace);
         logger.step(issue.number, `Committing and pushing ${branch}`);
         await workspaces.commitAll(workspace, `${pullRequestTitle(issue)}\n\nCloses #${issue.number}`);
         if ((await workspaces.commitsAhead(workspace)) === 0) {
@@ -481,12 +636,15 @@ export function createPipeline(services: Services) {
         }
         await workspaces.push(workspace, issue.number);
 
+        const evidenceUrls = await publishEvidence(issue.number, state.verification);
         const body = pullRequestBody({
           issue,
           spec: state.spec,
           plan: state.plan,
           done: state.done ?? undefined,
           pr: state.pr ?? undefined,
+          verification: state.verification,
+          evidenceUrls,
           review: state.review ?? undefined,
           unresolved: state.unresolved,
           checkCommand: config.checkCommand,

@@ -40,6 +40,7 @@ function services(config: Config): Services {
       baseBranch: config.baseBranch,
       cloneDir: paths.repoClone(config),
       workspaceDir: (issue) => paths.workspace(config, issue),
+      baseWorkspaceDir: paths.baseWorkspace(config),
       installCommand: config.installCommand,
       installTimeoutMs: config.limits.installTimeoutMs,
     }),

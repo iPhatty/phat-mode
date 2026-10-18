@@ -13,14 +13,15 @@ import { bashBlockReason, writeBlockReason } from './guards.ts';
 import { consoleLogger, type Logger, oneLine } from './log.ts';
 
 import type { SpecReport, StandardsReport } from './code-review.ts';
+import type { VerificationReport } from './verify.ts';
 import type { Role } from './config.ts';
 
 /**
  * The agents of one issue. The two reviewers follow mattpocock/skills' code-review skill, one per axis, and both use
  * the `review` model.
  */
-export type Agent = 'plan' | 'implement' | 'standards' | 'spec';
-export const AGENTS: readonly Agent[] = ['plan', 'implement', 'standards', 'spec'];
+export type Agent = 'plan' | 'implement' | 'standards' | 'spec' | 'verify';
+export const AGENTS: readonly Agent[] = ['plan', 'implement', 'standards', 'spec', 'verify'];
 export const modelRole = (agent: Agent): Role => (agent === 'standards' || agent === 'spec' ? 'review' : agent);
 
 /** Who a conversation is: stored with it, so hooks know its role and workspace, also after a restart. */
@@ -64,7 +65,8 @@ export type Report =
   | { type: 'done'; data: DoneReport }
   | { type: 'pr'; data: PrReport }
   | { type: 'standards'; data: StandardsReport }
-  | { type: 'spec'; data: SpecReport };
+  | { type: 'spec'; data: SpecReport }
+  | { type: 'verification'; data: VerificationReport };
 
 /** Reports an agent made, in order. The pipeline reads the ones after a baseline it stored before asking. */
 export const ReportsDoc = defineDoc<{ items: Report[] }>({
@@ -208,6 +210,51 @@ export const reportSpec = defineTool({
   },
 });
 
+export const reportVerification = defineTool({
+  name: 'report_verification',
+  description: 'Report your verification. Call this exactly once, as your final action, after cleanup.',
+  parameters: Type.Object({
+    summary: Type.String({ description: 'What you verified and what you found, in a few sentences.' }),
+    beforeNote: Type.String({
+      description: 'When there is no before run: why (e.g. "Every feature is new: nothing to show before."). Empty otherwise.',
+    }),
+    features: Type.Array(
+      Type.Object({
+        feature: Type.String({ description: 'The feature file name without .md, e.g. learning-path.' }),
+        subFeatures: Type.Array(Type.String(), { description: 'Sub-feature IDs this result covers.' }),
+        status: StringEnum(['verified', 'failed', 'not_verified'], {
+          description:
+            'verified: proved on the change. failed: a check failed on the change. ' +
+            'not_verified: needs a capability the harness lacks (name it in detail).',
+        }),
+        preExisting: Type.Boolean({
+          description: 'For failed: true only if you re-ran the same check on the base checkout and it fails there too.',
+        }),
+        detail: Type.String({ description: 'What you saw. For failed: what was expected and what happened.' }),
+        checks: Type.Array(Type.String(), {
+          description: 'Each check you ran on the change and its result, e.g. "ok: expect.sh label \"HSK 1\"".',
+        }),
+        before: Type.Array(Type.String(), {
+          description: 'Absolute paths of evidence from the base checkout. Empty for a new feature.',
+        }),
+        after: Type.Array(Type.String(), { description: 'Absolute paths of evidence from the change.' }),
+      }),
+    ),
+    drift: Type.Array(Type.String(), {
+      description: 'Where the feature map no longer matches an intended change, for a human to fix. Empty if none.',
+    }),
+    couldNotRun: Type.String({
+      description: 'Why verification could not run at all (e.g. no simulator, a script failed to launch). Empty when it ran.',
+    }),
+  }),
+  execute: async (args, api, context) => {
+    await api.commit(async (tx) => {
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'verification', data: { ...args } as VerificationReport });
+    }, context);
+    return recorded('Verification recorded.');
+  },
+});
+
 export const tools = {
   read: createReadTool(),
   bash: createBashTool(),
@@ -221,6 +268,7 @@ export const ROLE_TOOLS: Record<Agent, ToolRegistration[]> = {
   implement: [tools.read, tools.bash, tools.write, tools.edit, reportDone, reportPr],
   standards: [tools.read, tools.bash, reportStandards],
   spec: [tools.read, tools.bash, reportSpec],
+  verify: [tools.read, tools.bash, reportVerification],
 };
 
 let logger: Logger = consoleLogger;
@@ -263,5 +311,5 @@ export const Guard = defineExtension({
 
 export const Tools: Extension = defineExtension({
   name: 'phat.tools',
-  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportDone, reportPr, reportStandards, reportSpec],
+  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportDone, reportPr, reportStandards, reportSpec, reportVerification],
 });

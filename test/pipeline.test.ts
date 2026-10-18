@@ -190,6 +190,35 @@ const specIssue = (detail: string, kind: SpecFinding['kind'] = 'wrong'): SpecFin
 const violation = (detail: string): StandardsFinding => ({ kind: 'violation', where: 'hello.txt', rule: 'AGENTS.md: "Add tests"', detail });
 const smell = (detail: string): StandardsFinding => ({ kind: 'smell', where: 'hello.txt', rule: 'possible Mysterious Name', detail });
 
+/** A repo verification skill, as pstack's create-verification-skill generates them. */
+const VERIFY_SKILL_FILES = {
+  '.gitignore': '/.verify/\n',
+  '.agents/skills/verify-app/SKILL.md': '---\nname: verify-app\ndescription: "Drive the app."\n---\n\n# Verify App\n\nRun `scripts/launch.sh`.\n',
+  '.agents/skills/verify-app/scripts/launch.sh': 'echo launch\n',
+  '.agents/skills/verify-app/features/README.md': '# App verification map\n\n- [Hello](./hello.md)\n',
+  '.agents/skills/verify-app/features/hello.md': '# Hello\n',
+};
+type VerifyFeature = { status?: string; preExisting?: boolean; detail?: string; before?: string[]; after?: string[] };
+const verificationReport = (features: VerifyFeature[], extra: Record<string, unknown> = {}) =>
+  call('report_verification', {
+    summary: 'Drove the hello feature.',
+    beforeNote: '',
+    features: features.map((feature) => ({
+      feature: 'hello',
+      subFeatures: ['hello-shown'],
+      status: 'verified',
+      preExisting: false,
+      detail: 'hello.txt says hello.',
+      checks: ['ok: expect.sh label "hello"'],
+      before: [],
+      after: [],
+      ...feature,
+    })),
+    drift: [],
+    couldNotRun: '',
+    ...extra,
+  });
+
 // ─── Fixture ────────────────────────────────────────────────────────────────
 
 const temp: string[] = [];
@@ -235,6 +264,7 @@ async function fixture(files: Record<string, string> = {}) {
       baseBranch: 'main',
       cloneDir: paths.repoClone(config),
       workspaceDir: (issue) => paths.workspace(config, issue),
+      baseWorkspaceDir: paths.baseWorkspace(config),
     }),
   };
   // Commits in the workspace need an identity; the real CLI uses the user's git config.
@@ -375,6 +405,166 @@ describe('pipeline', () => {
       expectLast((message) => assert.match(textOf(message), /Some code review findings are still open/), describePr()),
     ]);
     assert.equal(result(outcome).status, 'pr_opened');
+  });
+
+  describe('verification in the app', () => {
+    const shot = (dir: string, name: string, content: string) =>
+      call('bash', { command: `cd '${dir}' && mkdir -p .verify && printf '${content}' > .verify/${name}` });
+
+    test('before and after evidence on the evidence branch, shown in the PR; what the verifier changes is discarded', async () => {
+      const { github, config, runIssue, remote, remoteFile } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(50);
+      const workspace = paths.workspace(config, 50);
+      const base = paths.baseWorkspace(config);
+      const { outcome, faux } = await runIssue(50, [
+        plan(),
+        write('hello.txt', 'hello\n'),
+        done(),
+        ...approve(),
+        expectLast((message) => {
+          const text = textOf(message);
+          assert.match(text, /^Verify this change in the real app, following the repo's verification skill\./);
+          assert.ok(text.includes(`- The change: ${workspace} (your working directory)`));
+          assert.ok(text.includes(`- The base branch, origin/main, before the change: ${base}.`));
+          assert.match(text, /only where there genuinely is a before/);
+          assert.match(text, /re-run that same check in the base checkout/);
+          assert.match(text, /<skill name="verify-app">\n# Verify App\n\nRun `scripts\/launch\.sh`\./);
+          assert.match(text, /# App verification map/);
+          assert.match(text, /\+hello/, 'the diff');
+        }, shot(base, '01-hello.png', 'before')),
+        shot(workspace, '02-hello.png', 'after'),
+        call('bash', { command: 'echo verifier >> README.md && echo x > stray.txt' }),
+        verificationReport([{ before: [join(base, '.verify/01-hello.png')], after: [join(workspace, '.verify/02-hello.png')] }]),
+        describePr(),
+      ]);
+      assert.equal(result(outcome).status, 'pr_opened');
+      assert.equal(faux.getPendingResponseCount(), 0);
+      // The verifier's changes never reach the PR.
+      assert.equal(await remoteFile(50, 'README.md'), '# test\n');
+      await assert.rejects(remoteFile(50, 'stray.txt'));
+      // Evidence lives on its own branch.
+      const show = (rev: string) => run('git', ['--git-dir', remote, 'show', rev]).then((r) => r.stdout);
+      const evidence = (await run('git', ['--git-dir', remote, 'ls-tree', '-r', '--name-only', 'phat-mode/evidence'])).stdout.trim().split('\n');
+      assert.deepEqual(evidence, ['issue-50/verify-1/after/02-hello-02-hello.png', 'issue-50/verify-1/before/01-hello-01-hello.png']);
+      assert.equal(await show('phat-mode/evidence:issue-50/verify-1/after/02-hello-02-hello.png'), 'after');
+      const commit = (await run('git', ['--git-dir', remote, 'rev-parse', 'phat-mode/evidence'])).stdout.trim();
+      const body = github.prs[0]!.body;
+      const url = (side: string, name: string) => `https://github.com/test/repo/blob/${commit}/issue-50/verify-1/${side}/${name}?raw=true`;
+      assert.match(body, /## Evidence\n\n- \*\*Verified in the app with `verify-app`\*\*, after 1 round\. Drove the hello feature\.\n- ✅ \*\*hello\*\* \(`hello-shown`\): hello\.txt says hello\./);
+      assert.ok(body.includes(`  **Before:** <img src="${url('before', '01-hello-01-hello.png')}" width="260" alt="hello-01-hello.png">`));
+      assert.ok(body.includes(`  **After:** <img src="${url('after', '02-hello-02-hello.png')}" width="260" alt="hello-01-hello.png">`.replace('hello-01-hello.png">', 'hello-02-hello.png">')));
+      assert.match(body, /<summary>Checks \(1\)<\/summary>\n\n  - `ok: expect\.sh label "hello"`/);
+      // Then the implementer's evidence and phat-mode's own check run.
+      assert.match(body, /checks \(1\)[^]*- \*\*Before:\*\* No hello\.txt\.[^]*- ✅ \*\*Verified by phat-mode:\*\*/i);
+    });
+
+    test('a new feature: no before, and the PR says so instead of inventing one', async () => {
+      const { github, config, runIssue } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(51);
+      const workspace = paths.workspace(config, 51);
+      await runIssue(51, [
+        plan(),
+        write('hello.txt', 'hello\n'),
+        done(),
+        ...approve(),
+        shot(workspace, '01-hello.png', 'after'),
+        verificationReport([{ after: [join(workspace, '.verify/01-hello.png')] }], { beforeNote: 'New feature: nothing to show before.' }),
+        describePr(),
+      ]);
+      assert.match(github.prs[0]!.body, /\*\*Before:\*\* New feature: nothing to show before\.\n  \*\*After:\*\* <img /);
+    });
+
+    test('a failure the change caused goes back to the implementer, then checks, review and verification again', async () => {
+      const { github, checks, runIssue } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(52);
+      const { outcome, faux } = await runIssue(52, [
+        plan(),
+        write('hello.txt', 'helo\n'),
+        done(),
+        ...approve(),
+        verificationReport([{ status: 'failed', detail: 'Expected "hello", the screen shows "helo".' }]),
+        expectLast((message) => {
+          const text = textOf(message);
+          assert.match(text, /^Verifying your change in the real app failed, and the same checks pass on the base branch/);
+          assert.match(text, /- hello \(hello-shown\): Expected "hello", the screen shows "helo"\./);
+        }, write('hello.txt', 'hello\n')),
+        done(),
+        ...approve(),
+        expectLast((message) => assert.match(textOf(message), /^This is verification round 2\./), verificationReport([{}])),
+        describePr(),
+      ]);
+      assert.equal(result(outcome).status, 'pr_opened');
+      assert.equal(faux.getPendingResponseCount(), 0);
+      assert.equal(checks.runs, 2);
+      assert.match(github.prs[0]!.body, /\*\*Verified in the app with `verify-app`\*\*, after 2 rounds\./);
+    });
+
+    test('a failure that also happens on the base branch does not block, and is labelled', async () => {
+      const { github, runIssue } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(53);
+      const { faux } = await runIssue(53, [
+        plan(),
+        write('hello.txt', 'hello\n'),
+        done(),
+        ...approve(),
+        verificationReport([{ status: 'failed', preExisting: true, detail: 'The footer overlaps.' }]),
+        describePr(),
+      ]);
+      assert.equal(faux.getPendingResponseCount(), 0, 'no fix round');
+      assert.match(github.prs[0]!.body, /- ❌ \*\*hello\*\* \(`hello-shown`\): The footer overlaps\. Also fails on the base branch: not caused by this change\./);
+    });
+
+    test('still failing after the last round: the PR opens with the failure flagged', async () => {
+      const { github, runIssue } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(54);
+      const failing = () => verificationReport([{ status: 'failed', detail: 'Still "helo".' }]);
+      await runIssue(54, [
+        plan(),
+        write('hello.txt', 'helo\n'),
+        done(),
+        ...approve(),
+        failing(),
+        write('hello.txt', 'helo!\n'),
+        done(),
+        ...approve(),
+        failing(),
+        describePr(),
+      ]);
+      const body = github.prs[0]!.body;
+      assert.match(body, /⚠️ \*\*Verified with `verify-app`, after 2 rounds: failures this change caused are still open\.\*\*/);
+      assert.match(body, /- ❌ \*\*hello\*\* \(`hello-shown`\): Still "helo"\. Caused by this change\./);
+    });
+
+    test('the implementer cannot change the verification skill; feature map edits are allowed and flagged', async () => {
+      const { github, runIssue, remoteFile } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(55);
+      await runIssue(55, [
+        plan(),
+        write('.agents/skills/verify-app/scripts/launch.sh', 'exit 0\n'),
+        expectLast((message) => {
+          assert.equal((message as ToolResultMessage).isError, true);
+          assert.match(textOf(message), /part of the repo's verification skill/);
+        }, call('bash', { command: "echo 'exit 0' > .agents/skills/verify-app/scripts/launch.sh" })),
+        write('.agents/skills/verify-app/features/hello.md', '# Hello\n\nSays hello.\n'),
+        write('hello.txt', 'hello\n'),
+        done(),
+        ...approve(),
+        expectLast((message) => assert.match(textOf(message), /This change edits the feature map: \.agents\/skills\/verify-app\/features\/hello\.md/), verificationReport([{}])),
+        describePr(),
+      ]);
+      assert.equal(await remoteFile(55, '.agents/skills/verify-app/scripts/launch.sh'), 'echo launch\n', 'reverted');
+      assert.equal(await remoteFile(55, '.agents/skills/verify-app/features/hello.md'), '# Hello\n\nSays hello.\n');
+      const body = github.prs[0]!.body;
+      assert.match(body, /ℹ️ \*\*This change edits the feature map\*\* \(`\.agents\/skills\/verify-app\/features\/hello\.md`\)/);
+      assert.match(body, /⚠️ \*\*The implementer changed the verification skill\*\* \(`\.agents\/skills\/verify-app\/scripts\/launch\.sh`\)\. Those changes were reverted/);
+    });
+
+    test('no verification skill: skipped, and the PR says how to add one', async () => {
+      const { github, runIssue } = await fixture();
+      github.addIssue(56);
+      await runIssue(56, [plan(), write('hello.txt', 'hello\n'), done(), ...approve(), describePr()]);
+      assert.match(github.prs[0]!.body, /## Evidence\n\n- ⚪ \*\*Not verified in the app\.\*\* This repo has no verification skill[^]*`\/create-verification-skill`/);
+    });
   });
 
   test('failing checks go back to the implementer with the output', async () => {

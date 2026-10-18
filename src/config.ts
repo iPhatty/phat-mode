@@ -11,8 +11,8 @@ export type ModelChoice = {
 };
 
 /** The agents phat-mode runs. */
-export type Role = 'plan' | 'implement' | 'review';
-export const ROLES: readonly Role[] = ['plan', 'implement', 'review'];
+export type Role = 'plan' | 'implement' | 'review' | 'verify';
+export const ROLES: readonly Role[] = ['plan', 'implement', 'review', 'verify'];
 
 export type Config = {
   /** GitHub repository, "owner/name". */
@@ -48,6 +48,8 @@ export type Config = {
     maxCheckFixes: number;
     /** Review rounds before the PR is opened with any remaining findings listed. */
     maxReviewRounds: number;
+    /** Verification rounds, counting the first one. */
+    maxVerifyRounds: number;
     /** Hard cap on implementer runs per issue. */
     maxImplementRuns: number;
     checkTimeoutMs: number;
@@ -81,6 +83,7 @@ export function defaultConfig(home = DEFAULT_HOME): Config {
     limits: {
       maxCheckFixes: 3,
       maxReviewRounds: 2,
+      maxVerifyRounds: 2,
       maxImplementRuns: 8,
       checkTimeoutMs: 10 * 60_000,
       installTimeoutMs: 15 * 60_000,
@@ -129,6 +132,11 @@ export const paths = {
   repoClone: (config: Config) => join(config.home, 'repos', config.repo.replace('/', '__')),
   workspace: (config: Config, issue: number) =>
     join(config.home, 'workspaces', config.repo.replace('/', '__'), `issue-${issue}`),
+  /** The base branch checkout, for "before" evidence. */
+  baseWorkspace: (config: Config) => join(config.home, 'workspaces', config.repo.replace('/', '__'), 'base'),
+  /** phat-mode's copies of verification evidence, kept until published. */
+  evidence: (config: Config, issue: number) =>
+    join(config.home, 'evidence', config.repo.replace('/', '__'), `issue-${issue}`),
 };
 
 export const branchFor = (issue: number) => `phat-mode/issue-${issue}`;
