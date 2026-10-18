@@ -30,7 +30,7 @@ import {
   type StandardsReport,
   standardsSources,
 } from './code-review.ts';
-import { eligibility, type Spec } from './spec.ts';
+import { eligibility, type ParentIssue, parentRef, type Spec } from './spec.ts';
 import { mkdir } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { branchFor, type Config, modelFor, paths } from './config.ts';
@@ -135,6 +135,9 @@ type Phase<P extends PipelineState['phase']> = RunningTask<PipelineInput, Extrac
 class StepFailure extends Error {}
 
 const MARKERS = { plan: commentMarker('plan'), result: commentMarker('result') };
+
+/** A parent issue is background; long specs (PRDs) are cut so they do not crowd out the issue itself. */
+const PARENT_MAX_CHARS = 20_000;
 
 /** Where the planner and implementer keep downloads and working files: next to the workspace, never committed. */
 export const scratchFor = (workspace: string) => `${workspace}-scratch`;
@@ -255,6 +258,32 @@ export function createPipeline(services: Services) {
     return urls;
   }
 
+  /**
+   * The issue's parent (the larger plan it is part of: GitHub's native parent, else "## Parent #N" in its body), as
+   * background for every agent. Only from a trusted author, like an Agent Brief; anything else is left out.
+   */
+  async function findParent(issue: Issue): Promise<ParentIssue | undefined> {
+    const number = (await github.parentIssue(issue.number)) ?? parentRef(issue.body, config.repo);
+    if (number === undefined || number === issue.number) return undefined;
+    const parent = await github.getIssue(number).catch(() => undefined);
+    if (parent === undefined) {
+      logger.step(issue.number, `Parent #${number} could not be read; continuing without it`);
+      return undefined;
+    }
+    if (!config.allowedAuthors.includes(parent.author)) {
+      logger.step(issue.number, `Parent #${number} is by ${parent.author}, not a trusted author; leaving it out`);
+      return undefined;
+    }
+    const body = parent.body.trim();
+    logger.step(issue.number, `Parent #${number}: "${parent.title}" (background for the agents)`);
+    return {
+      number,
+      title: parent.title,
+      author: parent.author,
+      body: body.length > PARENT_MAX_CHARS ? `${body.slice(0, PARENT_MAX_CHARS)}\n… (truncated)` : body,
+    };
+  }
+
   /** The last step before publishing: the implementer writes the pull request description. */
   const toDescribe = (runtime: Runtime, state: Work & Reviewed, verification: Verification, context: Context) =>
     goWithBaseline(
@@ -299,7 +328,7 @@ export function createPipeline(services: Services) {
           await finish(runtime, { status: 'ignored', reason: eligible.reason }, context);
           return;
         }
-        const { spec } = eligible;
+        let { spec } = eligible;
         const blockers = await github.openBlockers(number, spec.blockedBy);
         if (blockers.length > 0) {
           const reason = `#${number} is blocked by ${blockers.map((blocker) => `#${blocker}`).join(', ')}, still open.`;
@@ -307,6 +336,8 @@ export function createPipeline(services: Services) {
           await finish(runtime, { status: 'ignored', reason }, context);
           return;
         }
+        const parent = await findParent(fetched);
+        if (parent !== undefined) spec = { ...spec, parent };
         // The spec is kept on its own; comments are not needed again.
         const issue: Issue = { ...fetched, comments: [] };
         logger.step(

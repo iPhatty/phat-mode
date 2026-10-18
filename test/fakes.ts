@@ -15,6 +15,11 @@ export class FakeGitHub implements GitHub {
     state: PullRequestState;
   })[] = [];
   readied: number[] = [];
+  /** Native parents: issue → parent. */
+  parents = new Map<number, number>();
+  async parentIssue(issue: number) {
+    return this.parents.get(issue);
+  }
 
   addIssue(number: number, fields: Partial<Issue> = {}) {
     this.issues.set(number, {

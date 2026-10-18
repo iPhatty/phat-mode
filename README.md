@@ -30,7 +30,7 @@ phat-mode builds from, in order:
 1. the newest **Agent Brief** comment by a trusted author (`allowedAuthors`), from `/triage`, either the `## Agent Brief` template or a short inline `Agent brief: …`. The issue body is then background.
 2. otherwise the **issue body**, if a trusted author opened the issue, as `/to-tickets` and `/to-spec` write them.
 
-Acceptance criteria, out-of-scope lists and `Blocked by` references are read from either. Blockers are also read from GitHub's native issue dependencies.
+Acceptance criteria, out-of-scope lists and `Blocked by` references are read from either. The **parent issue** (GitHub's native parent, else `## Parent #N` in the body), when a trusted author wrote it, is given to every agent as background: the larger plan, followed where the spec is silent, never against it. Blockers are also read from GitHub's native issue dependencies.
 
 ### Labels
 

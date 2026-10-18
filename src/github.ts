@@ -66,6 +66,8 @@ export interface GitHub {
   editLabels(number: number, change: LabelChange): Promise<void>;
   /** Which of `mentioned`, and of the issue's native "blocked by" dependencies, are still open. */
   openBlockers(issue: number, mentioned: readonly number[]): Promise<number[]>;
+  /** The issue's native parent (sub-issues), if it has one. */
+  parentIssue(issue: number): Promise<number | undefined>;
 }
 
 /** Hidden marker that identifies a phat-mode comment. */
@@ -239,6 +241,15 @@ export class GhGitHub implements GitHub {
       if (result.code === 0 && result.stdout.trim() === 'open') open.add(number);
     }
     return [...open].sort((a, b) => a - b);
+  }
+
+  async parentIssue(issue: number): Promise<number | undefined> {
+    // 404 when the issue has no parent.
+    const result = await run('gh', ['api', `repos/${this.#repo}/issues/${issue}/parent`, '--jq', '.number'], {
+      allowFailure: true,
+    });
+    const number = Number(result.stdout.trim());
+    return result.code === 0 && Number.isInteger(number) && number > 0 ? number : undefined;
   }
 
   async editLabels(number: number, change: LabelChange): Promise<void> {

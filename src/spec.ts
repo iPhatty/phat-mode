@@ -15,7 +15,11 @@ export type Spec = {
   outOfScope: string[];
   /** Issue numbers listed under "Blocked by". */
   blockedBy: number[];
+  /** The larger plan this issue is part of, when a trusted author wrote it: background, not the contract. */
+  parent?: ParentIssue;
 };
+
+export type ParentIssue = { number: number; title: string; author: string; body: string };
 
 /** Start of an Agent Brief: a `## Agent Brief` heading, or a paragraph starting `Agent brief:` (optionally bold). */
 const BRIEF_START = /^(?:#{1,3}[ \t]*Agent Brief[ \t]*$|(?:\*\*)?Agent brief:?(?:\*\*)?:?[ \t])/im;
@@ -44,23 +48,35 @@ export function listUnder(text: string, label: string): string[] {
 }
 
 /** Issue numbers referenced under "Blocked by", as `#12` or a link to an issue in `repo`. "None" gives none. */
-export function blockedBy(text: string, repo: string): number[] {
+/** Issue numbers referenced in the section titled `label` (a heading or a bold label), as `#12` or a link into `repo`. */
+function sectionRefs(text: string, label: string, repo: string): number[] {
+  const title = new RegExp(`^(?:#{1,6}\\s*|\\*\\*)${label}:?(?:\\*\\*)?:?`, 'i');
   const lines = text.split('\n');
-  const start = lines.findIndex((line) => /^(?:#{1,6}\s*|\*\*)Blocked by:?(?:\*\*)?:?/i.test(line.trim()));
+  const start = lines.findIndex((line) => title.test(line.trim()));
   if (start === -1) return [];
   // The section: the rest of its own line, then lines until the next section.
-  const own = lines[start]!.replace(/^(?:#{1,6}\s*|\*\*)Blocked by:?(?:\*\*)?:?/i, '');
+  const own = lines[start]!.trim().replace(title, '');
   const rest: string[] = [];
   for (const line of lines.slice(start + 1)) {
     if (isSectionStart(line.trim())) break;
     rest.push(line);
   }
   const section = [own, ...rest].join('\n');
-  const numbers = new Set<number>();
-  for (const match of section.matchAll(/(?:^|[\s(,])#(\d+)\b/g)) numbers.add(Number(match[1]));
-  const link = new RegExp(`github\\.com/${repo.replace('/', '\\/')}/issues/(\\d+)`, 'gi');
-  for (const match of section.matchAll(link)) numbers.add(Number(match[1]));
-  return [...numbers].sort((a, b) => a - b);
+  const numbers: number[] = [];
+  const add = (n: number) => (numbers.includes(n) ? undefined : numbers.push(n));
+  const link = new RegExp(`(?:^|[\\s(,])#(\\d+)\\b|github\\.com/${repo.replace('/', '\\/')}/issues/(\\d+)`, 'gi');
+  for (const match of section.matchAll(link)) add(Number(match[1] ?? match[2]));
+  return numbers;
+}
+
+/** Issue numbers referenced under "Blocked by", as `#12` or a link to an issue in `repo`. "None" gives none. */
+export function blockedBy(text: string, repo: string): number[] {
+  return sectionRefs(text, 'Blocked by', repo).sort((a, b) => a - b);
+}
+
+/** The parent issue named under "Parent" (as `/to-tickets` writes it), if any: the first reference there. */
+export function parentRef(text: string, repo: string): number | undefined {
+  return sectionRefs(text, 'Parent', repo)[0];
 }
 
 function specFrom(source: Spec['source'], author: string, text: string, repo: string): Spec {

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { defaultConfig } from '../src/config.ts';
 import { type Issue, mergeLabels, progressChange } from '../src/github.ts';
-import { blockedBy, eligibility, findAgentBrief, findSpec, listUnder } from '../src/spec.ts';
+import { blockedBy, eligibility, findAgentBrief, findSpec, listUnder, parentRef } from '../src/spec.ts';
 
 const fixture = (name: string) => readFile(join(import.meta.dirname, 'fixtures', name), 'utf8');
 
@@ -88,6 +88,20 @@ describe('blockedBy', () => {
     assert.deepEqual(blockedBy('## Blocked by\n\n- None (can start immediately)', 'a/b'), []);
     assert.deepEqual(blockedBy('**Blocked by:** https://github.com/other/repo/issues/9', 'a/b'), []);
     assert.deepEqual(blockedBy('**Blocked by:** #7, #8', 'a/b'), [7, 8]);
+  });
+});
+
+describe('parentRef', () => {
+  test('the first reference under "Parent", as #N or a link into the repo', () => {
+    assert.equal(parentRef(TICKET_BODY, 'iPhatty/phatty-lingo'), 3);
+    assert.equal(parentRef('## Parent\n\nhttps://github.com/iPhatty/phatty-lingo/issues/1\n', 'iPhatty/phatty-lingo'), 1);
+    assert.equal(parentRef('**Parent:** #12', 'a/b'), 12);
+  });
+
+  test('none without a Parent section, or when it points elsewhere', () => {
+    assert.equal(parentRef('## What to build\n\nSee #4.', 'a/b'), undefined);
+    assert.equal(parentRef('## Parent\n\nhttps://github.com/other/repo/issues/1', 'a/b'), undefined);
+    assert.equal(parentRef('## Parent\n\nNone', 'a/b'), undefined);
   });
 });
 
