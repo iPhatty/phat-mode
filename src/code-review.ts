@@ -1,6 +1,5 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, relative } from 'node:path';
-import { run } from './exec.ts';
 
 /**
  * phat-mode's reviewers follow mattpocock/skills' `code-review` skill: two reviewers, in parallel and in separate
@@ -8,7 +7,7 @@ import { run } from './exec.ts';
  * code smells)? Spec: does it do what the spec asked? The pipeline does the skill's coordinator steps itself.
  */
 export type CodeReviewSkill = {
-  /** Where the skill text came from: a path on the base branch, or `bundled`. */
+  /** Which version of the skill, e.g. `mattpocock/skills@49dd158`. */
   source: string;
   /** The smell baseline, pasted in full into the Standards reviewer's prompt, as the skill says. */
   smellBaseline: string;
@@ -17,9 +16,22 @@ export type CodeReviewSkill = {
   specBrief: string;
 };
 
-/** Where the skill lives in a repo that installed it. */
-export const SKILL_PATHS = ['.agents/skills/code-review/SKILL.md', '.claude/skills/code-review/SKILL.md'];
-const BUNDLED = new URL('../skills/code-review/SKILL.md', import.meta.url);
+/**
+ * The skill is phat-mode's own, pinned copy in skills/code-review/, the same for every repo: the review process belongs
+ * to phat-mode, while each repo's documented standards (AGENTS.md and the like) say what good code means there.
+ * A copy installed in the target repo is never used, so the code under review cannot change how it is reviewed.
+ * To upgrade: copy the new upstream SKILL.md over, update PINNED and skills/code-review/README.md, run `npm test`.
+ */
+export const PINNED = {
+  commit: '49dd158d1076134a641b33efb035946536778336',
+  get short() {
+    return this.commit.slice(0, 7);
+  },
+  get url() {
+    return `https://github.com/mattpocock/skills/blob/${this.commit}/skills/engineering/code-review/SKILL.md`;
+  },
+};
+const SKILL_FILE = new URL('../skills/code-review/SKILL.md', import.meta.url);
 
 /** The parts of SKILL.md the reviewers need, or undefined if its layout changed beyond recognition. */
 export function parseCodeReviewSkill(text: string, source: string): CodeReviewSkill | undefined {
@@ -41,25 +53,16 @@ export function parseCodeReviewSkill(text: string, source: string): CodeReviewSk
   return { source, smellBaseline, standardsBrief, specBrief };
 }
 
-export async function bundledCodeReviewSkill(): Promise<CodeReviewSkill> {
-  const skill = parseCodeReviewSkill(await readFile(BUNDLED, 'utf8'), 'bundled');
-  if (skill === undefined) throw new Error('The bundled code-review skill could not be read');
-  return skill;
-}
+let loaded: Promise<CodeReviewSkill> | undefined;
 
-/**
- * The repo's own copy of the skill, read from the base branch, never the working tree: the implementer can change
- * files in the workspace, and must not be able to change the rules its work is reviewed by. Falls back to the bundled
- * copy when the repo has none, or one phat-mode cannot read.
- */
-export async function loadCodeReviewSkill(workspace: string, baseRef: string): Promise<CodeReviewSkill> {
-  for (const path of SKILL_PATHS) {
-    const shown = await run('git', ['show', `${baseRef}:${path}`], { cwd: workspace, allowFailure: true });
-    if (shown.code !== 0) continue;
-    const skill = parseCodeReviewSkill(shown.stdout, `${path} on ${baseRef}`);
-    if (skill !== undefined) return skill;
-  }
-  return bundledCodeReviewSkill();
+/** phat-mode's pinned copy of the skill. */
+export function loadCodeReviewSkill(): Promise<CodeReviewSkill> {
+  loaded ??= readFile(SKILL_FILE, 'utf8').then((text) => {
+    const skill = parseCodeReviewSkill(text, `mattpocock/skills@${PINNED.short}`);
+    if (skill === undefined) throw new Error(`phat-mode's code-review skill (${SKILL_FILE.pathname}) could not be read`);
+    return skill;
+  });
+  return loaded;
 }
 
 const STANDARDS_FILES = [

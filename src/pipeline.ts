@@ -372,7 +372,7 @@ export function createPipeline(services: Services) {
         const round = state.reviewRounds;
         logger.step(number, `Code review, round ${round}: Standards and Spec in parallel (${modelFor(config, 'review').modelId})`);
         // The coordinator steps of the code-review skill: fixed point, spec and standards sources.
-        const skill = await loadCodeReviewSkill(state.workspace, baseRef);
+        const skill = await loadCodeReviewSkill();
         const sources = await standardsSources(state.workspace);
         const before = await workspaces.fingerprint(state.workspace);
         const diff = await workspaces.diff(state.workspace);

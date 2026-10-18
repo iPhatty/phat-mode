@@ -53,7 +53,12 @@ phat-mode's reviewers follow mattpocock/skills' `code-review` skill. The pipelin
 - **Standards**: the repo's documented standards (hard violations, citing the rule) plus the skill's baseline of 12 Fowler code smells (always judgement calls).
 - **Spec**: requirements missing or partial, scope creep, and what looks wrong, each quoting the spec line. Plus one addition from phat-mode, which runs unattended: bugs, broken edge cases and leftover debugging code anywhere in the diff.
 
-Each reviewer gets the skill's brief verbatim. The skill text comes from the target repo's committed copy (`.agents/skills/code-review/SKILL.md` or `.claude/skills/...`), read from the **base branch** so the implementer cannot change the rules it is reviewed by; otherwise from the bundled copy in [`skills/code-review/`](skills/code-review/) (MIT, © Matt Pocock).
+Each reviewer gets the skill's brief verbatim, from **phat-mode's own pinned copy** in [`skills/code-review/`](skills/code-review/) (upstream commit `49dd158`, MIT, © Matt Pocock). It is the same for every repo, and a copy installed in the repo under review is never used:
+
+- The **review process** belongs to phat-mode: identical on every repo, and exactly what the tests cover. The code under review cannot change how it is reviewed.
+- **What good code means** belongs to each repo: its `AGENTS.md`, `CONTRIBUTING.md` and similar, which the Standards reviewer reads. A documented repo rule overrides a baseline smell, as the skill says.
+
+To upgrade the skill: copy the new upstream `SKILL.md` into `skills/code-review/`, update `PINNED` in `src/code-review.ts` and the commit in `skills/code-review/README.md`, and run `npm test` (it fails if the skill's layout changed).
 
 The skill gives no verdict, so phat-mode decides:
 
@@ -141,7 +146,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 
 - `src/pipeline.ts`: the durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again.
 - `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
-- `src/code-review.ts`: reads the code-review skill (from the base branch, or the bundled copy), finds standards sources, and decides what must be fixed.
+- `src/code-review.ts`: reads phat-mode's pinned code-review skill, finds standards sources, and decides what must be fixed.
 - `src/agents.ts`: the four agents (planner, implementer, Standards and Spec reviewers), their tools, the report tools agents finish with, and the guard hook.
 - `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code.
 - Issue comments carry hidden markers, so a rerun updates its comment instead of posting again.

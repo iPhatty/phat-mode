@@ -1,5 +1,5 @@
 import type { DoneReport, PlanReport } from './agents.ts';
-import { type AxisReport, type CodeReview, needsFixes, type SpecFinding, type StandardsFinding } from './code-review.ts';
+import { type AxisReport, type CodeReview, needsFixes, PINNED, type SpecFinding, type StandardsFinding } from './code-review.ts';
 import type { Spec } from './spec.ts';
 import type { Issue } from './github.ts';
 
@@ -63,7 +63,7 @@ export function doneComment(prUrl: string): string {
   return `🤖 **phat-mode opened a draft pull request:** ${prUrl}`;
 }
 
-const SKILL_LINK = '[code-review](https://github.com/mattpocock/skills/blob/main/skills/engineering/code-review/SKILL.md)';
+const SKILL_LINK = `[code-review @ ${PINNED.short}](${PINNED.url})`;
 
 const standardsItem = (finding: StandardsFinding) =>
   finding.kind === 'violation'
