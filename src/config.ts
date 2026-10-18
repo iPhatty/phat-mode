@@ -87,6 +87,7 @@ export async function loadConfig(home = DEFAULT_HOME): Promise<Config> {
 
 export const paths = {
   state: (config: Config) => join(config.home, 'state.sqlite'),
+  lock: (config: Config) => join(config.home, 'state.sqlite.lock'),
   credentials: (config: Config) => join(config.home, 'auth.json'),
   repoClone: (config: Config) => join(config.home, 'repos', config.repo.replace('/', '__')),
   workspace: (config: Config, issue: number) =>

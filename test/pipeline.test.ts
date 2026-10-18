@@ -19,6 +19,7 @@ import { branchFor, type Config, defaultConfig, paths } from '../src/config.ts';
 import { run } from '../src/exec.ts';
 import type { GitHub, Issue, PullRequest, StatusLabel } from '../src/github.ts';
 import { openPhatMode } from '../src/harness.ts';
+import { LockedError } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
 import type { PipelineResult, Services } from '../src/pipeline.ts';
 import { type CheckResult, type Checks, GitWorkspaces } from '../src/workspace.ts';
@@ -165,7 +166,7 @@ async function fixture() {
     faux.setResponses(responses);
     const models = createModels();
     models.setProvider(faux.provider);
-    const storage = await openNodeSqliteStorage(join(dir, 'state.sqlite'));
+    const storage = () => openNodeSqliteStorage(join(dir, 'state.sqlite'));
     const phat = await openPhatMode(services, context, { storage, models });
     return { phat, faux };
   };
@@ -348,5 +349,14 @@ describe('pipeline', () => {
     assert.equal(github.comments.filter((comment) => comment.marker.includes('triage')).length, 1);
     assert.equal(github.prs.length, 1);
     assert.equal(await remoteFile(9, 'hello.txt'), 'hello\n');
+  });
+
+  test('only one process can open the state: a second open is refused until the first closes', async () => {
+    const { open } = await fixture();
+    const first = await open([]);
+    await assert.rejects(open([]), LockedError);
+    await first.phat.close(context);
+    const second = await open([]);
+    await second.phat.close(context);
   });
 });

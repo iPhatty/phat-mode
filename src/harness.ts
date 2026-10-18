@@ -16,6 +16,7 @@ import { Guard, Tools } from './agents.ts';
 import { paths } from './config.ts';
 import { FileCredentialStore } from './credentials.ts';
 import { agentEnv } from './exec.ts';
+import { acquireLock } from './lock.ts';
 import { createPipeline, type PipelineInput, type PipelineResult, type Services } from './pipeline.ts';
 
 /** Every run phat-mode started, newest last per issue. Stored on the root conversation. */
@@ -45,7 +46,13 @@ export type PhatMode = {
 };
 
 export type OpenOptions = {
-  storage?: Storage;
+  /**
+   * Pi Durable storage has no cross-process locking: one process may use it at a time. This lock enforces that.
+   * Default: `<home>/state.sqlite.lock`. `false` only for storage that is not shared, such as in-memory storage.
+   */
+  lock?: { path?: string; command?: string } | false;
+  /** Opens the storage; called only once the lock is held. Default: SQLite at `<home>/state.sqlite`. */
+  storage?: () => Promise<Storage>;
   models?: Models;
   onReport?: (error: unknown) => void;
 };
@@ -58,30 +65,44 @@ export async function openPhatMode(services: Services, context: Context, options
   registry.install(Guard);
   registry.install(extension);
 
-  const storage = options.storage ?? (await openNodeSqliteStorage(paths.state(config)));
-  const models = options.models ?? createCopilotModels(new FileCredentialStore(paths.credentials(config)));
-  const shellEnv = agentEnv();
+  // Take the lock before touching the database, so a second process never resumes the same tasks.
+  const lock =
+    options.lock === false
+      ? undefined
+      : await acquireLock(options.lock?.path ?? paths.lock(config), options.lock?.command ?? 'phat-mode');
 
-  const harness = await Harness.open(
-    storage,
-    {
-      models,
-      registry,
-      // Each agent's tools run in its issue's workspace, without the user's tokens in the environment.
-      env: ({ cwd }) => (cwd === undefined ? undefined : new NodeExecutionEnv({ cwd, shellEnv })),
-      settings: { retry: { maxRetries: 3 }, stream: { timeoutMs: 300_000 } },
-      onReport: (error) => options.onReport?.(error),
-    },
-    context,
-  );
-  const root = await harness.root(context);
+  let harness: Harness | undefined;
+  let root: Conversation;
+  try {
+    const storage = await (options.storage ?? (() => openNodeSqliteStorage(paths.state(config))))();
+    const models = options.models ?? createCopilotModels(new FileCredentialStore(paths.credentials(config)));
+    const shellEnv = agentEnv();
+    harness = await Harness.open(
+      storage,
+      {
+        models,
+        registry,
+        // Each agent's tools run in its issue's workspace, without the user's tokens in the environment.
+        env: ({ cwd }) => (cwd === undefined ? undefined : new NodeExecutionEnv({ cwd, shellEnv })),
+        settings: { retry: { maxRetries: 3 }, stream: { timeoutMs: 300_000 } },
+        onReport: (error) => options.onReport?.(error),
+      },
+      context,
+    );
+    root = await harness.root(context);
+  } catch (error) {
+    await harness?.close(context).catch(() => {});
+    await lock?.release();
+    throw error;
+  }
+  const opened = harness;
 
   async function start(input: PipelineInput, context: Context) {
     const key = runKey(input);
-    const runs = (await harness.snapshot(RunsDoc, root.id, context))?.runs[key] ?? [];
+    const runs = (await opened.snapshot(RunsDoc, root.id, context))?.runs[key] ?? [];
     const latest = runs.at(-1);
     if (latest !== undefined) {
-      const record = await harness.getTask(latest.taskId as unknown as TaskId<PipelineResult>, context);
+      const record = await opened.getTask(latest.taskId as unknown as TaskId<PipelineResult>, context);
       if (record !== undefined && record.state.status !== 'terminal') {
         return { taskId: latest.taskId as unknown as TaskId<PipelineResult>, resumed: true };
       }
@@ -97,5 +118,15 @@ export async function openPhatMode(services: Services, context: Context, options
     return { taskId, resumed: false };
   }
 
-  return { harness, root, start, close: (context) => harness.close(context) };
+  let closed: Promise<void> | undefined;
+  const close = (context: Context) =>
+    (closed ??= (async () => {
+      try {
+        await opened.close(context);
+      } finally {
+        await lock?.release();
+      }
+    })());
+
+  return { harness: opened, root, start, close };
 }

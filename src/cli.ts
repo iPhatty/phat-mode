@@ -8,11 +8,14 @@ import { FileCredentialStore, importPiCredential } from './credentials.ts';
 import { run } from './exec.ts';
 import { GhGitHub } from './github.ts';
 import { createCopilotModels, openPhatMode, RunsDoc } from './harness.ts';
+import { LockedError } from './lock.ts';
 import { consoleLogger } from './log.ts';
 import type { PipelineResult, Services } from './pipeline.ts';
 import { CommandChecks, GitWorkspaces } from './workspace.ts';
 
 const context = BACKGROUND_CONTEXT;
+/** Recorded in the lock file, so a second process can say what is running. */
+const lock = { command: `phat-mode ${process.argv.slice(2).join(' ')}`.trim() };
 const PROVIDER = 'github-copilot';
 
 const USAGE = `phat-mode: turn GitHub issues into draft pull requests
@@ -47,6 +50,7 @@ function services(config: Config): Services {
 async function open(config: Config) {
   setToolLogger(consoleLogger);
   const phat = await openPhatMode(services(config), context, {
+    lock,
     onReport: (error) => consoleLogger.error(`Report: ${error instanceof Error ? error.message : String(error)}`),
   });
   // Ctrl-C stops cleanly. Everything is saved; `phat-mode run` or `resume` continues where it stopped.
@@ -159,7 +163,7 @@ async function doctor(config: Config): Promise<number> {
 }
 
 async function status(config: Config): Promise<number> {
-  const phat = await openPhatMode(services(config), context);
+  const phat = await openPhatMode(services(config), context, { lock });
   try {
     const runs = (await phat.harness.snapshot(RunsDoc, phat.root.id, context))?.runs ?? {};
     const keys = Object.keys(runs);
@@ -229,7 +233,7 @@ async function main(argv: string[]): Promise<number> {
     }
     case 'abort': {
       const issue = Number(arg);
-      const phat = await openPhatMode(services(config), context);
+      const phat = await openPhatMode(services(config), context, { lock });
       const list = (await phat.harness.snapshot(RunsDoc, phat.root.id, context))?.runs[`${config.repo}#${issue}`];
       if (list === undefined) {
         console.log(`No run for #${issue}.`);
@@ -248,4 +252,10 @@ async function main(argv: string[]): Promise<number> {
   }
 }
 
-process.exitCode = await main(process.argv.slice(2));
+try {
+  process.exitCode = await main(process.argv.slice(2));
+} catch (error) {
+  if (!(error instanceof LockedError)) throw error;
+  console.error(`✖ ${error.message}`);
+  process.exitCode = 3;
+}

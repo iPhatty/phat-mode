@@ -42,6 +42,8 @@ node src/cli.ts doctor            # checks everything
 
 Ctrl-C is always safe: progress is saved, and `run` or `resume` continues from the last step.
 
+Only one phat-mode process can use `~/.phat-mode` at a time (Pi Durable storage has no cross-process locking). A second one exits with `phat-mode is already running (…)`. A lock left by a crashed process is taken over automatically.
+
 ## Configuration
 
 Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`src/config.ts`](src/config.ts):
@@ -59,7 +61,7 @@ Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`sr
 }
 ```
 
-`~/.phat-mode/` also holds the state database, the Copilot login (`auth.json`, owner-only) and the workspaces (`workspaces/<repo>/issue-<n>`).
+`~/.phat-mode/` also holds the state database (`state.sqlite`) and its lock, the Copilot login (`auth.json`, owner-only) and the workspaces (`workspaces/<repo>/issue-<n>`).
 
 ## Safety
 
