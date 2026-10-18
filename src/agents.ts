@@ -44,6 +44,8 @@ export type PlanReport = {
   questions: string[];
   /** For needs_human: why. */
   reason: string;
+  /** What the planner found out that the implementer needs, so it does not redo the research. */
+  notes?: string;
 };
 export type DoneReport = { summary: string; testing: string };
 
@@ -96,6 +98,10 @@ export const reportPlan = defineTool({
       description: 'For needs_info: specific, actionable questions for the author. Empty otherwise.',
     }),
     reason: Type.String({ description: 'For needs_human: why an agent should not do this. Empty otherwise.' }),
+    notes: Type.String({
+      description:
+        'When proceeding: what you found out that the implementer needs (sources, URLs, commands that worked, facts about the data or code, files you left in the scratch folder), so it does not redo your research. Empty if nothing.',
+    }),
   }),
   execute: async (args, api, context) => {
     await api.commit(async (tx) => {

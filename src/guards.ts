@@ -39,8 +39,20 @@ const BLOCKED_COMMANDS: { pattern: RegExp; reason: string }[] = [
   { pattern: /\bsudo\b/, reason: 'sudo is not allowed' },
   { pattern: /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+(\/|~|\$HOME)(\s|$|\/\*?\s*$)/, reason: 'deleting outside the workspace is not allowed' },
   { pattern: /\b(security|keychain)\b.*\b(find|dump|export)/, reason: 'reading the keychain is not allowed' },
-  { pattern: /\.(ssh|aws|config\/gh|phat-mode|pi\/agent)\b/, reason: 'reading credential folders is not allowed' },
+  { pattern: /\.(ssh|aws|config\/gh|pi\/agent)\b/, reason: 'reading credential folders is not allowed' },
 ];
+
+/**
+ * phat-mode's home holds credentials and state, but also the workspaces agents work in. Paths into
+ * `.phat-mode/workspaces/` are allowed; anything else there is not, including a way out with `..`.
+ */
+function phatModeHomeBlocked(command: string): boolean {
+  for (const match of command.matchAll(/\.phat-mode\b([^\s'"`;|&<>()]*)/g)) {
+    const rest = match[1] ?? '';
+    if (!rest.startsWith('/workspaces/') || /(^|\/)\.\.(\/|$)/.test(rest)) return true;
+  }
+  return false;
+}
 
 export function bashBlockReason(command: string): string | undefined {
   const git = gitSubcommands(command).find((subcommand) => BLOCKED_GIT.has(subcommand));
@@ -50,6 +62,7 @@ export function bashBlockReason(command: string): string | undefined {
   for (const { pattern, reason } of BLOCKED_COMMANDS) {
     if (pattern.test(command)) return `Blocked: ${reason}.`;
   }
+  if (phatModeHomeBlocked(command)) return 'Blocked: reading credential folders is not allowed.';
   return undefined;
 }
 

@@ -51,6 +51,29 @@ describe('bashBlockReason', () => {
     }
   });
 
+  test('phat-mode home: workspaces allowed, everything else blocked, including a way out with ..', () => {
+    const ws = '/Users/me/.phat-mode/workspaces/iPhatty__phatty-lingo';
+    for (const command of [
+      `cd ${ws}/issue-2 && git diff origin/main --stat`,
+      `sips -Z 1200 ${ws}/base/.verify/evidence/x/03.png --out ${ws}/issue-2-scratch/b.png`,
+      `ls '${ws}/issue-2'`,
+      'cat ~/.phat-mode/workspaces/a/issue-1/README.md',
+    ]) {
+      assert.equal(bashBlockReason(command), undefined, command);
+    }
+    for (const command of [
+      'cat ~/.phat-mode/auth.json',
+      'sqlite3 ~/.phat-mode/state.sqlite',
+      'ls ~/.phat-mode',
+      'cat ~/.phat-mode/workspaces/../auth.json',
+      `cat ${ws}/../../auth.json`,
+      `cd ${ws}/issue-2 && cat ~/.phat-mode/auth.json`,
+      'cp $HOME/.phat-mode/config.json /tmp',
+    ]) {
+      assert.match(bashBlockReason(command) ?? '', /credential folders/, command);
+    }
+  });
+
   test('blocks sudo, deleting home or root, and reading credentials', () => {
     for (const command of ['sudo rm x', 'rm -rf ~', 'rm -rf /', 'cat ~/.ssh/id_ed25519', 'cat ~/.phat-mode/auth.json', 'cat ~/.config/gh/hosts.yml']) {
       assert.match(bashBlockReason(command) ?? '', /^Blocked:/, command);

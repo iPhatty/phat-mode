@@ -6,6 +6,7 @@ import { describe, test } from 'node:test';
 import { FileCredentialStore, importPiCredential } from '../src/credentials.ts';
 import { agentEnv } from '../src/exec.ts';
 import { evidence, pullRequestBody } from '../src/messages.ts';
+import { ROLE_INSTRUCTIONS } from '../src/prompts.ts';
 
 const issue = { number: 7, title: 'Save progress', body: '', author: 'iPhatty', state: 'OPEN' as const, url: '', labels: [], comments: [] };
 const spec = { source: 'issue' as const, author: 'iPhatty', text: '', acceptanceCriteria: [], outOfScope: [], blockedBy: [] };
@@ -152,5 +153,15 @@ describe('FileCredentialStore', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('instructions', () => {
+  test('the verifier keeps its files inside the two checkouts', () => {
+    assert.match(ROLE_INSTRUCTIONS.verify, /Keep every file you make inside the two checkouts[^]*not in \/tmp/);
+  });
+
+  test('the planner hands its research over instead of leaving it for the implementer to redo', () => {
+    assert.match(ROLE_INSTRUCTIONS.plan, /put in report_plan's notes, and leave any files you download in the scratch folder/);
   });
 });

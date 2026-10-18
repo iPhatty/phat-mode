@@ -31,6 +31,7 @@ import {
   standardsSources,
 } from './code-review.ts';
 import { eligibility, type Spec } from './spec.ts';
+import { mkdir } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { branchFor, type Config, modelFor, paths } from './config.ts';
 import { prSkill } from './pr.ts';
@@ -134,6 +135,9 @@ type Phase<P extends PipelineState['phase']> = RunningTask<PipelineInput, Extrac
 class StepFailure extends Error {}
 
 const MARKERS = { plan: commentMarker('plan'), result: commentMarker('result') };
+
+/** Where the planner and implementer keep downloads and working files: next to the workspace, never committed. */
+export const scratchFor = (workspace: string) => `${workspace}-scratch`;
 
 const NO_VERIFY_SKILL =
   'This repo has no verification skill (a `verify-*` skill in `.agents/skills`, `.claude/skills` or `.cursor/skills`). Create one with `/create-verification-skill`.';
@@ -311,6 +315,7 @@ export function createPipeline(services: Services) {
         );
         await github.editLabels(number, progressChange('working'));
         const workspace = await workspaces.prepare(number);
+        await mkdir(scratchFor(workspace), { recursive: true });
         logger.step(number, `Workspace ready: ${workspace}`);
 
         await runtime.commit(async (tx) => {
@@ -341,7 +346,7 @@ export function createPipeline(services: Services) {
           {
             conversation: state.conversations.plan,
             requestId: 'plan',
-            prompt: planPrompt(issue, spec),
+            prompt: planPrompt(issue, spec, scratchFor(state.workspace)),
             baseline: 0,
             type: 'plan',
             tool: 'report_plan',
@@ -372,7 +377,7 @@ export function createPipeline(services: Services) {
         }
         await github.upsertComment(issue.number, MARKERS.plan, planComment(plan));
         const start: Work = { ...state, plan, runs: 0, checkFixes: 0, reviewRounds: 0, verifyRounds: 0, done: null };
-        await toImplement(runtime, start, implementPrompt(issue, spec, plan), context);
+        await toImplement(runtime, start, implementPrompt(issue, spec, plan, scratchFor(state.workspace)), context);
       }),
 
       implement: guarded<'implement'>(async (task, runtime, context) => {
