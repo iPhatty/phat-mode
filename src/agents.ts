@@ -12,11 +12,19 @@ import { createBashTool, createEditTool, createReadTool, createWriteTool } from 
 import { bashBlockReason, writeBlockReason } from './guards.ts';
 import { consoleLogger, type Logger, oneLine } from './log.ts';
 
-export type { Role } from './config.ts';
+import type { SpecReport, StandardsReport } from './code-review.ts';
 import type { Role } from './config.ts';
 
+/**
+ * The agents of one issue. The two reviewers follow mattpocock/skills' code-review skill, one per axis, and both use
+ * the `review` model.
+ */
+export type Agent = 'plan' | 'implement' | 'standards' | 'spec';
+export const AGENTS: readonly Agent[] = ['plan', 'implement', 'standards', 'spec'];
+export const modelRole = (agent: Agent): Role => (agent === 'standards' || agent === 'spec' ? 'review' : agent);
+
 /** Who a conversation is: stored with it, so hooks know its role and workspace, also after a restart. */
-export const RoleDoc = defineDoc<{ role: Role | null; issue: number | null; workspace: string | null }>({
+export const RoleDoc = defineDoc<{ role: Agent | null; issue: number | null; workspace: string | null }>({
   kind: 'phat.role',
   version: 1,
   scope: 'conversation',
@@ -37,12 +45,12 @@ export type PlanReport = {
   reason: string;
 };
 export type DoneReport = { summary: string; testing: string };
-export type ReviewReport = { verdict: 'approve' | 'changes'; summary: string; findings: string[] };
 
 export type Report =
   | { type: 'plan'; data: PlanReport }
   | { type: 'done'; data: DoneReport }
-  | { type: 'review'; data: ReviewReport };
+  | { type: 'standards'; data: StandardsReport }
+  | { type: 'spec'; data: SpecReport };
 
 /** Reports an agent made, in order. The pipeline reads the ones after a baseline it stored before asking. */
 export const ReportsDoc = defineDoc<{ items: Report[] }>({
@@ -97,23 +105,63 @@ export const reportDone = defineTool({
   },
 });
 
-export const reportReview = defineTool({
-  name: 'report_review',
-  description: 'Report your review verdict. Call this exactly once, as your final action.',
+const axisFields = {
+  summary: Type.String({ description: 'Your report on this axis, under 400 words.' }),
+  worst: Type.String({ description: 'The worst issue on this axis, in one line. Empty when there are no findings.' }),
+};
+
+export const reportStandards = defineTool({
+  name: 'report_standards',
+  description: 'Report your Standards review. Call this exactly once, as your final action.',
   parameters: Type.Object({
-    verdict: StringEnum(['approve', 'changes'], {
-      description: 'approve: ready for a human to review. changes: there are problems that must be fixed first.',
-    }),
-    summary: Type.String({ description: 'One or two sentences on the overall change.' }),
-    findings: Type.Array(Type.String(), {
-      description: 'Concrete problems that must be fixed, each with file and reason. Empty when approving.',
-    }),
+    ...axisFields,
+    findings: Type.Array(
+      Type.Object({
+        kind: StringEnum(['violation', 'smell'], {
+          description: 'violation: breaks a documented repo standard. smell: a baseline smell, always a judgement call.',
+        }),
+        where: Type.String({ description: 'File and hunk or line, e.g. src/curriculum/path.ts:42.' }),
+        rule: Type.String({
+          description: 'For a violation: the standards file and the rule. For a smell: its name, e.g. "possible Feature Envy".',
+        }),
+        detail: Type.String({ description: 'What is wrong, quoting the hunk where useful, and how to fix it.' }),
+      }),
+      { description: 'Empty when the change follows the standards.' },
+    ),
   }),
   execute: async (args, api, context) => {
     await api.commit(async (tx) => {
-      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'review', data: { ...args } as ReviewReport });
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'standards', data: { ...args } as StandardsReport });
     }, context);
-    return recorded('Review recorded.');
+    return recorded('Standards review recorded.');
+  },
+});
+
+export const reportSpec = defineTool({
+  name: 'report_spec',
+  description: 'Report your Spec review. Call this exactly once, as your final action.',
+  parameters: Type.Object({
+    ...axisFields,
+    findings: Type.Array(
+      Type.Object({
+        kind: StringEnum(['missing', 'unasked', 'wrong', 'bug'], {
+          description:
+            'missing: asked for, but missing or partial. unasked: not asked for (scope creep). ' +
+            'wrong: looks implemented, but the implementation looks wrong. ' +
+            'bug: a bug, broken edge case or leftover debugging code, wherever it is.',
+        }),
+        where: Type.String({ description: 'File and hunk or line, when the finding is about code. Empty otherwise.' }),
+        specLine: Type.String({ description: 'The spec line this is about, quoted exactly. Empty only for a bug no spec line covers.' }),
+        detail: Type.String({ description: 'What is wrong, and how to fix it.' }),
+      }),
+      { description: 'Empty when the change does what the spec asks.' },
+    ),
+  }),
+  execute: async (args, api, context) => {
+    await api.commit(async (tx) => {
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'spec', data: { ...args } as SpecReport });
+    }, context);
+    return recorded('Spec review recorded.');
   },
 });
 
@@ -125,10 +173,11 @@ export const tools = {
 };
 
 /** The tools each role may use. Only the implementer can change files. */
-export const ROLE_TOOLS: Record<Role, ToolRegistration[]> = {
+export const ROLE_TOOLS: Record<Agent, ToolRegistration[]> = {
   plan: [tools.read, tools.bash, reportPlan],
   implement: [tools.read, tools.bash, tools.write, tools.edit, reportDone],
-  review: [tools.read, tools.bash, reportReview],
+  standards: [tools.read, tools.bash, reportStandards],
+  spec: [tools.read, tools.bash, reportSpec],
 };
 
 let logger: Logger = consoleLogger;
@@ -171,5 +220,5 @@ export const Guard = defineExtension({
 
 export const Tools: Extension = defineExtension({
   name: 'phat.tools',
-  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportDone, reportReview],
+  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportDone, reportStandards, reportSpec],
 });

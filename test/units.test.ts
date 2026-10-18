@@ -12,37 +12,64 @@ const spec = { source: 'issue' as const, author: 'iPhatty', text: '', acceptance
 const plan = { decision: 'proceed' as const, summary: 'Save lesson progress.', plan: ['Add storage', 'Test it'], established: [], questions: [], reason: '' };
 
 describe('pullRequestBody', () => {
-  test('links the issue and lists summary, plan, testing and the approval', () => {
+  const details = {
+    issue,
+    spec,
+    plan,
+    done: { summary: 'Progress is saved with AsyncStorage.', testing: 'Added progress tests.' },
+    checkCommand: 'npm run check',
+  };
+
+  test('links the issue and lists summary, plan, testing and the code review', () => {
     const body = pullRequestBody({
-      issue,
-      spec,
-      plan,
-      done: { summary: 'Progress is saved with AsyncStorage.', testing: 'Added progress tests.' },
-      review: { verdict: 'approve', summary: 'Looks right.', findings: [] },
-      unresolved: [],
-      checkCommand: 'npm run check',
+      ...details,
+      review: {
+        round: 1,
+        standards: { summary: 'Follows AGENTS.md.', worst: '', findings: [] },
+        spec: { summary: 'Does what the issue asks.', worst: '', findings: [] },
+      },
+      unresolved: false,
     });
     assert.match(body, /^Closes #7/);
     assert.match(body, /Progress is saved with AsyncStorage\./);
     assert.match(body, /- Add storage\n- Test it/);
     assert.match(body, /`npm run check` passes/);
-    assert.match(body, /Approved by the reviewer agent/);
-    assert.doesNotMatch(body, /Unresolved/);
+    assert.match(body, /after 1 round\. ✅ Nothing that must be fixed/);
+    assert.match(body, /### Standards\n\nFollows AGENTS\.md\.\n\n### Spec\n\nDoes what the issue asks\./);
+    assert.match(body, /\*\*Summary:\*\* Standards: no findings\. Spec: no findings\./);
     assert.doesNotMatch(body, /Acceptance criteria/, 'no brief, no criteria section');
   });
 
-  test('lists unresolved findings instead of an approval', () => {
+  test('flags must-fix findings that are still open; keeps the axes apart; notes a missing report', () => {
     const body = pullRequestBody({
-      issue,
-      spec,
-      plan,
-      done: undefined,
-      review: { verdict: 'changes', summary: '', findings: ['src/a.ts: missing test'] },
-      unresolved: ['src/a.ts: missing test'],
-      checkCommand: 'npm run check',
+      ...details,
+      review: {
+        round: 2,
+        standards: null,
+        spec: {
+          summary: 'Saves, but not on update.',
+          worst: 'progress lost after an app update',
+          findings: [
+            { kind: 'missing', where: 'src/progress.ts', specLine: 'Progress survives an app restart', detail: 'progress lost after an app update' },
+            { kind: 'unasked', where: '', specLine: 'Out of scope: syncing', detail: 'adds a sync stub' },
+          ],
+        },
+      },
+      unresolved: true,
     });
-    assert.match(body, /Unresolved review findings\n\n- src\/a\.ts: missing test/);
-    assert.doesNotMatch(body, /Approved/);
+    assert.match(body, /after 2 rounds\. ⚠️ \*\*Findings that must be fixed are still open\*\*/);
+    assert.match(body, /### Standards\n\nThe Standards reviewer did not report\./);
+    assert.match(
+      body,
+      /- \*\*Missing or partial\*\* in `src\/progress\.ts`: progress lost after an app update\n  > Progress survives an app restart\n- \*\*Not asked for\*\*: adds a sync stub/,
+    );
+    assert.match(body, /Standards: no report\. Spec: 2 findings \(worst: progress lost after an app update\)\./);
+    assert.doesNotMatch(body, /Nothing that must be fixed/);
+  });
+
+  test('without a review: no review section', () => {
+    const body = pullRequestBody({ ...details, review: undefined, unresolved: false });
+    assert.doesNotMatch(body, /Code review/);
   });
 });
 

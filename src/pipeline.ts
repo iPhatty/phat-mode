@@ -9,15 +9,26 @@ import {
   type TaskRuntime,
 } from '@earendil-works/pi-durable';
 import {
+  type Agent,
+  AGENTS,
   type DoneReport,
+  modelRole,
+  type PlanReport,
   type Report,
   ReportsDoc,
-  type ReviewReport,
-  type Role,
   ROLE_TOOLS,
   RoleDoc,
-  type PlanReport,
 } from './agents.ts';
+import {
+  type AxisReport,
+  type CodeReview,
+  loadCodeReviewSkill,
+  mustFix,
+  needsFixes,
+  type SpecReport,
+  type StandardsReport,
+  standardsSources,
+} from './code-review.ts';
 import { eligibility, type Spec } from './spec.ts';
 import { branchFor, type Config, modelFor } from './config.ts';
 import { commentMarker, type GitHub, type Issue, mergeLabels, progressChange } from './github.ts';
@@ -38,7 +49,8 @@ import {
   NUDGE,
   planPrompt,
   ROLE_INSTRUCTIONS,
-  reviewPrompt,
+  specReviewPrompt,
+  standardsReviewPrompt,
 } from './prompts.ts';
 import { type Checks, tail, type Workspaces } from './workspace.ts';
 
@@ -52,8 +64,8 @@ export type Services = {
 
 export type PipelineInput = { repo: string; issue: number };
 
-type Conversations = Record<Role, ConversationId>;
-type ReportData = { plan: PlanReport; done: DoneReport; review: ReviewReport };
+type Conversations = Record<Agent, ConversationId>;
+type ReportData = { plan: PlanReport; done: DoneReport; standards: StandardsReport; spec: SpecReport };
 
 /** Known once the workspace is ready. `spec`: what to build, from an Agent Brief or the issue body. */
 type Setup = { issue: Issue; spec: Spec; workspace: string; conversations: Conversations };
@@ -74,8 +86,10 @@ export type PipelineState =
   /** `baseline`: how many reports the agent had made before this request, so only new ones count. */
   | (Work & { phase: 'implement'; prompt: string; baseline: number })
   | (Work & { phase: 'verify' })
-  | (Work & { phase: 'review'; baseline: number })
-  | (Work & { phase: 'publish'; review: ReviewReport | null; unresolved: string[] })
+  /** `baseline`: per reviewer, as for implement. */
+  | (Work & { phase: 'review'; baseline: { standards: number; spec: number } })
+  /** `unresolved`: the last review still had findings that must be fixed. */
+  | (Work & { phase: 'publish'; review: CodeReview | null; unresolved: boolean })
   | { phase: 'fail'; issue: number; reason: string };
 
 export type PipelineResult =
@@ -92,9 +106,14 @@ class StepFailure extends Error {}
 
 const MARKERS = { plan: commentMarker('plan'), result: commentMarker('result') };
 
+const axisCount = (report: AxisReport<unknown> | null) =>
+  report === null ? 'no report' : `${report.findings.length} finding${report.findings.length === 1 ? '' : 's'}`;
+
 export function createPipeline(services: Services) {
   const { config, github, workspaces, checks, logger } = services;
   const { limits, labels } = config;
+  /** The code review's fixed point. */
+  const baseRef = `origin/${config.baseBranch}`;
 
   const go = (runtime: Runtime, next: PipelineState, context: Context) =>
     runtime.commit(() => ({ status: 'running', checkpoint: next }), context);
@@ -228,8 +247,8 @@ export function createPipeline(services: Services) {
 
         await runtime.commit(async (tx) => {
           const conversations = {} as Conversations;
-          for (const role of ['plan', 'implement', 'review'] as const) {
-            const model = modelFor(config, role);
+          for (const role of AGENTS) {
+            const model = modelFor(config, modelRole(role));
             const created = await tx.createConversation({ ownership: { kind: 'task', taskId: runtime.taskId } });
             await configure(tx, created.id, {
               model: { provider: model.provider, modelId: model.modelId },
@@ -316,10 +335,19 @@ export function createPipeline(services: Services) {
         const result = await checks.run(state.workspace);
         if (result.passed) {
           logger.step(number, 'Checks pass');
-          await goWithBaseline(
-            runtime,
-            state.conversations.review,
-            (baseline) => ({ ...work(state), phase: 'review', reviewRounds: state.reviewRounds + 1, baseline }),
+          await runtime.commit(
+            async (tx) => ({
+              status: 'running',
+              checkpoint: {
+                ...work(state),
+                phase: 'review',
+                reviewRounds: state.reviewRounds + 1,
+                baseline: {
+                  standards: (await tx.doc(ReportsDoc, state.conversations.standards)).items.length,
+                  spec: (await tx.doc(ReportsDoc, state.conversations.spec)).items.length,
+                },
+              },
+            }),
             context,
           );
           return;
@@ -341,45 +369,61 @@ export function createPipeline(services: Services) {
       review: guarded<'review'>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const number = state.issue.number;
-        logger.step(number, `Review, round ${state.reviewRounds} (${modelFor(config, 'review').modelId})`);
+        const round = state.reviewRounds;
+        logger.step(number, `Code review, round ${round}: Standards and Spec in parallel (${modelFor(config, 'review').modelId})`);
+        // The coordinator steps of the code-review skill: fixed point, spec and standards sources.
+        const skill = await loadCodeReviewSkill(state.workspace, baseRef);
+        const sources = await standardsSources(state.workspace);
         const before = await workspaces.fingerprint(state.workspace);
         const diff = await workspaces.diff(state.workspace);
-        const review = await askForReport(
-          runtime,
-          {
-            conversation: state.conversations.review,
-            requestId: `review-${state.reviewRounds}`,
-            prompt: reviewPrompt(state.issue, state.spec, state.plan, state.done ?? undefined, diff),
-            baseline: state.baseline,
-            type: 'review',
-            tool: 'report_review',
-          },
-          context,
-        );
+        // Both axes at once, each in its own conversation, so they do not pollute each other's context.
+        const [standards, spec] = await Promise.all([
+          askForReport(
+            runtime,
+            {
+              conversation: state.conversations.standards,
+              requestId: `standards-${round}`,
+              prompt: standardsReviewPrompt({ skill, sources, baseRef, diff, round }),
+              baseline: state.baseline.standards,
+              type: 'standards',
+              tool: 'report_standards',
+            },
+            context,
+          ),
+          askForReport(
+            runtime,
+            {
+              conversation: state.conversations.spec,
+              requestId: `spec-${round}`,
+              prompt: specReviewPrompt({ skill, issue: state.issue, spec: state.spec, baseRef, diff, round }),
+              baseline: state.baseline.spec,
+              type: 'spec',
+              tool: 'report_spec',
+            },
+            context,
+          ),
+        ]);
         if ((await workspaces.fingerprint(state.workspace)) !== before) {
-          // The reviewer is told not to edit; if files changed anyway, verify again before trusting them.
+          // The reviewers are told not to edit; if files changed anyway, verify again before trusting them.
           logger.step(number, 'Files changed during review; verifying again');
           await go(runtime, { ...work(state), phase: 'verify' }, context);
           return;
         }
-        if (review === undefined) {
-          await go(
-            runtime,
-            { ...work(state), phase: 'publish', review: null, unresolved: ['The reviewer agent did not give a verdict.'] },
-            context,
-          );
+        const review: CodeReview = { round, standards: standards ?? null, spec: spec ?? null };
+        const fix = mustFix(review);
+        logger.step(
+          number,
+          `Review: Standards ${axisCount(review.standards)}, Spec ${axisCount(review.spec)}; ${fix.standards.length + fix.spec.length} must fix`,
+        );
+        if (!needsFixes(review)) {
+          await go(runtime, { ...work(state), phase: 'publish', review, unresolved: false }, context);
           return;
         }
-        logger.step(number, `Review: ${review.verdict}${review.findings.length ? `, ${review.findings.length} finding(s)` : ''}`);
-        if (review.verdict === 'approve' || review.findings.length === 0) {
-          await go(runtime, { ...work(state), phase: 'publish', review, unresolved: [] }, context);
+        if (round >= limits.maxReviewRounds) {
+          await go(runtime, { ...work(state), phase: 'publish', review, unresolved: true }, context);
           return;
         }
-        if (state.reviewRounds >= limits.maxReviewRounds) {
-          await go(runtime, { ...work(state), phase: 'publish', review, unresolved: review.findings }, context);
-          return;
-        }
-        await toImplement(runtime, work(state), fixReviewPrompt(review.findings), context);
+        await toImplement(runtime, work(state), fixReviewPrompt(review), context);
       }),
 
       publish: guarded<'publish'>(async (task, runtime, context) => {

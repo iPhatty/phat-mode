@@ -1,4 +1,5 @@
-import type { DoneReport, PlanReport, ReviewReport } from './agents.ts';
+import type { DoneReport, PlanReport } from './agents.ts';
+import { type AxisReport, type CodeReview, needsFixes, type SpecFinding, type StandardsFinding } from './code-review.ts';
 import type { Spec } from './spec.ts';
 import type { Issue } from './github.ts';
 
@@ -62,14 +63,57 @@ export function doneComment(prUrl: string): string {
   return `🤖 **phat-mode opened a draft pull request:** ${prUrl}`;
 }
 
+const SKILL_LINK = '[code-review](https://github.com/mattpocock/skills/blob/main/skills/engineering/code-review/SKILL.md)';
+
+const standardsItem = (finding: StandardsFinding) =>
+  finding.kind === 'violation'
+    ? `- **Violation** of ${finding.rule}${finding.where ? ` in \`${finding.where}\`` : ''}: ${finding.detail}`
+    : `- *Judgement call:* ${finding.rule}${finding.where ? ` in \`${finding.where}\`` : ''}: ${finding.detail}`;
+
+const SPEC_KIND = { missing: 'Missing or partial', unasked: 'Not asked for', wrong: 'Looks wrong', bug: 'Bug' } as const;
+const specItem = (finding: SpecFinding) =>
+  `- **${SPEC_KIND[finding.kind]}**${finding.where ? ` in \`${finding.where}\`` : ''}: ${finding.detail}${
+    finding.specLine ? `\n  > ${finding.specLine}` : ''
+  }`;
+
+function axisSection<F>(title: string, report: AxisReport<F> | null, item: (finding: F) => string): string {
+  if (report === null) return `### ${title}\n\nThe ${title} reviewer did not report.`;
+  const findings = report.findings.length > 0 ? `\n\n${report.findings.map(item).join('\n')}` : '';
+  return `### ${title}\n\n${report.summary.trim() || 'No findings.'}${findings}`;
+}
+
+const axisSummary = (title: string, report: AxisReport<unknown> | null) => {
+  if (report === null) return `${title}: no report`;
+  const count = report.findings.length;
+  if (count === 0) return `${title}: no findings`;
+  return `${title}: ${count} finding${count === 1 ? '' : 's'}${report.worst ? ` (worst: ${report.worst})` : ''}`;
+};
+
+/** The two axes side by side, never merged or reranked, as the skill says; then one line per axis. */
+export function codeReviewSection(review: CodeReview, unresolved: boolean): string {
+  const rounds = `${review.round} round${review.round === 1 ? '' : 's'}`;
+  const status = unresolved
+    ? '⚠️ **Findings that must be fixed are still open** after the last review round.'
+    : needsFixes(review)
+      ? ''
+      : '✅ Nothing that must be fixed. Judgement calls, if any, are left to you.';
+  return [
+    `## Code review\n\nBy two reviewer agents following the ${SKILL_LINK} skill, one per axis, after ${rounds}. ${status}`.trim(),
+    axisSection('Standards', review.standards, standardsItem),
+    axisSection('Spec', review.spec, specItem),
+    `**Summary:** ${axisSummary('Standards', review.standards)}. ${axisSummary('Spec', review.spec)}.`,
+  ].join('\n\n');
+}
+
 export type PullRequestDetails = {
   issue: Issue;
   spec: Spec;
   plan: PlanReport;
   done: DoneReport | undefined;
-  review: ReviewReport | undefined;
-  /** Findings still open after the last review round. */
-  unresolved: readonly string[];
+  /** The last code review round; undefined when there was none. */
+  review: CodeReview | undefined;
+  /** The last review still had findings that must be fixed. */
+  unresolved: boolean;
   checkCommand: string;
 };
 
@@ -92,11 +136,7 @@ export function pullRequestBody(details: PullRequestDetails): string {
     `## Plan\n\n${list(plan.plan)}`,
     `## Testing\n\n${done?.testing ? `${done.testing}\n\n` : ''}✅ \`${checkCommand}\` passes.`,
   );
-  if (unresolved.length > 0) {
-    sections.push(`## ⚠️ Unresolved review findings\n\n${list(unresolved)}`);
-  } else if (review !== undefined) {
-    sections.push(`## Review\n\n✅ Approved by the reviewer agent. ${review.summary}`);
-  }
+  if (review !== undefined) sections.push(codeReviewSection(review, unresolved));
   sections.push('---\n🤖 Opened by phat-mode. This is a draft: a human must review and merge it.');
   return sections.join('\n\n');
 }

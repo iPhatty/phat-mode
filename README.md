@@ -16,7 +16,7 @@ phat-mode is the **AFK agent** in a [mattpocock/skills](https://github.com/mattp
 2. **Plan** (AI, Claude Opus 5.5): reads the spec and the code, and plans *how* to build it. If the spec has a gap, it posts triage notes and moves the issue back to `needs-info`. If an agent shouldn't do it, it moves it to `ready-for-human`.
 3. **Implement** (AI, Claude Opus 5.5): changes the code and adds tests.
 4. **Verify** (code, not AI): runs `npm run check`. On failure, the output goes back to the implementer (up to 3 times).
-5. **Review** (GPT-6.1 Sol, a different model family, read-only): checks the diff against the acceptance criteria and the out-of-scope list. Findings go back to the implementer (up to 2 rounds).
+5. **Code review** (GPT-6.1 Sol, a different model family, read-only): two reviewers in parallel, following Matt Pocock's [code-review](https://github.com/mattpocock/skills/blob/main/skills/engineering/code-review/SKILL.md) skill. See [Code review](#code-review).
 6. **Publish** (code): commits, pushes, and opens a **draft** PR that closes the issue, lists the acceptance criteria for you to tick off, and is labelled `ready-for-human`.
 
 It never merges and never pushes to `main`. You review and merge every PR.
@@ -45,6 +45,25 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 | Gave up (e.g. checks keep failing) | `ready-for-human` + `phat-mode:failed`, with the reason |
 
 To retry, label the issue `ready-for-agent` again and run it.
+
+## Code review
+
+phat-mode's reviewers follow mattpocock/skills' `code-review` skill. The pipeline does the skill's coordinator steps (fixed point: the base branch; spec: the one phat-mode built from; standards sources: `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `CODING_STANDARDS.md`, `.github/copilot-instructions.md`, `docs/**/*.md`), and two reviewer agents, in parallel and in separate conversations, review one axis each:
+
+- **Standards**: the repo's documented standards (hard violations, citing the rule) plus the skill's baseline of 12 Fowler code smells (always judgement calls).
+- **Spec**: requirements missing or partial, scope creep, and what looks wrong, each quoting the spec line. Plus one addition from phat-mode, which runs unattended: bugs, broken edge cases and leftover debugging code anywhere in the diff.
+
+Each reviewer gets the skill's brief verbatim. The skill text comes from the target repo's committed copy (`.agents/skills/code-review/SKILL.md` or `.claude/skills/...`), read from the **base branch** so the implementer cannot change the rules it is reviewed by; otherwise from the bundled copy in [`skills/code-review/`](skills/code-review/) (MIT, © Matt Pocock).
+
+The skill gives no verdict, so phat-mode decides:
+
+| Finding | Effect |
+|---|---|
+| Any Spec finding (incl. bugs) | must fix: back to the implementer |
+| Standards violation | must fix: back to the implementer |
+| Code smell | judgement call: sent along with must-fix findings, but never blocks the PR |
+
+With nothing to fix, the PR opens. Otherwise the implementer fixes and both reviewers look again; after `maxReviewRounds` (2: one round of fixes) the PR opens with the open findings flagged. The PR's **Code review** section shows Standards and Spec side by side, never merged or reranked, and the skill's one-line summary (findings per axis and the worst within each).
 
 ## Setup
 
@@ -77,7 +96,7 @@ Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`sr
 
 ### Models
 
-Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**) unless `models` overrides it for its role (`plan`, `implement`, `review`). Built in, `review` uses **GPT-6.1 Sol**, so a different model family checks the code.
+Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**) unless `models` overrides it for its role (`plan`, `implement`, `review`; both reviewers use `review`). Built in, `review` uses **GPT-6.1 Sol**, so a different model family checks the code.
 
 ```json
 {
@@ -122,7 +141,8 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 
 - `src/pipeline.ts`: the durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again.
 - `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
-- `src/agents.ts`: the three roles (plan, implement, review), their tools, the report tools agents finish with, and the guard hook.
+- `src/code-review.ts`: reads the code-review skill (from the base branch, or the bundled copy), finds standards sources, and decides what must be fixed.
+- `src/agents.ts`: the four agents (planner, implementer, Standards and Spec reviewers), their tools, the report tools agents finish with, and the guard hook.
 - `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code.
 - Issue comments carry hidden markers, so a rerun updates its comment instead of posting again.
 

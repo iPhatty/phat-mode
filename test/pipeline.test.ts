@@ -21,6 +21,7 @@ import type { GitHub, Issue, LabelChange, PullRequest } from '../src/github.ts';
 import { openPhatMode } from '../src/harness.ts';
 import { LockedError } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
+import type { SpecFinding, StandardsFinding } from '../src/code-review.ts';
 import type { PipelineResult, Services } from '../src/pipeline.ts';
 import { type CheckResult, type Checks, GitWorkspaces } from '../src/workspace.ts';
 
@@ -136,8 +137,6 @@ A hello.txt file says hello.
 - Translating the greeting`;
 const write = (path: string, content: string) => call('write', { path, content });
 const done = () => call('report_done', { summary: 'Added hello.txt.', testing: 'Ran the checks.' });
-const approve = () => call('report_review', { verdict: 'approve', summary: 'Fine.', findings: [] });
-const changes = (findings: string[]) => call('report_review', { verdict: 'changes', summary: 'Needs work.', findings });
 
 /** A response that first checks what the agent just saw: the last message of the request. */
 const expectLast = (check: (message: ToolResultMessage | { role: string; content: unknown }) => void, then: FauxResponseStep): FauxResponseFactory =>
@@ -149,6 +148,36 @@ const textOf = (message: { content: unknown }) =>
   typeof message.content === 'string'
     ? message.content
     : (message.content as { type: string; text?: string }[]).map((part) => part.text ?? '').join('');
+
+type Findings = { standards?: StandardsFinding[]; spec?: SpecFinding[] };
+type Axis = 'standards' | 'spec';
+/**
+ * Both reviewers' answers for one round. They run in parallel, so each answer works out which reviewer is asking
+ * (from its request) instead of relying on order. `check` sees the request each reviewer got.
+ */
+const review = (findings: Findings = {}, check?: (axis: Axis, text: string) => void): FauxResponseFactory[] => {
+  const answer: FauxResponseFactory = (request) => {
+    const text = textOf(request.messages.at(-1) as { content: unknown });
+    const axis: Axis = text.includes('on the Standards axis') ? 'standards' : 'spec';
+    check?.(axis, text);
+    const items = findings[axis] ?? [];
+    return call(`report_${axis}`, {
+      summary: items.length > 0 ? `${axis} has problems.` : `${axis} looks good.`,
+      worst: items[0]?.detail ?? '',
+      findings: items,
+    });
+  };
+  return [answer, answer];
+};
+const approve = () => review();
+const specIssue = (detail: string, kind: SpecFinding['kind'] = 'wrong'): SpecFinding => ({
+  kind,
+  where: 'hello.txt',
+  specLine: kind === 'bug' ? '' : 'A hello.txt file says hello.',
+  detail,
+});
+const violation = (detail: string): StandardsFinding => ({ kind: 'violation', where: 'hello.txt', rule: 'AGENTS.md: "Add tests"', detail });
+const smell = (detail: string): StandardsFinding => ({ kind: 'smell', where: 'hello.txt', rule: 'possible Mysterious Name', detail });
 
 // ─── Fixture ────────────────────────────────────────────────────────────────
 
@@ -232,7 +261,7 @@ describe('pipeline', () => {
   test('happy path: plan, implement, verify, review, then a draft pull request', async () => {
     const { github, checks, runIssue, remoteFile } = await fixture();
     github.addIssue(1);
-    const { outcome, faux } = await runIssue(1, [plan(), write('hello.txt', 'hello\n'), done(), approve()]);
+    const { outcome, faux } = await runIssue(1, [plan(), write('hello.txt', 'hello\n'), done(), ...approve()]);
 
     assert.deepEqual(result(outcome), { status: 'pr_opened', url: 'https://github.test/pull/100' });
     assert.equal(faux.getPendingResponseCount(), 0);
@@ -243,7 +272,7 @@ describe('pipeline', () => {
     assert.equal(pr!.branch, 'phat-mode/issue-1');
     assert.equal(pr!.base, 'main');
     assert.match(pr!.body, /^Closes #1/);
-    assert.match(pr!.body, /Approved by the reviewer agent/);
+    assert.match(pr!.body, /## Code review[^]*### Standards[^]*### Spec[^]*\*\*Summary:\*\* Standards: no findings\. Spec: no findings\./);
     assert.deepEqual(
       github.comments.map((comment) => comment.marker),
       ['<!-- phat-mode:plan -->', '<!-- phat-mode:result -->'],
@@ -264,42 +293,102 @@ describe('pipeline', () => {
       done(),
       expectLast((message) => assert.match(textOf(message), /FAIL hello\.test\.ts/), write('hello.txt', 'hello\n')),
       done(),
-      approve(),
+      ...approve(),
     ]);
     assert.equal(result(outcome).status, 'pr_opened');
     assert.equal(checks.runs, 2);
   });
 
-  test('review findings go back to the implementer, then a second review', async () => {
+  test('code review: both reviewers get the skill’s briefs; Spec also gets phat-mode’s bug hunting', async () => {
+    const { github, runIssue } = await fixture();
+    github.addIssue(30);
+    const seen: Partial<Record<Axis, string>> = {};
+    const { outcome } = await runIssue(30, [
+      plan(),
+      write('hello.txt', 'hello\n'),
+      done(),
+      ...review({}, (axis, text) => (seen[axis] = text)),
+    ]);
+    assert.equal(result(outcome).status, 'pr_opened');
+    const standards = seen.standards!;
+    const spec = seen.spec!;
+    // The fixture repo has no skill installed, so the bundled copy is used.
+    assert.match(standards, /Review this change on the Standards axis/);
+    assert.match(standards, /from the code-review skill \(bundled\)/);
+    assert.match(standards, /> Report, per file\/hunk where relevant/, 'the Standards brief, verbatim');
+    assert.match(standards, /\*\*Refused Bequest\*\*/, 'the smell baseline, pasted in full');
+    assert.match(standards, /- README\.md|\(none found\)/);
+    assert.match(standards, /\+hello/, 'the diff');
+    assert.match(standards, /git diff origin\/main/);
+    assert.doesNotMatch(standards, /leftover debugging code/);
+    assert.match(spec, /Review this change on the Spec axis/);
+    assert.match(spec, /> Report: \(a\) requirements the spec asked for/, 'the Spec brief, verbatim');
+    assert.match(spec, /Added by phat-mode[^]*leftover debugging code anywhere in the diff/);
+    assert.match(spec, /<issue number="30"/, 'the spec');
+    assert.doesNotMatch(spec, /Refused Bequest/, 'axes do not mix');
+  });
+
+  test('spec findings and standards violations go back to the implementer, then a second round', async () => {
     const { github, runIssue, remoteFile } = await fixture();
     github.addIssue(3);
     const { outcome } = await runIssue(3, [
       plan(),
       write('hello.txt', 'hello\n'),
       done(),
-      changes(['hello.txt: missing trailing exclamation mark']),
-      expectLast((message) => assert.match(textOf(message), /missing trailing exclamation/), write('hello.txt', 'hello!\n')),
+      ...review({
+        spec: [specIssue('missing trailing exclamation mark')],
+        standards: [violation('no test for hello.txt'), smell('hello is a vague name')],
+      }),
+      expectLast((message) => {
+        const text = textOf(message);
+        assert.match(text, /Must fix, Spec[^]*\[wrong\] `hello\.txt` re "A hello\.txt file says hello\.": missing trailing exclamation mark/);
+        assert.match(text, /Must fix, Standards[^]*AGENTS\.md: "Add tests"\): no test for hello\.txt/);
+        assert.match(text, /Judgement calls[^]*possible Mysterious Name\): hello is a vague name/);
+      }, write('hello.txt', 'hello!\n')),
       done(),
-      approve(),
+      ...review({}, (_axis, text) => assert.match(text, /^This is review round 2\./)),
     ]);
     assert.equal(result(outcome).status, 'pr_opened');
     assert.equal(await remoteFile(3, 'hello.txt'), 'hello!\n');
+    assert.match(github.prs[0]!.body, /after 2 rounds\. ✅ Nothing that must be fixed/);
   });
 
-  test('opens the PR with unresolved findings listed after the last review round', async () => {
+  test('smells alone never block: no fix round, listed on the PR as judgement calls', async () => {
+    const { github, runIssue } = await fixture();
+    github.addIssue(31);
+    const { outcome, faux } = await runIssue(31, [
+      plan(),
+      write('hello.txt', 'hello\n'),
+      done(),
+      ...review({ standards: [smell('hello is a vague name')] }),
+    ]);
+    assert.equal(result(outcome).status, 'pr_opened');
+    assert.equal(faux.state.callCount, 5, 'plan, implement x2, two reviewers: no second implementer request');
+    const body = github.prs[0]!.body;
+    assert.match(body, /## Code review\n\nBy two reviewer agents following the \[code-review\]\(.+\) skill, one per axis, after 1 round\. ✅/);
+    assert.match(body, /### Standards\n\nstandards has problems\.\n\n- \*Judgement call:\* possible Mysterious Name in `hello\.txt`: hello is a vague name/);
+    assert.match(body, /### Spec\n\nspec looks good\./);
+    assert.match(body, /\*\*Summary:\*\* Standards: 1 finding \(worst: hello is a vague name\)\. Spec: no findings\./);
+  });
+
+  test('opens the PR with must-fix findings flagged after the last review round, each under its own axis', async () => {
     const { github, runIssue } = await fixture();
     github.addIssue(4);
     const { outcome } = await runIssue(4, [
       plan(),
       write('hello.txt', 'a\n'),
       done(),
-      changes(['first problem']),
+      ...review({ spec: [specIssue('first problem')] }),
       write('hello.txt', 'b\n'),
       done(),
-      changes(['still a problem']),
+      ...review({ spec: [specIssue('still a problem'), specIssue('console.log left in', 'bug')] }),
     ]);
     assert.equal(result(outcome).status, 'pr_opened');
-    assert.match(github.prs[0]!.body, /Unresolved review findings\n\n- still a problem/);
+    const body = github.prs[0]!.body;
+    assert.match(body, /after 2 rounds\. ⚠️ \*\*Findings that must be fixed are still open\*\*/);
+    assert.match(body, /### Spec\n\nspec has problems\.\n\n- \*\*Looks wrong\*\* in `hello\.txt`: still a problem\n  > A hello\.txt file says hello\.\n- \*\*Bug\*\* in `hello\.txt`: console\.log left in/);
+    assert.doesNotMatch(body, /first problem/);
+    assert.match(body, /Spec: 2 findings \(worst: still a problem\)/);
   });
 
   test('uses the Agent Brief as the spec, and lists its acceptance criteria on the PR', async () => {
@@ -324,7 +413,7 @@ describe('pipeline', () => {
       expectLast(seesBrief, plan()),
       expectLast(seesBrief, write('hello.txt', 'hello')),
       done(),
-      expectLast(seesBrief, approve()),
+      ...review({}, (axis, text) => axis === 'spec' && seesBrief({ content: text })),
     ]);
     assert.equal(result(outcome).status, 'pr_opened');
     assert.match(
@@ -336,7 +425,7 @@ describe('pipeline', () => {
   test('works on an issue someone else opened when a trusted Agent Brief exists', async () => {
     const { github, runIssue } = await fixture();
     github.addIssue(6, { author: 'stranger', comments: [{ author: 'iPhatty', body: BRIEF, createdAt: '2026-10-02T00:00:00Z' }] });
-    const { outcome } = await runIssue(6, [plan(), write('hello.txt', 'hello'), done(), approve()]);
+    const { outcome } = await runIssue(6, [plan(), write('hello.txt', 'hello'), done(), ...approve()]);
     assert.equal(result(outcome).status, 'pr_opened');
   });
 
@@ -357,7 +446,7 @@ describe('pipeline', () => {
       expectLast((message) => assert.match(textOf(message), /the issue itself is the spec/), plan()),
       write('hello.txt', 'hello'),
       done(),
-      approve(),
+      ...approve(),
     ]);
     assert.equal(result(outcome).status, 'pr_opened');
     assert.match(github.prs[0]!.body, /From the issue\. For the human reviewer to tick off:\n\n- \[ \] hello\.txt says hello/);
@@ -414,7 +503,7 @@ describe('pipeline', () => {
         assert.match(textOf(message), /Blocked/);
       }, write('hello.txt', 'hello\n')),
       done(),
-      approve(),
+      ...approve(),
     ]);
     assert.equal(result(outcome).status, 'pr_opened');
     assert.equal((await run('git', ['--git-dir', remote, 'rev-parse', 'main'])).stdout, before);
@@ -455,7 +544,7 @@ describe('pipeline', () => {
     assert.equal(github.comments.length, 1, 'plan comment posted before the crash');
 
     // Second process: same storage. Only the implementer and reviewer answer; the planner must not run again.
-    const second = await open([write('hello.txt', 'hello\n'), done(), approve()]);
+    const second = await open([write('hello.txt', 'hello\n'), done(), ...approve()]);
     const again = await second.phat.start({ repo: config.repo, issue: 9 }, context);
     assert.equal(again.taskId, taskId);
     assert.equal(again.resumed, true);

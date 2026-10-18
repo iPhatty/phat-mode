@@ -1,4 +1,12 @@
-import type { DoneReport, PlanReport, Role } from './agents.ts';
+import type { Agent, DoneReport, PlanReport } from './agents.ts';
+import {
+  type CodeReview,
+  type CodeReviewSkill,
+  judgementCalls,
+  mustFix,
+  type SpecFinding,
+  type StandardsFinding,
+} from './code-review.ts';
 import type { Spec } from './spec.ts';
 import type { Issue } from './github.ts';
 
@@ -12,7 +20,7 @@ Rules that always apply:
 - The spec is the contract: the <agent-brief> when present (the <issue> is then background), otherwise the <issue>. Build what it describes, meet every acceptance criterion, and do nothing it lists as out of scope.
 - You run unattended. Nobody can answer questions mid-task, so decide sensibly and say what you decided in your report.`;
 
-export const ROLE_INSTRUCTIONS: Record<Role, string> = {
+export const ROLE_INSTRUCTIONS: Record<Agent, string> = {
   plan: `${SHARED}
 
 Your role: planner. The issue was already triaged as ready for an agent; your job is to plan how to build it, not whether.
@@ -32,17 +40,19 @@ Your role: implementer. Make the change the spec asks for, following the plan.
 - Run the project's checks (\`npm run check\`) and fix every failure before you finish.
 Finish by calling report_done.`,
 
-  review: `${SHARED}
+  standards: `${SHARED}
 
-Your role: reviewer. You review a change before a human sees it. Do not change any files.
-Check that the change:
-- meets every acceptance criterion in the spec (say which one fails, if any);
-- does nothing the spec lists as out of scope, and nothing unrelated;
-- follows the project's AGENTS.md rules;
-- has tests for its behaviour;
-- has no bugs, broken edge cases or leftover debugging code.
-Only report real problems that must be fixed, each with the file and reason. Do not ask for style changes the linter does not require.
-Finish by calling report_review.`,
+Your role: the Standards reviewer, one of two reviewers following mattpocock/skills' code-review skill.
+You review a change on one axis only: does the code follow this repo's documented coding standards, plus a baseline of code smells?
+Another reviewer checks it against the spec; do not review that axis. Do not change any files.
+Your brief and the smell baseline are in each request. Finish by calling report_standards.`,
+
+  spec: `${SHARED}
+
+Your role: the Spec reviewer, one of two reviewers following mattpocock/skills' code-review skill.
+You review a change on one axis only: does the code faithfully implement the spec?
+Another reviewer checks it against the repo's coding standards; do not review that axis. Do not change any files.
+Your brief is in each request. Finish by calling report_spec.`,
 };
 
 const issueBlock = (issue: Issue) => `<issue number="${issue.number}" author="${issue.author}">
@@ -83,35 +93,103 @@ ${output}
 \`\`\``;
 }
 
-export function fixReviewPrompt(findings: readonly string[]): string {
-  return `A reviewer found problems with your change. Fix each one, run \`npm run check\` until it passes, then call report_done again.
+const standardsLine = (finding: StandardsFinding) =>
+  `- \`${finding.where || 'general'}\` (${finding.rule}): ${finding.detail}`;
+const specLine = (finding: SpecFinding) =>
+  `- [${finding.kind}]${finding.where ? ` \`${finding.where}\`` : ''}${finding.specLine ? ` re "${finding.specLine}"` : ''}: ${finding.detail}`;
 
-Findings:
-${list(findings)}`;
+export function fixReviewPrompt(review: CodeReview): string {
+  const fix = mustFix(review);
+  const smells = judgementCalls(review);
+  const sections = [
+    'The code review found problems with your change. Fix them, run `npm run check` until it passes, then call report_done again.',
+  ];
+  if (fix.spec.length > 0) sections.push(`Must fix, Spec (does it do what the spec asks?):\n${fix.spec.map(specLine).join('\n')}`);
+  if (fix.standards.length > 0) {
+    sections.push(`Must fix, Standards (the repo's documented rules):\n${fix.standards.map(standardsLine).join('\n')}`);
+  }
+  if (smells.length > 0) {
+    sections.push(
+      `Judgement calls, code smells: fix them if that makes the code better, otherwise say in report_done why not.\n${smells.map(standardsLine).join('\n')}`,
+    );
+  }
+  return sections.join('\n\n');
 }
 
-export function reviewPrompt(
-  issue: Issue,
-  spec: Spec,
-  plan: PlanReport,
-  done: DoneReport | undefined,
-  diff: string,
-): string {
-  return `Review this change.
+/** What both reviewers are shown about the change: how to see it, and the diff itself (skill step 1). */
+function changeBlock(baseRef: string, diff: string): string {
+  return `The change: the uncommitted changes in this checkout, against \`${baseRef}\`. There are no commits yet.
+See it with \`git diff ${baseRef}\` (new files are included).
+
+\`\`\`diff
+${diff.length > 60_000 ? `${diff.slice(0, 60_000)}\n… (diff truncated; run the diff command for the rest)` : diff}
+\`\`\``;
+}
+
+const roundNote = (round: number) =>
+  round > 1
+    ? `This is review round ${round}. The implementer has worked on the earlier findings; review the change as it is now.\n\n`
+    : '';
+
+const fromSkill = (skill: CodeReviewSkill) => `from the code-review skill (${skill.source})`;
+
+export function standardsReviewPrompt(options: {
+  skill: CodeReviewSkill;
+  sources: readonly string[];
+  baseRef: string;
+  diff: string;
+  round: number;
+}): string {
+  const { skill, sources, baseRef, diff, round } = options;
+  return `${roundNote(round)}Review this change on the Standards axis.
+
+${changeBlock(baseRef, diff)}
+
+Standards sources found in the repo:
+${sources.length > 0 ? list(sources) : '- (none found)'}
+Search the repo for any other file that documents how code should be written, and use those too.
+
+The smell baseline, ${fromSkill(skill)}:
+
+${skill.smellBaseline}
+
+Your brief, ${fromSkill(skill)}:
+
+> ${skill.standardsBrief}
+
+Report by calling report_standards: one finding per item, kind "violation" for a documented-standard breach (rule: the file and the rule) or "smell" for a baseline smell (rule: its name, e.g. "possible Feature Envy"). The summary is your report; worst is the worst issue on this axis.`;
+}
+
+/** phat-mode's addition to the skill's Spec brief: it runs unattended, so no human has looked at the code yet. */
+export const BUG_HUNTING =
+  'Also report bugs, broken edge cases and leftover debugging code anywhere in the diff, even where the spec says nothing.';
+
+export function specReviewPrompt(options: {
+  skill: CodeReviewSkill;
+  issue: Issue;
+  spec: Spec;
+  baseRef: string;
+  diff: string;
+  round: number;
+}): string {
+  const { skill, issue, spec, baseRef, diff, round } = options;
+  return `${roundNote(round)}Review this change on the Spec axis.
+
+${changeBlock(baseRef, diff)}
+
+The spec:
 
 ${specBlock(issue, spec)}
 
-Plan the implementer followed:
-${list(plan.plan)}
+Your brief, ${fromSkill(skill)}:
 
-Implementer's summary: ${done?.summary ?? '(none)'}
+> ${skill.specBrief}
 
-The project's checks (\`npm run check\`) pass.
+Added by phat-mode, which runs unattended, so no human has looked at this code yet:
 
-Diff against the base branch:
-\`\`\`diff
-${diff.length > 60_000 ? `${diff.slice(0, 60_000)}\n… (diff truncated; read the files for the rest)` : diff}
-\`\`\``;
+> ${BUG_HUNTING}
+
+Report by calling report_spec: one finding per item, kind "missing" for (a), "unasked" for (b), "wrong" for (c), and "bug" for phat-mode's addition. Quote the spec line in specLine; leave it empty only for a bug no spec line covers. The summary is your report; worst is the worst issue on this axis.`;
 }
 
 export const NUDGE = (tool: string) =>
