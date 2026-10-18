@@ -17,7 +17,7 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { setToolLogger } from '../src/agents.ts';
 import { branchFor, type Config, defaultConfig, paths } from '../src/config.ts';
 import { run } from '../src/exec.ts';
-import type { GitHub, Issue, LabelChange, PullRequest } from '../src/github.ts';
+import { FakeGitHub } from './fakes.ts';
 import { openPhatMode } from '../src/harness.ts';
 import { LockedError } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
@@ -29,72 +29,6 @@ const context = BACKGROUND_CONTEXT;
 setToolLogger(silentLogger);
 
 // ─── Fakes ──────────────────────────────────────────────────────────────────
-
-class FakeGitHub implements GitHub {
-  issues = new Map<number, Issue>();
-  comments: { issue: number; marker: string; body: string }[] = [];
-  /** Every call that changes something on GitHub. */
-  writes = 0;
-  prs: (PullRequest & { branch: string; base: string; title: string; body: string; labels: string[] })[] = [];
-
-  addIssue(number: number, fields: Partial<Issue> = {}) {
-    this.issues.set(number, {
-      number,
-      title: `Issue ${number}`,
-      body: 'Add a hello file.',
-      author: 'iPhatty',
-      state: 'OPEN',
-      url: `https://github.test/issues/${number}`,
-      labels: ['enhancement', 'ready-for-agent'],
-      comments: [],
-      ...fields,
-    });
-  }
-  labels(number: number) {
-    return [...(this.issues.get(number)?.labels ?? this.prs.find((pr) => pr.number === number)!.labels)].sort();
-  }
-  async getIssue(number: number) {
-    const issue = this.issues.get(number);
-    if (!issue) throw new Error(`no issue ${number}`);
-    return structuredClone(issue);
-  }
-  async upsertComment(issue: number, marker: string, body: string) {
-    this.writes++;
-    const existing = this.comments.find((comment) => comment.issue === issue && comment.marker === marker);
-    if (existing) existing.body = body;
-    else this.comments.push({ issue, marker, body });
-  }
-  async findPullRequest(branch: string) {
-    return this.prs.find((pr) => pr.branch === branch);
-  }
-  async createDraftPullRequest(options: { branch: string; base: string; title: string; body: string }) {
-    this.writes++;
-    // Numbers apart from issues, as on GitHub they share one sequence.
-    const number = 100 + this.prs.length;
-    const pr = { number, url: `https://github.test/pull/${number}`, labels: [], ...options };
-    this.prs.push(pr);
-    return pr;
-  }
-  async updatePullRequestBody(number: number, body: string) {
-    this.writes++;
-    this.prs.find((pr) => pr.number === number)!.body = body;
-  }
-  /** Issue numbers that count as open blockers. */
-  openIssues = new Set<number>();
-  native = new Map<number, number[]>();
-  async openBlockers(issue: number, mentioned: readonly number[]) {
-    return [...new Set([...(this.native.get(issue) ?? []), ...mentioned])].filter((n) => this.openIssues.has(n)).sort();
-  }
-  async editLabels(number: number, change: LabelChange) {
-    this.writes++;
-    const target = this.issues.get(number) ?? this.prs.find((pr) => pr.number === number)!;
-    const add = change.add ?? [];
-    target.labels = [
-      ...target.labels.filter((label) => !(change.remove ?? []).includes(label) || add.includes(label)),
-      ...add.filter((label) => !target.labels.includes(label)),
-    ];
-  }
-}
 
 class FakeChecks implements Checks {
   results: CheckResult[] = [];
@@ -305,7 +239,7 @@ const result = (outcome: { status: string; result?: PipelineResult }) => {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe('pipeline', () => {
-  test('happy path: plan, implement, verify, review, then a draft pull request', async () => {
+  test('happy path: plan, implement, verify, review, then a pull request ready for review', async () => {
     const { github, checks, runIssue, remoteFile } = await fixture();
     github.addIssue(1);
     const { outcome, faux } = await runIssue(1, [plan(), write('hello.txt', 'hello\n'), done(), ...approve(), describePr()]);
@@ -318,6 +252,7 @@ describe('pipeline', () => {
     assert.equal(github.prs.length, 1);
     assert.equal(pr!.branch, 'phat-mode/issue-1');
     assert.equal(pr!.base, 'main');
+    assert.equal(pr!.isDraft, false);
     // mattpocock/skills' pr template first, then what phat-mode adds, with the issue link at the end.
     assert.match(pr!.body, /^## Summary\n\n```diff\n\+hello\.txt  # says hello\n```\n\n## Evidence\n\n/);
     assert.match(pr!.body, /- \*\*Before:\*\* No hello\.txt\.\n  \*\*After:\*\* `cat hello\.txt` prints `hello`\.\n- ✅ \*\*Verified by phat-mode:\*\* `npm run check` passes on this code\./);
@@ -332,6 +267,18 @@ describe('pipeline', () => {
     assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:done', 'ready-for-agent']);
     // On the PR, ready-for-human means: ready for a human to review and merge.
     assert.deepEqual(github.labels(pr!.number), ['ready-for-human']);
+  });
+
+  test('a draft pull request left from an earlier run is updated and made ready for review', async () => {
+    const { github, runIssue } = await fixture();
+    github.addIssue(1);
+    const old = github.addPullRequest({ branch: 'phat-mode/issue-1', isDraft: true });
+    const { outcome } = await runIssue(1, [plan(), write('hello.txt', 'hello\n'), done(), ...approve(), describePr()]);
+
+    assert.deepEqual(result(outcome), { status: 'pr_opened', url: old.url });
+    assert.equal(github.prs.length, 1);
+    assert.deepEqual(github.readied, [old.number]);
+    assert.match(old.body, /^## Summary/);
   });
 
   test('the implementer writes the description last, following phat-mode’s copy of the pr skill', async () => {

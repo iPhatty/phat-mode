@@ -12,7 +12,7 @@ import type { Spec } from './spec.ts';
 import type { FeatureResult, VerifySkill } from './verify.ts';
 import type { Issue } from './github.ts';
 
-const SHARED = `You are part of phat-mode, an automated pipeline that turns triaged GitHub issues into draft pull requests.
+const SHARED = `You are part of phat-mode, an automated pipeline that turns triaged GitHub issues into pull requests.
 
 Rules that always apply:
 - Work inside the current working directory, which is a git checkout of the project. Outside it, use only the places a request names (a scratch folder, a second checkout).

@@ -20,7 +20,13 @@ export type Issue = {
 export type PullRequest = {
   number: number;
   url: string;
+  isDraft: boolean;
 };
+
+export type PullRequestState = 'OPEN' | 'CLOSED' | 'MERGED';
+
+/** An open issue as listed: labels only, no body or comments. */
+export type ListedIssue = { number: number; title: string; labels: string[] };
 
 /**
  * phat-mode's own progress labels. They only say what phat-mode is doing; the issue's triage state (ready-for-agent,
@@ -45,7 +51,16 @@ export interface GitHub {
   upsertComment(issue: number, marker: string, body: string): Promise<void>;
   /** The open pull request from `branch`, if any. */
   findPullRequest(branch: string): Promise<PullRequest | undefined>;
-  createDraftPullRequest(options: { branch: string; base: string; title: string; body: string }): Promise<PullRequest>;
+  /** The newest pull request from `branch`, in any state. */
+  latestPullRequest(branch: string): Promise<(PullRequest & { state: PullRequestState }) | undefined>;
+  /** Every open pull request, with the branch it comes from. */
+  openPullRequests(): Promise<(PullRequest & { branch: string })[]>;
+  /** Open issues labelled `label`, lowest number first. */
+  listOpenIssues(label: string): Promise<ListedIssue[]>;
+  /** Opens a pull request ready for review (not a draft). */
+  createPullRequest(options: { branch: string; base: string; title: string; body: string }): Promise<PullRequest>;
+  /** Turns a draft pull request into one ready for review. */
+  markReadyForReview(pr: number): Promise<void>;
   updatePullRequestBody(pr: number, body: string): Promise<void>;
   /** Change labels on an issue or pull request. Missing labels are created; existing ones are never edited. */
   editLabels(number: number, change: LabelChange): Promise<void>;
@@ -133,15 +148,50 @@ export class GhGitHub implements GitHub {
 
   async findPullRequest(branch: string): Promise<PullRequest | undefined> {
     const prs = JSON.parse(
-      await this.#gh(['pr', 'list', '-R', this.#repo, '--head', branch, '--state', 'open', '--json', 'number,url']),
+      await this.#gh(['pr', 'list', '-R', this.#repo, '--head', branch, '--state', 'open', '--json', 'number,url,isDraft']),
     ) as PullRequest[];
     return prs[0];
   }
 
-  async createDraftPullRequest(options: { branch: string; base: string; title: string; body: string }) {
+  async latestPullRequest(branch: string) {
+    const prs = JSON.parse(
+      await this.#gh([
+        'pr', 'list', '-R', this.#repo, '--head', branch, '--state', 'all', '--limit', '100',
+        '--json', 'number,url,isDraft,state',
+      ]),
+    ) as (PullRequest & { state: PullRequestState })[];
+    return prs.sort((a, b) => b.number - a.number)[0];
+  }
+
+  async openPullRequests() {
+    const prs = JSON.parse(
+      await this.#gh([
+        'pr', 'list', '-R', this.#repo, '--state', 'open', '--limit', '500', '--json', 'number,url,isDraft,headRefName',
+      ]),
+    ) as (PullRequest & { headRefName: string })[];
+    return prs.map(({ headRefName, ...pr }) => ({ ...pr, branch: headRefName }));
+  }
+
+  async listOpenIssues(label: string): Promise<ListedIssue[]> {
+    const issues = JSON.parse(
+      await this.#gh([
+        'issue', 'list', '-R', this.#repo, '--state', 'open', '--label', label, '--limit', '500',
+        '--json', 'number,title,labels',
+      ]),
+    ) as { number: number; title: string; labels: { name: string }[] }[];
+    return issues
+      .map((issue) => ({ number: issue.number, title: issue.title, labels: issue.labels.map((l) => l.name) }))
+      .sort((a, b) => a.number - b.number);
+  }
+
+  async markReadyForReview(pr: number): Promise<void> {
+    await this.#gh(['pr', 'ready', String(pr), '-R', this.#repo]);
+  }
+
+  async createPullRequest(options: { branch: string; base: string; title: string; body: string }) {
     await this.#gh(
       [
-        'pr', 'create', '-R', this.#repo, '--draft',
+        'pr', 'create', '-R', this.#repo,
         '--base', options.base, '--head', options.branch,
         '--title', options.title, '--body-file', '-',
       ],

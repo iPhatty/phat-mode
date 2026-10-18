@@ -11,6 +11,7 @@ import { createCopilotModels, openPhatMode, RunsDoc } from './harness.ts';
 import { LockedError } from './lock.ts';
 import { consoleLogger } from './log.ts';
 import type { PipelineResult, Services } from './pipeline.ts';
+import { describeStep, nextStep } from './watch.ts';
 import { CommandChecks, GitWorkspaces } from './workspace.ts';
 
 const context = BACKGROUND_CONTEXT;
@@ -18,13 +19,14 @@ const context = BACKGROUND_CONTEXT;
 const lock = { command: `phat-mode ${process.argv.slice(2).join(' ')}`.trim() };
 const PROVIDER = 'github-copilot';
 
-const USAGE = `phat-mode: turn GitHub issues into draft pull requests
+const USAGE = `phat-mode: turn GitHub issues into pull requests
 
 Usage:
   phat-mode login [--from-pi]   Sign in to GitHub Copilot (or copy the pi coding agent's login)
   phat-mode doctor              Check that everything phat-mode needs is set up
-  phat-mode run <issue>         Work on a ready-for-agent issue until a draft PR is open (resumes if interrupted)
+  phat-mode run <issue>         Work on a ready-for-agent issue until a PR is open (resumes if interrupted)
   phat-mode resume              Continue every run that was interrupted
+  phat-mode watch               Keep going: work on the next ready issue each time you merge a PR (Ctrl-C to stop)
   phat-mode status              List runs and where they are
   phat-mode abort <issue>       Stop the run for an issue
 
@@ -68,7 +70,7 @@ async function open(config: Config) {
 function describe(result: PipelineResult): string {
   switch (result.status) {
     case 'pr_opened':
-      return `✅ Draft pull request opened: ${result.url}`;
+      return `✅ Pull request opened: ${result.url}`;
     case 'needs_info':
       return '❓ The spec has gaps. phat-mode posted triage notes and moved the issue to needs-info.';
     case 'needs_human':
@@ -90,6 +92,55 @@ async function waitAndReport(phat: Awaited<ReturnType<typeof open>>, taskId: Tas
   }
   console.log(`\n✖ ${outcome.status}`);
   return 1;
+}
+
+/** Runs that have not finished (interrupted, or still going), by issue. */
+async function liveRuns(phat: Awaited<ReturnType<typeof open>>) {
+  const runs = (await phat.harness.snapshot(RunsDoc, phat.root.id, context))?.runs ?? {};
+  const live: { key: string; taskId: TaskId<PipelineResult> }[] = [];
+  for (const [key, list] of Object.entries(runs)) {
+    const taskId = list.at(-1)!.taskId as unknown as TaskId<PipelineResult>;
+    const record = await phat.harness.getTask(taskId, context);
+    if (record !== undefined && record.state.status !== 'terminal') live.push({ key, taskId });
+  }
+  return live;
+}
+
+/**
+ * Work through the ready issues one at a time, until Ctrl-C: finish any run that is going, wait while a phat-mode pull
+ * request is open, then start the lowest-numbered ready issue that is not blocked. See src/watch.ts.
+ */
+async function watch(config: Config): Promise<number> {
+  const phat = await open(config);
+  phat.harness.resume();
+  const github = new GhGitHub(config.repo);
+  const minutes = Math.round(config.watchIntervalMs / 60_000) || 1;
+  consoleLogger.info(`Watching ${config.repo}: one issue at a time, looking every ${minutes} min. Ctrl-C to stop.`);
+  let last = '';
+  for (;;) {
+    for (const { key, taskId } of await liveRuns(phat)) {
+      consoleLogger.info(`Resuming ${key}`);
+      await waitAndReport(phat, taskId);
+      last = '';
+    }
+    try {
+      const step = await nextStep(github, config, consoleLogger);
+      const text = describeStep(step);
+      // Say it once, not on every look.
+      if (text !== last) consoleLogger.info(text);
+      last = text;
+      if (step.kind === 'start') {
+        const { taskId } = await phat.start({ repo: config.repo, issue: step.issue }, context);
+        await waitAndReport(phat, taskId);
+        last = '';
+      }
+    } catch (error) {
+      // Offline, asleep, or GitHub is down: try again on the next look.
+      consoleLogger.error(`Could not check GitHub: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`);
+      last = '';
+    }
+    await new Promise((resolve) => setTimeout(resolve, config.watchIntervalMs));
+  }
 }
 
 async function login(config: Config, fromPi: boolean): Promise<number> {
@@ -218,21 +269,18 @@ async function main(argv: string[]): Promise<number> {
     case 'resume': {
       const phat = await open(config);
       phat.harness.resume();
-      const runs = (await phat.harness.snapshot(RunsDoc, phat.root.id, context))?.runs ?? {};
+      const live = await liveRuns(phat);
       let code = 0;
-      let any = false;
-      for (const [key, list] of Object.entries(runs)) {
-        const taskId = list.at(-1)!.taskId as unknown as TaskId<PipelineResult>;
-        const record = await phat.harness.getTask(taskId, context);
-        if (record === undefined || record.state.status === 'terminal') continue;
-        any = true;
+      for (const { key, taskId } of live) {
         consoleLogger.info(`Resuming ${key}`);
         code = Math.max(code, await waitAndReport(phat, taskId));
       }
-      if (!any) console.log('Nothing to resume.');
+      if (live.length === 0) console.log('Nothing to resume.');
       await phat.close(context);
       return code;
     }
+    case 'watch':
+      return watch(config);
     case 'abort': {
       const issue = Number(arg);
       const phat = await openPhatMode(services(config), context, { lock });

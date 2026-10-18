@@ -656,16 +656,18 @@ export function createPipeline(services: Services) {
         });
         let pr = await github.findPullRequest(branch);
         if (pr === undefined) {
-          pr = await github.createDraftPullRequest({ branch, base: config.baseBranch, title: pullRequestTitle(issue), body });
+          pr = await github.createPullRequest({ branch, base: config.baseBranch, title: pullRequestTitle(issue), body });
         } else {
           await github.updatePullRequestBody(pr.number, body);
+          // A pull request from before phat-mode stopped opening drafts.
+          if (pr.isDraft) await github.markReadyForReview(pr.number);
         }
         // On a pull request, ready-for-human means: ready for a human to review and merge.
         await github.editLabels(pr.number, { add: [labels.readyForHuman] });
         await github.upsertComment(issue.number, MARKERS.result, doneComment(pr.url));
         // The issue keeps ready-for-agent until the PR closes it; phat-mode:done shows an agent already did it.
         await github.editLabels(issue.number, progressChange('done'));
-        logger.step(issue.number, `Draft pull request: ${pr.url}`);
+        logger.step(issue.number, `Pull request: ${pr.url}`);
         await finish(runtime, { status: 'pr_opened', url: pr.url }, context);
       }),
 

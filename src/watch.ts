@@ -1,0 +1,122 @@
+import { branchFor, type Config } from './config.ts';
+import { commentMarker, type GitHub, type ListedIssue, mergeLabels, PROGRESS_LABELS, progressChange } from './github.ts';
+import type { Logger } from './log.ts';
+import { handedBackComment } from './messages.ts';
+import { eligibility } from './spec.ts';
+
+/**
+ * What `phat-mode watch` does next, worked out from GitHub alone each time, so nothing needs saving between looks:
+ * a crash, Ctrl-C or a sleeping Mac only means it catches up on the next look. Runs that are still going are resumed
+ * before this is asked.
+ *
+ * One issue at a time: while a phat-mode pull request is open, nothing new starts. Merging it closes its issue
+ * (`Closes #N`), which also unblocks the issues that wait for it.
+ */
+export type WatchStep =
+  /** phat-mode's pull requests waiting for a human to merge (or close) them. */
+  | { kind: 'wait_for_merge'; prs: { issue: number; url: string }[] }
+  /** The lowest-numbered issue that is ready and not blocked. */
+  | { kind: 'start'; issue: number; title: string }
+  /** Nothing can start. `waiting`: why each ready issue cannot, one line each. */
+  | { kind: 'idle'; waiting: string[] };
+
+const PR_BRANCH = /^phat-mode\/issue-(\d+)$/;
+
+export const MARKER_HANDED_BACK = commentMarker('handed-back');
+
+const progressOf = (issue: Pick<ListedIssue, 'labels'>) =>
+  (Object.keys(PROGRESS_LABELS) as (keyof typeof PROGRESS_LABELS)[]).find((key) =>
+    issue.labels.includes(PROGRESS_LABELS[key].name),
+  );
+
+export async function nextStep(github: GitHub, config: Config, logger: Logger): Promise<WatchStep> {
+  const { labels } = config;
+
+  // 1. A phat-mode pull request is open: wait for the human to merge it.
+  const open = (await github.openPullRequests()).flatMap((pr) => {
+    const match = PR_BRANCH.exec(pr.branch);
+    return match ? [{ issue: Number(match[1]), url: pr.url }] : [];
+  });
+  if (open.length > 0) return { kind: 'wait_for_merge', prs: open.sort((a, b) => a.issue - b.issue) };
+
+  const ready = await github.listOpenIssues(labels.readyForAgent);
+
+  // 2. Done issues whose pull request was closed without merging: the human said no, so hand the issue back.
+  //    A merged one closes its issue; it is only still listed until GitHub catches up.
+  for (const issue of ready.filter((candidate) => progressOf(candidate) === 'done')) {
+    const pr = await github.latestPullRequest(branchFor(issue.number));
+    if (pr?.state !== 'CLOSED') continue;
+    logger.step(issue.number, `Pull request ${pr.url} was closed without merging; handing the issue to a human`);
+    await github.upsertComment(issue.number, MARKER_HANDED_BACK, handedBackComment(pr.url, labels));
+    await github.editLabels(
+      issue.number,
+      mergeLabels(progressChange(null), { add: [labels.readyForHuman], remove: [labels.readyForAgent] }),
+    );
+  }
+
+  // 3. The lowest-numbered ready issue that is not blocked. `done` waits for its PR to merge; `working` without a
+  //    run going means a run was aborted. `failed` with ready-for-agent again means: try again.
+  const byNumber = new Map(ready.map((issue) => [issue.number, issue]));
+  const waiting: string[] = [];
+  const blocked: { issue: number; blockers: number[] }[] = [];
+  for (const listed of ready) {
+    const progress = progressOf(listed);
+    if (progress === 'done') continue;
+    if (progress === 'working') {
+      waiting.push(`#${listed.number} is labelled ${PROGRESS_LABELS.working.name}, but no run is going. Run \`phat-mode status\`, or remove the label to start again.`);
+      continue;
+    }
+    const eligible = eligibility(await github.getIssue(listed.number), config);
+    if (!eligible.ok) {
+      waiting.push(eligible.reason);
+      continue;
+    }
+    const blockers = await github.openBlockers(listed.number, eligible.spec.blockedBy);
+    if (blockers.length === 0) return { kind: 'start', issue: listed.number, title: listed.title };
+    blocked.push({ issue: listed.number, blockers });
+  }
+
+  // 4. Nothing can start: say what each issue waits for, and what that blocker waits for.
+  const why = new Map<number, string>();
+  const blockerState = async (number: number) => {
+    if (!why.has(number)) {
+      const listed = byNumber.get(number);
+      let text: string;
+      if (listed !== undefined) {
+        const progress = progressOf(listed);
+        text =
+          progress === 'done'
+            ? 'its pull request is merged, GitHub has not closed it yet'
+            : progress === 'working'
+              ? PROGRESS_LABELS.working.name
+              : 'ready-for-agent, but blocked itself';
+      } else {
+        const issue = await github.getIssue(number);
+        const triage = Object.values(labels).filter((label) => issue.labels.includes(label));
+        text = triage.length > 0 ? triage.join(', ') : 'not triaged';
+      }
+      why.set(number, text);
+    }
+    return `#${number} (${why.get(number)})`;
+  };
+  for (const { issue, blockers } of blocked) {
+    const states = [];
+    for (const blocker of blockers) states.push(await blockerState(blocker));
+    waiting.push(`#${issue} is blocked by ${states.join(', ')}`);
+  }
+  return { kind: 'idle', waiting };
+}
+
+/** One line (or a few) for the console. */
+export function describeStep(step: WatchStep): string {
+  switch (step.kind) {
+    case 'wait_for_merge':
+      return `Waiting for you to merge ${step.prs.map((pr) => `#${pr.issue}: ${pr.url}`).join(', ')}`;
+    case 'start':
+      return `Next: #${step.issue} ${step.title}`;
+    case 'idle':
+      return step.waiting.length === 0
+        ? 'Nothing labelled ready-for-agent. Waiting for new issues.'
+        : `Nothing can start:\n${step.waiting.map((line) => `    - ${line}`).join('\n')}`;
+  }
+}

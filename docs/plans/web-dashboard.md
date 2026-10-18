@@ -74,6 +74,10 @@ One process owns the database, runs the work, and serves clients.
 
 ## Phase 3: Pick up issues automatically (optional, still in the daemon)
 
+> **Done early, without the daemon (2026-10-18):** `phat-mode watch` (`src/watch.ts`) works through ready issues one
+> at a time, starting the next one when a phat-mode PR merges. It works everything out from GitHub on each look instead
+> of a durable polling task, since GitHub already holds the state. When the daemon lands, `watch` moves into it.
+
 - [ ] Poll GitHub every N minutes (config `poll.intervalMs`, off by default) for open `ready-for-agent` issues
 - [ ] Start at most `poll.concurrency` runs at a time (default 1); skip issues with a live or finished run unless they
       were relabelled

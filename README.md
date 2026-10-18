@@ -1,6 +1,6 @@
 # phat-mode
 
-Turns GitHub issues into **draft pull requests**, unattended. Built on [Pi Durable](https://earendil.com/posts/pi-durable/), so a run survives crashes, Ctrl-C and a sleeping laptop, and continues where it stopped.
+Turns GitHub issues into **pull requests**, unattended, one after another. Built on [Pi Durable](https://earendil.com/posts/pi-durable/), so a run survives crashes, Ctrl-C and a sleeping laptop, and continues where it stopped.
 
 > **Stage 1 MVP.** It runs on your Mac and works on one issue when you run it. Everything here may change.
 
@@ -9,7 +9,7 @@ Turns GitHub issues into **draft pull requests**, unattended. Built on [Pi Durab
 phat-mode is the **AFK agent** in a [mattpocock/skills](https://github.com/mattpocock/skills) workflow. You and the skills decide *what* to build; phat-mode builds it.
 
 ```
-/triage, /to-tickets or /to-spec  →  issue labelled ready-for-agent  →  phat-mode run 12  →  draft PR
+/triage, /to-tickets or /to-spec  →  issue labelled ready-for-agent  →  phat-mode watch  →  PR  →  you merge  →  next issue
 ```
 
 1. **Prepare**: only works on issues that are open, labelled `ready-for-agent`, specified by a trusted author, and not blocked by open issues. Anything else is left alone, with no reply. Labels it `phat-mode:working` and checks out branch `phat-mode/issue-12` in its own workspace.
@@ -19,7 +19,7 @@ phat-mode is the **AFK agent** in a [mattpocock/skills](https://github.com/mattp
 5. **Code review** (GPT-6.1 Sol, a different model family, read-only): two reviewers in parallel, following Matt Pocock's [code-review](https://github.com/mattpocock/skills/blob/main/skills/engineering/code-review/SKILL.md) skill. See [Code review](#code-review).
 6. **Verify** (AI, read-only, in the real app): follows the repo's own verification skill. See [Verification](#verification).
 7. **Describe** (AI, the implementer): writes the PR description following Matt Pocock's [pr](https://github.com/mattpocock/skills/blob/main/skills/engineering/pr/SKILL.md) skill: **Summary** (the smallest diagram that makes the point), **Evidence** (before and after) and **Merge Danger** (one- or two-way door, blast radius). It must not change files; if it does, the change is checked and reviewed again.
-8. **Publish** (code): commits, pushes, and opens a **draft** PR labelled `ready-for-human`. The description is the pr skill's three sections, then what phat-mode adds: its own verified check result under Evidence, the acceptance criteria to tick off, the code review, and `Closes #N`.
+8. **Publish** (code): commits, pushes, and opens a PR, ready for review, labelled `ready-for-human`. (A draft left by an earlier version is updated and made ready for review.) The description is the pr skill's three sections, then what phat-mode adds: its own verified check result under Evidence, the acceptance criteria to tick off, the code review, and `Closes #N`.
 
 It never merges and never pushes to `main`. You review and merge every PR.
 
@@ -41,12 +41,25 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 
 | Outcome | Issue labels afterwards |
 |---|---|
-| Draft PR opened | `ready-for-agent` + `phat-mode:done` (the PR gets `ready-for-human`; the issue closes when the PR merges) |
+| PR opened | `ready-for-agent` + `phat-mode:done` (the PR gets `ready-for-human`; the issue closes when the PR merges) |
 | Spec has gaps | `needs-info`, with triage notes in the skills' format |
 | Not for an agent | `ready-for-human`, with the reason |
 | Gave up (e.g. checks keep failing) | `ready-for-human` + `phat-mode:failed`, with the reason |
 
 To retry, label the issue `ready-for-agent` again and run it.
+
+## Watch
+
+`phat-mode watch` keeps going on its own: after you merge a PR, it starts the next issue. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes). Each time it:
+
+1. finishes any run that is still going;
+2. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge;
+3. hands an issue to a human if its PR was closed without merging (`ready-for-human`, with a comment; label it `ready-for-agent` again to retry);
+4. starts the **lowest-numbered issue that is ready and not blocked**: open, `ready-for-agent`, specified by a trusted author, no open blockers, and not `phat-mode:working` or `phat-mode:done`. `phat-mode:failed` with `ready-for-agent` again means: try again.
+
+Merging a PR closes its issue (`Closes #N`), which unblocks the issues that wait for it, so blockers set up as GitHub issue dependencies or `Blocked by` lines give the order. When nothing can start, it says why, once: e.g. `#9 is blocked by #18 (ready-for-human)`.
+
+It polls rather than using GitHub webhooks: a webhook needs a public address for your Mac, and anything sent while the Mac sleeps would be lost. Polling works out everything from GitHub on each look, so it catches up after sleep, Ctrl-C or a crash. While `watch` runs, it holds the lock: `status`, `run` and `abort` say phat-mode is already running.
 
 ## Code review
 
@@ -105,7 +118,8 @@ node src/cli.ts doctor            # checks everything
 
 | Command | |
 |---|---|
-| `node src/cli.ts run <issue>` | Work on an issue until a draft PR is open. Run it again to resume. |
+| `node src/cli.ts watch` | Work through the ready issues one at a time, until Ctrl-C. See [Watch](#watch). |
+| `node src/cli.ts run <issue>` | Work on one issue until a PR is open. Run it again to resume. |
 | `node src/cli.ts resume` | Continue every interrupted run. |
 | `node src/cli.ts status` | List runs and where they are. |
 | `node src/cli.ts abort <issue>` | Stop a run. |
@@ -147,7 +161,8 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
   "allowedAuthors": ["iPhatty"],
   "labels": { "readyForAgent": "ready-for-agent", "readyForHuman": "ready-for-human", "needsInfo": "needs-info" },
   "checkCommand": "npm run check",
-  "limits": { "maxCheckFixes": 3, "maxReviewRounds": 2 }
+  "limits": { "maxCheckFixes": 3, "maxReviewRounds": 2 },
+  "watchIntervalMs": 120000
 }
 ```
 

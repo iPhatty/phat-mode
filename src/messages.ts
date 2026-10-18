@@ -20,7 +20,7 @@ ${plan.summary}
 **Plan**
 ${list(plan.plan)}
 
-I'll open a draft pull request when the checks pass and the review is done.`;
+I'll open a pull request when the checks pass and the review is done.`;
 }
 
 /** Hand back to the author, in the triage skill's needs-info format. */
@@ -64,7 +64,13 @@ Nothing was merged. Any work so far is on the \`phat-mode\` branch for this issu
 }
 
 export function doneComment(prUrl: string): string {
-  return `🤖 **phat-mode opened a draft pull request:** ${prUrl}`;
+  return `🤖 **phat-mode opened a pull request:** ${prUrl}`;
+}
+
+export function handedBackComment(prUrl: string, labels: { readyForHuman: string; readyForAgent: string }): string {
+  return `🤖 **The pull request was closed without merging** (${prUrl}), so phat-mode moved this to \`${labels.readyForHuman}\` and will not pick it up again.
+
+To let phat-mode try again, label it \`${labels.readyForAgent}\`.`;
 }
 
 const SKILL_LINK = `[code-review @ ${MATTPOCOCK_SKILLS.short}](${MATTPOCOCK_SKILLS.url('code-review')})`;
@@ -259,7 +265,7 @@ export function pullRequestBody(details: PullRequestDetails): string {
   }
   if (review !== undefined) sections.push(codeReviewSection(review, unresolved));
   sections.push(
-    `---\nCloses #${issue.number}\n\n🤖 Opened by phat-mode. Description written following the [pr @ ${MATTPOCOCK_SKILLS.short}](${MATTPOCOCK_SKILLS.url('pr')}) skill. This is a draft: a human must review and merge it.`,
+    `---\nCloses #${issue.number}\n\n🤖 Opened by phat-mode. Description written following the [pr @ ${MATTPOCOCK_SKILLS.short}](${MATTPOCOCK_SKILLS.url('pr')}) skill. A human must review and merge it.`,
   );
   return sections.join('\n\n');
 }

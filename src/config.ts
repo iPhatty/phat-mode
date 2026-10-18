@@ -57,6 +57,8 @@ export type Config = {
   };
   /** Where phat-mode keeps its state, credentials and workspaces. */
   home: string;
+  /** How often `phat-mode watch` looks at GitHub when it has nothing to do. */
+  watchIntervalMs: number;
 };
 
 export const DEFAULT_HOME = process.env.PHAT_MODE_HOME ?? join(homedir(), '.phat-mode');
@@ -89,6 +91,7 @@ export function defaultConfig(home = DEFAULT_HOME): Config {
       installTimeoutMs: 15 * 60_000,
     },
     home,
+    watchIntervalMs: 2 * 60_000,
   };
 }
 
