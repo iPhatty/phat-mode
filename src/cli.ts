@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile, writeFile } from 'node:fs/promises';
+import { access, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
@@ -25,7 +25,7 @@ import { detectCommands, installProjectSkills, readiness, settingsFile } from '.
 import { LockedError } from './lock.ts';
 import { consoleLogger, consoleLoggerFor } from './log.ts';
 import type { PipelineResult, Services } from './pipeline.ts';
-import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef } from './repos.ts';
+import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef, watchScope } from './repos.ts';
 import { MATTPOCOCK_SKILLS } from './skills.ts';
 import { describeStep, nextStep } from './watch.ts';
 import { CommandChecks, GitWorkspaces, tail } from './workspace.ts';
@@ -43,7 +43,8 @@ Usage:
   phat-mode doctor [repo]       Check that everything phat-mode needs is set up
   phat-mode run <issue>         Work on a ready-for-agent issue until a PR is open (resumes if interrupted)
   phat-mode resume              Continue every run that was interrupted
-  phat-mode watch [repo...]     Keep going: work on the next ready issue each time you merge a PR (Ctrl-C to stop)
+  phat-mode watch [repo...]     Keep going: work on the next ready issue each time you merge a PR (Ctrl-C to stop).
+                                In a set-up repo, asks whether to watch it alone or all your repos
   phat-mode status              List runs and where they are
   phat-mode abort <issue>       Stop the run for an issue
 
@@ -445,6 +446,44 @@ const repoServices = (machine: MachineConfig) => {
   return async (repo: string) => servicesFor(await configFor(repo));
 };
 
+/** The repo of this folder, and whether it is set up: has a .phat-mode.json, from `phat-mode init`. */
+async function repoHere(): Promise<{ repo: string; setUp: boolean } | undefined> {
+  const top = await run('git', ['rev-parse', '--show-toplevel'], { allowFailure: true });
+  if (top.code !== 0) return undefined;
+  const root = top.stdout.trim();
+  const repo = await currentRepo(root);
+  if (repo === undefined) return undefined;
+  const setUp = await access(join(root, REPO_SETTINGS_FILE)).then(
+    () => true,
+    () => false,
+  );
+  return { repo, setUp };
+}
+
+/** Ask whether to watch only `here` or `all` repos. Not at a terminal, nobody can answer: all, as before. */
+async function chooseWatchRepos(here: string, all: string[]): Promise<string[]> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(`${here} is set up for phat-mode; watching all ${all.length} repos. Run \`phat-mode watch ${here}\` to watch it alone.`);
+    return all;
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  // Ctrl-C at the question stops, as it does everywhere else.
+  rl.on('SIGINT', () => {
+    rl.close();
+    process.exit(130);
+  });
+  try {
+    console.log(`This folder is ${here}, set up for phat-mode. Watch:\n  1) ${here} only\n  2) all ${all.length} repos: ${all.join(', ')}`);
+    for (;;) {
+      const answer = (await rl.question('Choice [1]: ')).trim();
+      if (answer === '' || answer === '1') return [here];
+      if (answer === '2') return all;
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 /** Repos named on the command line, else the ones in config.json, else this folder's. */
 async function reposFrom(args: string[], machine: MachineConfig): Promise<string[]> {
   const bad = args.filter((arg) => !isRepoName(arg));
@@ -502,7 +541,12 @@ async function main(argv: string[]): Promise<number> {
       return code;
     }
     case 'watch': {
-      const repos = await reposFrom(args, machine);
+      let repos: string[];
+      if (args.length > 0) repos = await reposFrom(args, machine);
+      else {
+        const scope = watchScope(machine.repos, await repoHere());
+        repos = 'repos' in scope ? scope.repos : await chooseWatchRepos(scope.choose.here, scope.choose.all);
+      }
       if (repos.length === 0) {
         console.error('✖ Which repos? Run it in a clone, name them (phat-mode watch owner/name), or list them under "repos" in ~/.phat-mode/config.json.');
         return 2;

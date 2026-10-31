@@ -22,6 +22,23 @@ export async function currentRepo(cwd = process.cwd()): Promise<string | undefin
   return result.code === 0 && isRepoName(name) ? name : undefined;
 }
 
+/** What `phat-mode watch` works on: these repos, or a question for the user. */
+export type WatchScope = { repos: string[] } | { choose: { here: string; all: string[] } };
+
+/**
+ * What `phat-mode watch` works on when no repos are named. `configured`: the `repos` in config.json. `here`: the repo of
+ * the current folder, and whether it is set up (has .phat-mode.json). In a set-up repo with other repos to watch, ask:
+ * this one, or all of them (this one included). Otherwise the configured repos, else this folder's.
+ */
+export function watchScope(configured: readonly string[], here: { repo: string; setUp: boolean } | undefined): WatchScope {
+  if (here?.setUp) {
+    const all = configured.includes(here.repo) ? [...configured] : [...configured, here.repo];
+    return all.length > 1 ? { choose: { here: here.repo, all } } : { repos: [here.repo] };
+  }
+  if (configured.length > 0) return { repos: [...configured] };
+  return { repos: here === undefined ? [] : [here.repo] };
+}
+
 /**
  * An issue, written as `12`, `#12`, `owner/name#12` or its GitHub URL. A bare number means an issue in `here`, the
  * repo of the current folder.

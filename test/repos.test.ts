@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, test } from 'node:test';
 import { detectCommands, settingsFile } from '../src/init.ts';
-import { parseIssueRef } from '../src/repos.ts';
+import { parseIssueRef, watchScope } from '../src/repos.ts';
 
 describe('parseIssueRef', () => {
   test('a number is an issue in the repo of this folder', () => {
@@ -21,6 +21,31 @@ describe('parseIssueRef', () => {
     assert.throws(() => parseIssueRef('12', undefined), /which repo\? Run this inside a clone of it, or write owner\/name#12/);
     assert.throws(() => parseIssueRef('twelve', 'o/r'), /is not an issue/);
     assert.throws(() => parseIssueRef('0', 'o/r'), /not an issue number/);
+  });
+});
+
+describe('watchScope: what `phat-mode watch` works on when no repos are named', () => {
+  const setUp = (repo: string) => ({ repo, setUp: true });
+  const notSetUp = (repo: string) => ({ repo, setUp: false });
+
+  test('in a set-up repo, with other repos configured: ask, this one or all of them', () => {
+    assert.deepEqual(watchScope(['o/a', 'o/b'], setUp('o/b')), { choose: { here: 'o/b', all: ['o/a', 'o/b'] } });
+  });
+
+  test('a set-up repo that is not configured is part of all', () => {
+    assert.deepEqual(watchScope(['o/a'], setUp('o/c')), { choose: { here: 'o/c', all: ['o/a', 'o/c'] } });
+  });
+
+  test('nothing to choose: the set-up repo is the only one', () => {
+    assert.deepEqual(watchScope([], setUp('o/a')), { repos: ['o/a'] });
+    assert.deepEqual(watchScope(['o/a'], setUp('o/a')), { repos: ['o/a'] });
+  });
+
+  test('not in a set-up repo: the configured repos, else this folder, as before', () => {
+    assert.deepEqual(watchScope(['o/a', 'o/b'], notSetUp('o/c')), { repos: ['o/a', 'o/b'] });
+    assert.deepEqual(watchScope(['o/a'], undefined), { repos: ['o/a'] });
+    assert.deepEqual(watchScope([], notSetUp('o/c')), { repos: ['o/c'] });
+    assert.deepEqual(watchScope([], undefined), { repos: [] });
   });
 });
 

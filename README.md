@@ -52,7 +52,7 @@ To retry, label the issue `ready-for-agent` again and run it.
 
 ## Watch
 
-`phat-mode watch` keeps going on its own: after you merge a PR, it starts the next issue. It works on the repos named on the command line (`phat-mode watch owner/a owner/b`), else the `repos` in your config.json (`phat-mode init` adds each repo it sets up), else the repo of the current folder. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes).
+`phat-mode watch` keeps going on its own: after you merge a PR, it starts the next issue. It works on the repos named on the command line (`phat-mode watch owner/a owner/b`), else the `repos` in your config.json (`phat-mode init` adds each repo it sets up), else the repo of the current folder. Run inside a set-up repo (one with `.phat-mode.json`) while other repos are listed, it asks whether to watch that repo alone (the default) or all of them; when it cannot ask (not a terminal), it watches all. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes).
 
 One run at a time across all repos, in the order they are listed. The rules below apply per repo: a PR waiting for you in one repo does not hold up the others. Each time, for each repo, it:
 
@@ -138,7 +138,7 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 | Command | |
 |---|---|
 | `phat-mode init` | Set up the repo in this folder. See [Setup](#setup). |
-| `phat-mode watch [repo…]` | Work through the ready issues one at a time, until Ctrl-C. See [Watch](#watch). |
+| `phat-mode watch [repo…]` | Work through the ready issues one at a time, until Ctrl-C. In a set-up repo, asks: this repo or all. See [Watch](#watch). |
 | `phat-mode run <issue>` | Work on one issue until a PR is open. Run it again to resume. |
 | `phat-mode resume` | Continue every interrupted run. |
 | `phat-mode status` | List runs (every repo) and where they are. |
@@ -190,7 +190,7 @@ Optional; anything left out uses the defaults in [`src/config.ts`](src/config.ts
 ```
 
 - `limits`: also `maxGrillRounds` (6) and `maxTickets` (8), for agent mode's shaping.
-- `repos`: what `watch` works on when no repos are named. `init` adds to it.
+- `repos`: what `watch` works on when no repos are named (inside a set-up repo, it asks: that one or all). `init` adds to it.
 - `allowedAuthors`: trusted on every repo that does not list its own. Default: you, the `gh` user.
 - Repo settings (`checkCommand`, `repo`, …) here are an error, pointing to `.phat-mode.json`.
 
