@@ -47,13 +47,13 @@ export type LabelChange = { add?: readonly string[]; remove?: readonly string[] 
 export interface GitHub {
   /** The issue with its labels and comments. */
   getIssue(issue: number): Promise<Issue>;
-  /** Post a comment, or update the one carrying `marker`, so a rerun never posts twice. */
+  /** Post a comment, or update phat-mode's own one carrying `marker`, so a rerun never posts twice. */
   upsertComment(issue: number, marker: string, body: string): Promise<void>;
-  /** The open pull request from `branch`, if any. */
+  /** The open pull request from `branch` in the repo itself (never a fork's), if any. */
   findPullRequest(branch: string): Promise<PullRequest | undefined>;
-  /** The newest pull request from `branch`, in any state. */
+  /** The newest pull request from `branch` in the repo itself (never a fork's), in any state. */
   latestPullRequest(branch: string): Promise<(PullRequest & { state: PullRequestState }) | undefined>;
-  /** Every open pull request, with the branch it comes from. */
+  /** Every open pull request from a branch in the repo itself (never a fork's), with that branch. */
   openPullRequests(): Promise<(PullRequest & { branch: string })[]>;
   /** Open issues labelled `label`, lowest number first. */
   listOpenIssues(label: string): Promise<ListedIssue[]>;
@@ -87,10 +87,22 @@ export function mergeLabels(...changes: LabelChange[]): Required<LabelChange> {
   return { add, remove };
 }
 
+/** Fields asked for on pull requests: what `PullRequest` needs, and whether the branch comes from a fork. */
+const PR_FIELDS = 'number,url,isDraft,isCrossRepository';
+
+/**
+ * The pull requests whose branch is in the repo itself. On a public repo anyone can open one from a fork, and name its
+ * branch `phat-mode/issue-N`; only people with write access can push a branch to the repo, so a fork's pull request is
+ * never phat-mode's.
+ */
+const fromRepo = <T extends { isCrossRepository: boolean }>(prs: T[]): Omit<T, 'isCrossRepository'>[] =>
+  prs.filter((pr) => !pr.isCrossRepository).map(({ isCrossRepository: _fork, ...pr }) => pr);
+
 /** GitHub through the `gh` CLI, using its existing login. */
 export class GhGitHub implements GitHub {
   readonly #repo: string;
   #knownLabels: Set<string> | undefined;
+  #viewer: Promise<string> | undefined;
 
   constructor(repo: string) {
     this.#repo = repo;
@@ -132,12 +144,20 @@ export class GhGitHub implements GitHub {
     };
   }
 
+  /** The `gh` user: who phat-mode posts as. */
+  #me(): Promise<string> {
+    this.#viewer ??= this.#gh(['api', 'user', '--jq', '.login']).then((login) => login.trim());
+    return this.#viewer;
+  }
+
   async upsertComment(issue: number, marker: string, body: string): Promise<void> {
     const text = `${marker}\n${body}`;
     const comments = JSON.parse(
       await this.#gh(['api', '--paginate', '--slurp', `repos/${this.#repo}/issues/${issue}/comments`]),
-    ) as { id: number; body: string }[][];
-    const existing = comments.flat().find((comment) => comment.body.includes(marker));
+    ) as { id: number; body: string; user: { login: string } | null }[][];
+    // Only phat-mode's own comment: anyone can post one carrying the marker on a public repo.
+    const me = await this.#me();
+    const existing = comments.flat().find((comment) => comment.user?.login === me && comment.body.includes(marker));
     if (existing === undefined) {
       await this.#gh(['issue', 'comment', String(issue), '-R', this.#repo, '--body-file', '-'], text);
     } else if (existing.body !== text) {
@@ -150,28 +170,28 @@ export class GhGitHub implements GitHub {
 
   async findPullRequest(branch: string): Promise<PullRequest | undefined> {
     const prs = JSON.parse(
-      await this.#gh(['pr', 'list', '-R', this.#repo, '--head', branch, '--state', 'open', '--json', 'number,url,isDraft']),
-    ) as PullRequest[];
-    return prs[0];
+      await this.#gh(['pr', 'list', '-R', this.#repo, '--head', branch, '--state', 'open', '--json', PR_FIELDS]),
+    ) as (PullRequest & { isCrossRepository: boolean })[];
+    return fromRepo(prs)[0];
   }
 
   async latestPullRequest(branch: string) {
     const prs = JSON.parse(
       await this.#gh([
         'pr', 'list', '-R', this.#repo, '--head', branch, '--state', 'all', '--limit', '100',
-        '--json', 'number,url,isDraft,state',
+        '--json', `${PR_FIELDS},state`,
       ]),
-    ) as (PullRequest & { state: PullRequestState })[];
-    return prs.sort((a, b) => b.number - a.number)[0];
+    ) as (PullRequest & { state: PullRequestState; isCrossRepository: boolean })[];
+    return fromRepo(prs).sort((a, b) => b.number - a.number)[0];
   }
 
   async openPullRequests() {
     const prs = JSON.parse(
       await this.#gh([
-        'pr', 'list', '-R', this.#repo, '--state', 'open', '--limit', '500', '--json', 'number,url,isDraft,headRefName',
+        'pr', 'list', '-R', this.#repo, '--state', 'open', '--limit', '500', '--json', `${PR_FIELDS},headRefName`,
       ]),
-    ) as (PullRequest & { headRefName: string })[];
-    return prs.map(({ headRefName, ...pr }) => ({ ...pr, branch: headRefName }));
+    ) as (PullRequest & { headRefName: string; isCrossRepository: boolean })[];
+    return fromRepo(prs).map(({ headRefName, ...pr }) => ({ ...pr, branch: headRefName }));
   }
 
   async listOpenIssues(label: string): Promise<ListedIssue[]> {

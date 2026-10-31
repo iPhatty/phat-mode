@@ -217,6 +217,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 
 - Only `ready-for-agent` issues (a label only people with triage access can set) specified by `allowedAuthors` are worked on; others are ignored without any reply. Briefs from anyone else are ignored.
 - Issue and brief text is treated as untrusted input in every prompt.
+- Public repos: only pull requests from branches in the repo itself count as phat-mode's (a fork's `phat-mode/issue-N` branch is ignored), and only comments posted by the `gh` user are updated as phat-mode's own.
 - Agents never touch git history or GitHub: `git push/commit/checkout/...` and `gh` are blocked. The pipeline does those itself.
 - Only the implementer can write files, and only inside its workspace (never `.git`).
 - Agent commands run without your tokens in their environment, and credential folders are blocked.
