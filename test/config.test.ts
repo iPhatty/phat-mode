@@ -54,9 +54,41 @@ describe('models', () => {
     assert.deepEqual(modelFor(config, 'review'), { ...opus, thinkingLevel: 'high' });
   });
 
+  test('agent mode: GPT-6.1 Sol grills, defaultModel shapes', async () => {
+    const config = defaultMachineConfig('/tmp/unused');
+    assert.deepEqual(modelFor(config, 'grill'), gpt);
+    assert.deepEqual(modelFor(config, 'shape'), opus);
+    const changed = await withConfig({ defaultModel: { modelId: 'claude-sonnet-5.5' } });
+    assert.deepEqual(modelFor(changed, 'shape'), { ...opus, modelId: 'claude-sonnet-5.5' });
+    assert.deepEqual(modelFor(changed, 'grill'), gpt, 'the questioner keeps its own model');
+  });
+
+  test('the grill and shape roles can be overridden, and "grill": null follows defaultModel', async () => {
+    const config = await withConfig({ models: { grill: { modelId: 'x' }, shape: { thinkingLevel: 'high' } } });
+    assert.deepEqual(modelFor(config, 'grill'), { ...gpt, modelId: 'x' });
+    assert.deepEqual(modelFor(config, 'shape'), { ...opus, thinkingLevel: 'high' });
+    const followed = await withConfig({ models: { grill: null } });
+    assert.deepEqual(modelFor(followed, 'grill'), opus);
+  });
+
   test('other settings keep their defaults when config.json sets only models', async () => {
     const config = await withConfig({ defaultModel: { thinkingLevel: 'high' } });
     assert.deepEqual(config.repos, []);
+    assert.equal(config.limits.maxCheckFixes, 3);
+  });
+});
+
+describe('limits', () => {
+  test('agent mode: 6 grilling rounds and 8 tickets by default', () => {
+    const { limits } = defaultMachineConfig('/tmp/unused');
+    assert.equal(limits.maxGrillRounds, 6);
+    assert.equal(limits.maxTickets, 8);
+  });
+
+  test('an override keeps the other limits', async () => {
+    const config = await withConfig({ limits: { maxGrillRounds: 3, maxTickets: 12 } });
+    assert.equal(config.limits.maxGrillRounds, 3);
+    assert.equal(config.limits.maxTickets, 12);
     assert.equal(config.limits.maxCheckFixes, 3);
   });
 });
@@ -94,6 +126,12 @@ describe('.phat-mode.json (each repo\'s)', () => {
     );
   });
 
+  test('labels.agentMode renames the agent-mode label', () => {
+    assert.deepEqual(parse({ installCommand: 'a', checkCommand: 'b', labels: { agentMode: 'shape-me' } }).labels, { agentMode: 'shape-me' });
+    assert.throws(() => parse({ installCommand: 'a', checkCommand: 'b', labels: { agentMode: 'x', shaped: 'y' } }), /"labels" may only rename .*agentMode/);
+    assert.throws(() => parse({ installCommand: 'a', checkCommand: 'b', agentMode: 'x' }), /unknown setting\(s\) agentMode/);
+  });
+
   test('both commands are required: phat-mode never guesses them', () => {
     assert.throws(() => parse({ installCommand: 'npm ci' }), /"checkCommand" is required/);
     assert.throws(() => parse({ checkCommand: 'npm test', installCommand: ' ' }), /"installCommand" is required/);
@@ -119,6 +157,7 @@ describe('repoConfig', () => {
     assert.equal(config.baseBranch, 'trunk');
     assert.equal(config.checkCommand, 'npm run check');
     assert.equal(config.labels.readyForAgent, 'ready-for-agent');
+    assert.equal(config.labels.agentMode, 'agent-mode');
     assert.deepEqual(config.defaultModel, machine.defaultModel);
     assert.equal('repos' in config, false);
   });
@@ -137,5 +176,7 @@ describe('repoConfig', () => {
     assert.equal(config.baseBranch, 'develop');
     assert.equal(config.labels.readyForAgent, 'agent');
     assert.equal(config.labels.needsInfo, 'needs-info');
+    const renamed = repoConfig(machine, 'o/r', { ...settings, labels: { agentMode: 'shape-me' } }, github);
+    assert.equal(renamed.labels.agentMode, 'shape-me');
   });
 });

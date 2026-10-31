@@ -11,8 +11,8 @@ export type ModelChoice = {
 };
 
 /** The agents phat-mode runs. */
-export type Role = 'plan' | 'implement' | 'review' | 'verify';
-export const ROLES: readonly Role[] = ['plan', 'implement', 'review', 'verify'];
+export type Role = 'plan' | 'implement' | 'review' | 'verify' | 'grill' | 'shape';
+export const ROLES: readonly Role[] = ['plan', 'implement', 'review', 'verify', 'grill', 'shape'];
 
 export type Labels = {
   needsTriage: string;
@@ -20,6 +20,8 @@ export type Labels = {
   readyForAgent: string;
   readyForHuman: string;
   wontfix: string;
+  /** Set by a human on a vague issue: phat-mode shapes it into ready-for-agent tickets instead of building it. */
+  agentMode: string;
 };
 
 export type Limits = {
@@ -33,6 +35,10 @@ export type Limits = {
   maxImplementRuns: number;
   checkTimeoutMs: number;
   installTimeoutMs: number;
+  /** Grilling rounds when shaping; questions still open after the last one are decided with the recommended answers. */
+  maxGrillRounds: number;
+  /** Most tickets shaping may break a request into; a bigger request is handed to a human. */
+  maxTickets: number;
 };
 
 /** Your settings, the same for every repo: `~/.phat-mode/config.json`. */
@@ -62,7 +68,7 @@ export type RepoSettings = {
   baseBranch?: string;
   /** Overrides the trusted authors from your config.json for this repo. */
   allowedAuthors?: string[];
-  /** Triage label names, when the repo maps them differently (see its triage-labels.md). */
+  /** Triage label names (and `agentMode`), when the repo maps them differently (see its triage-labels.md). */
   labels?: Partial<Labels>;
 };
 
@@ -96,6 +102,7 @@ export const DEFAULT_LABELS: Labels = {
   readyForAgent: 'ready-for-agent',
   readyForHuman: 'ready-for-human',
   wontfix: 'wontfix',
+  agentMode: 'agent-mode',
 };
 
 export function defaultMachineConfig(home = DEFAULT_HOME): MachineConfig {
@@ -105,6 +112,8 @@ export function defaultMachineConfig(home = DEFAULT_HOME): MachineConfig {
     models: {
       // A different model family reviews the code, so the review is independent of the model that wrote it.
       review: { provider: 'github-copilot', modelId: 'gpt-6.1-sol' },
+      // The questioner in shaping, on a different model family from the answerer (`shape`, defaultModel).
+      grill: { provider: 'github-copilot', modelId: 'gpt-6.1-sol' },
     },
     limits: {
       maxCheckFixes: 3,
@@ -113,6 +122,8 @@ export function defaultMachineConfig(home = DEFAULT_HOME): MachineConfig {
       maxImplementRuns: 8,
       checkTimeoutMs: 10 * 60_000,
       installTimeoutMs: 15 * 60_000,
+      maxGrillRounds: 6,
+      maxTickets: 8,
     },
     watchIntervalMs: 2 * 60_000,
     repos: [],

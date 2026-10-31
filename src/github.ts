@@ -1,3 +1,4 @@
+import type { Labels } from './config.ts';
 import { run } from './exec.ts';
 
 export type Comment = {
@@ -36,9 +37,20 @@ export const PROGRESS_LABELS = {
   working: { name: 'phat-mode:working', color: 'FBCA04', description: 'phat-mode is working on this' },
   done: { name: 'phat-mode:done', color: '0E8A16', description: 'phat-mode opened a pull request' },
   failed: { name: 'phat-mode:failed', color: 'B60205', description: 'phat-mode could not finish' },
+  shaped: { name: 'phat-mode:shaped', color: '5319E7', description: 'phat-mode shaped this into tickets' },
 } as const;
 
-export type Progress = keyof typeof PROGRESS_LABELS;
+/**
+ * The progress of a run: one at a time, each replacing the others. `shaped` is not one of them: it stays on a Parent
+ * while its Tickets are built.
+ */
+export const RUN_PROGRESS = ['working', 'done', 'failed'] as const;
+export type Progress = (typeof RUN_PROGRESS)[number];
+
+/** Every label phat-mode needs on a repo: the triage labels (with `agentMode`), as named there, and its progress labels. */
+export function requiredLabels(labels: Labels): string[] {
+  return [...new Set([...Object.values(labels), ...Object.values(PROGRESS_LABELS).map((label) => label.name)])];
+}
 
 /** Labels to add and remove. Removing a label that is not there is fine. */
 export type LabelChange = { add?: readonly string[]; remove?: readonly string[] };
@@ -75,7 +87,7 @@ export const commentMarker = (key: string) => `<!-- phat-mode:${key} -->`;
 
 /** The label change that shows `progress` (or no progress label at all) and removes the other progress labels. */
 export function progressChange(progress: Progress | null): Required<LabelChange> {
-  const all = Object.values(PROGRESS_LABELS).map((label) => label.name);
+  const all = RUN_PROGRESS.map((key) => PROGRESS_LABELS[key].name);
   const add = progress === null ? [] : [PROGRESS_LABELS[progress].name];
   return { add, remove: all.filter((name) => !add.includes(name)) };
 }
@@ -235,20 +247,31 @@ export class GhGitHub implements GitHub {
     return created;
   }
 
-  async #ensureLabel(name: string): Promise<boolean> {
+  /** Which of `names` the repo does not have. */
+  async missingLabels(names: readonly string[]): Promise<string[]> {
+    const known = await this.#loadKnownLabels();
+    return names.filter((name) => !known.has(name));
+  }
+
+  async #loadKnownLabels(): Promise<Set<string>> {
     if (this.#knownLabels === undefined) {
       const labels = JSON.parse(
         await this.#gh(['label', 'list', '-R', this.#repo, '--limit', '1000', '--json', 'name']),
       ) as { name: string }[];
       this.#knownLabels = new Set(labels.map((label) => label.name));
     }
-    if (this.#knownLabels.has(name)) return false;
+    return this.#knownLabels;
+  }
+
+  async #ensureLabel(name: string): Promise<boolean> {
+    const known = await this.#loadKnownLabels();
+    if (known.has(name)) return false;
     // Create only. Never --force: that would overwrite the colour and description someone else chose.
     const progress = Object.values(PROGRESS_LABELS).find((label) => label.name === name);
     const args = ['label', 'create', name, '-R', this.#repo];
     if (progress) args.push('--color', progress.color, '--description', progress.description);
     const result = await run('gh', args, { allowFailure: true });
-    this.#knownLabels.add(name);
+    known.add(name);
     return result.code === 0;
   }
 

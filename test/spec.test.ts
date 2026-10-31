@@ -3,7 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { testConfig } from './fakes.ts';
-import { type Issue, mergeLabels, progressChange } from '../src/github.ts';
+import { type Issue, mergeLabels, progressChange, requiredLabels } from '../src/github.ts';
+import { DEFAULT_LABELS } from '../src/config.ts';
 import { blockedBy, eligibility, findAgentBrief, findSpec, listUnder, parentRef } from '../src/spec.ts';
 
 const fixture = (name: string) => readFile(join(import.meta.dirname, 'fixtures', name), 'utf8');
@@ -195,12 +196,36 @@ describe('eligibility', () => {
     assert.equal(eligibility(issue({ labels: ['agent:ready'] }), custom).ok, true);
     assert.equal(eligibility(issue(), custom).ok, false);
   });
+
+  test('refuses an issue labelled agent-mode: it is shaped, not built', () => {
+    const refused = eligibility(issue({ labels: ['ready-for-agent', 'agent-mode'] }), config);
+    assert.equal(refused.ok, false);
+    assert.match(refused.ok ? '' : refused.reason, /labelled `agent-mode`: phat-mode shapes it/);
+    const custom = { ...config, labels: { ...config.labels, agentMode: 'shape-me' } };
+    assert.equal(eligibility(issue({ labels: ['ready-for-agent', 'shape-me'] }), custom).ok, false);
+    assert.equal(eligibility(issue({ labels: ['ready-for-agent', 'agent-mode'] }), custom).ok, true);
+  });
 });
 
 describe('labels', () => {
   test('progressChange shows one progress label and removes the others', () => {
     assert.deepEqual(progressChange('working'), { add: ['phat-mode:working'], remove: ['phat-mode:done', 'phat-mode:failed'] });
     assert.deepEqual(progressChange(null), { add: [], remove: ['phat-mode:working', 'phat-mode:done', 'phat-mode:failed'] });
+  });
+
+  test('progressChange never touches phat-mode:shaped', () => {
+    for (const progress of ['working', 'done', 'failed', null] as const) {
+      const change = progressChange(progress);
+      assert.equal([...change.add, ...change.remove].includes('phat-mode:shaped'), false);
+    }
+  });
+
+  test('requiredLabels: the triage labels, agent-mode and every progress label, as the repo names them', () => {
+    const names = requiredLabels(DEFAULT_LABELS);
+    for (const name of ['ready-for-agent', 'agent-mode', 'phat-mode:working', 'phat-mode:shaped']) assert.ok(names.includes(name), name);
+    const renamed = requiredLabels({ ...DEFAULT_LABELS, agentMode: 'shape-me' });
+    assert.ok(renamed.includes('shape-me'));
+    assert.equal(renamed.includes('agent-mode'), false);
   });
 
   test('mergeLabels: adding wins over removing', () => {
