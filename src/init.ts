@@ -1,7 +1,9 @@
-import { access, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, cp, lstat, mkdir, readFile, symlink } from 'node:fs/promises';
+import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { RepoSettings } from './config.ts';
-import { findVerifySkills } from './verify.ts';
+import { PROJECT_SKILLS, skillDir } from './skills.ts';
+import { findVerifySkills, SKILL_ROOTS } from './verify.ts';
 
 const exists = (path: string) =>
   access(path).then(
@@ -75,6 +77,49 @@ export type Readiness = {
   /** mattpocock/skills' label mapping, if the repo has one. */
   triageLabels: string | undefined;
 };
+
+export type InstalledSkills = {
+  /** Copied into `.agents/skills/`. */
+  installed: string[];
+  /** Already in the repo (any skills folder): left as they are, the repo owns them. */
+  kept: string[];
+  /** `.claude/skills/<name>` links made to the `.agents/skills/` copy, for Claude Code. */
+  linked: string[];
+};
+
+const present = (path: string) =>
+  lstat(path).then(
+    () => true,
+    () => false,
+  );
+
+/**
+ * Copy phat-mode's pinned `PROJECT_SKILLS` into the repo's `.agents/skills/`, the folder most agents read. Never
+ * replaces a skill the repo already has, in any skills folder: once there, the repo owns it. Claude Code reads only
+ * `.claude/skills/`, so a repo that uses it (a `.claude/` folder or `CLAUDE.md`) also gets a link there.
+ */
+export async function installProjectSkills(root: string): Promise<InstalledSkills> {
+  const result: InstalledSkills = { installed: [], kept: [], linked: [] };
+  const claude = (await present(join(root, '.claude'))) || (await present(join(root, 'CLAUDE.md')));
+  for (const skill of PROJECT_SKILLS) {
+    const existing = [];
+    for (const dir of SKILL_ROOTS) if (await present(join(root, dir, skill))) existing.push(dir);
+    if (existing.length > 0) {
+      result.kept.push(`${existing[0]}/${skill}`);
+      continue;
+    }
+    const target = join(root, '.agents/skills', skill);
+    await cp(fileURLToPath(skillDir(skill)), target, { recursive: true });
+    result.installed.push(`.agents/skills/${skill}`);
+    if (claude) {
+      const link = join(root, '.claude/skills', skill);
+      await mkdir(join(root, '.claude/skills'), { recursive: true });
+      await symlink(relative(join(root, '.claude/skills'), target), link, 'dir');
+      result.linked.push(`.claude/skills/${skill}`);
+    }
+  }
+  return result;
+}
 
 /** What the repo has that phat-mode uses. Read from `HEAD`, as runs read from the base branch. */
 export async function readiness(root: string): Promise<Readiness> {

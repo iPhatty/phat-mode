@@ -75,7 +75,7 @@ Each reviewer gets the skill's brief verbatim, from **phat-mode's own pinned cop
 - The **review process** belongs to phat-mode: identical on every repo, and exactly what the tests cover. The code under review cannot change how it is reviewed.
 - **What good code means** belongs to each repo: its `AGENTS.md`, `CONTRIBUTING.md` and similar, which the Standards reviewer reads. A documented repo rule overrides a baseline smell, as the skill says.
 
-Both of Matt's skills (`code-review`, `pr`) are pinned together in `skills/`. To upgrade: copy the new upstream files in, update `MATTPOCOCK_SKILLS` in `src/skills.ts` and the commit in each `skills/*/README.md`, and run `npm test` (it fails if a skill's layout changed).
+Matt's skills are pinned together in `skills/`: the two phat-mode follows (`code-review`, `pr`) and the ones `init` installs into each repo (see [Setup](#setup)). To upgrade: copy the new upstream files in, update `MATTPOCOCK_SKILLS` in `src/skills.ts` and the commit in each `skills/*/README.md`, and run `npm test` (it fails if a skill's layout changed).
 
 ### Evidence
 
@@ -121,12 +121,13 @@ Then, once per repo, in a clone of it:
 
 ```bash
 cd ~/code/some-repo
-phat-mode init               # writes .phat-mode.json, creates the labels, says what the repo is missing
-git add .phat-mode.json && git commit -m "Set up phat-mode" && git push
+phat-mode init               # writes .phat-mode.json, creates the labels, adds mattpocock/skills, says what is missing
+git add .phat-mode.json .agents/skills   # and .claude/skills, if init linked skills there
+git commit -m "Set up phat-mode" && git push
 phat-mode doctor             # checks everything, including this repo's settings on GitHub
 ```
 
-`init` suggests the install and check commands from the repo's files (npm, pnpm, yarn or bun scripts, Cargo, Go, `make check`) and asks before writing them; `--yes` accepts the suggestions, `--check "<cmd>"` and `--install "<cmd>"` set them. It runs the check command once to see that it passes, and reports whether the repo has what makes phat-mode's work good: an `AGENTS.md` (or `CLAUDE.md`, `CONTRIBUTING.md`) with the repo's rules, a [verification skill](#verification), and the triage setup from [mattpocock/skills](https://github.com/mattpocock/skills).
+`init` suggests the install and check commands from the repo's files (npm, pnpm, yarn or bun scripts, Cargo, Go, `make check`) and asks before writing them; `--yes` accepts the suggestions, `--check "<cmd>"` and `--install "<cmd>"` set them. It copies mattpocock/skills' `triage`, `to-tickets`, `to-spec` and `tdd`, with every skill they use (`setup-matt-pocock-skills`, `grilling`, `domain-modeling`, `codebase-design`, `code-review`), pinned in [`skills/`](skills/) (same commit, MIT, © Matt Pocock), into the repo's `.agents/skills/`, linked from `.claude/skills/` if the repo uses Claude Code (a `.claude/` folder or `CLAUDE.md`), so everyone preparing issues has the skills phat-mode reads, and anyone building test-first has `tdd`; a skill the repo already has, in any skills folder, is kept as it is, and `--no-skills` copies none. Run `/setup-matt-pocock-skills` once afterwards: it writes the issue tracker and label settings `triage`, `to-tickets` and `to-spec` need. It runs the check command once to see that it passes, and reports whether the repo has what makes phat-mode's work good: an `AGENTS.md` (or `CLAUDE.md`, `CONTRIBUTING.md`) with the repo's rules, a [verification skill](#verification), and the triage setup from [mattpocock/skills](https://github.com/mattpocock/skills).
 
 A repo without a `.phat-mode.json` on its default branch is refused: phat-mode never guesses the check command that decides whether a change is good enough for a pull request.
 
@@ -224,10 +225,10 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 ## How it works
 
 - `src/pipeline.ts`: the durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again. Each run uses the settings and services of its own repo, so one process works on any number of repos.
-- `src/config.ts` / `src/repos.ts`: your settings and each repo's `.phat-mode.json` (read from GitHub), and which repo an issue reference means. `src/init.ts`: what `phat-mode init` detects and reports.
+- `src/config.ts` / `src/repos.ts`: your settings and each repo's `.phat-mode.json` (read from GitHub), and which repo an issue reference means. `src/init.ts`: what `phat-mode init` detects, installs and reports.
 - `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
 - `src/verify.ts`: finds the repo's verify skill, protects it, collects evidence, and decides what blocks.
-- `src/skills.ts`: the pinned mattpocock/skills version. `src/pr.ts`: the pr skill and evidence sources.
+- `src/skills.ts`: the pinned mattpocock/skills version, and which skills `init` installs. `src/pr.ts`: the pr skill and evidence sources.
 - `src/code-review.ts`: reads phat-mode's pinned code-review skill, finds standards sources, and decides what must be fixed.
 - `src/agents.ts`: the four agents (planner, implementer, Standards and Spec reviewers), their tools, the report tools agents finish with, and the guard hook.
 - `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code.

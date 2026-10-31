@@ -21,11 +21,12 @@ import { FileCredentialStore, importPiCredential } from './credentials.ts';
 import { run, runShell } from './exec.ts';
 import { GhGitHub, PROGRESS_LABELS } from './github.ts';
 import { createCopilotModels, openPhatMode, RunsDoc } from './harness.ts';
-import { detectCommands, readiness, settingsFile } from './init.ts';
+import { detectCommands, installProjectSkills, readiness, settingsFile } from './init.ts';
 import { LockedError } from './lock.ts';
 import { consoleLogger, consoleLoggerFor } from './log.ts';
 import type { PipelineResult, Services } from './pipeline.ts';
 import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef } from './repos.ts';
+import { MATTPOCOCK_SKILLS } from './skills.ts';
 import { describeStep, nextStep } from './watch.ts';
 import { CommandChecks, GitWorkspaces, tail } from './workspace.ts';
 
@@ -48,6 +49,7 @@ Usage:
 
 <issue> is 12 (in the repo of this folder), owner/name#12, or the issue's URL. [repo] is owner/name.
 init options: --check "<command>"  --install "<command>"  --yes (accept what it detects)  --no-check (do not run it)
+              --no-skills (do not copy mattpocock/skills' triage, to-tickets, to-spec and tdd, and the skills they use, into the repo)
 
 Settings: each repo's .phat-mode.json (from \`phat-mode init\`), and yours in ~/.phat-mode/config.json (see README).`;
 
@@ -278,14 +280,15 @@ async function doctor(machine: MachineConfig, repos: string[]): Promise<number> 
   return ok ? 0 : 1;
 }
 
-type InitOptions = { yes: boolean; runCheck: boolean; check?: string; install?: string };
+type InitOptions = { yes: boolean; runCheck: boolean; skills: boolean; check?: string; install?: string };
 
 function parseInitOptions(args: string[]): InitOptions {
-  const options: InitOptions = { yes: false, runCheck: true };
+  const options: InitOptions = { yes: false, runCheck: true, skills: true };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--yes' || arg === '-y') options.yes = true;
     else if (arg === '--no-check') options.runCheck = false;
+    else if (arg === '--no-skills') options.skills = false;
     else if ((arg === '--check' || arg === '--install') && args[i + 1] !== undefined) options[arg === '--check' ? 'check' : 'install'] = args[++i]!;
     else throw new Error(`Unknown option for init: ${arg}`);
   }
@@ -360,6 +363,15 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
   const created = await new GhGitHub(repo).ensureLabels(labels);
   console.log(`✓ Labels: ${created.length > 0 ? `created ${created.join(', ')}` : 'all there'}`);
 
+  // The skills that make issues ready-for-agent, for the people who prepare them.
+  let skillsAdded = false;
+  if (options.skills) {
+    const skills = await installProjectSkills(root);
+    skillsAdded = skills.installed.length > 0;
+    if (skillsAdded) console.log(`✓ Added mattpocock/skills (${MATTPOCOCK_SKILLS.label}): ${[...skills.installed, ...skills.linked].join(', ')}`);
+    if (skills.kept.length > 0) console.log(`✓ Kept the repo's own skills: ${skills.kept.join(', ')}`);
+  }
+
   const ready = await readiness(root);
   console.log(
     ready.standards.length > 0
@@ -374,7 +386,9 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
   console.log(
     ready.triageLabels
       ? `✓ Triage label mapping: ${ready.triageLabels}. If it renames labels, copy them into "labels" in ${REPO_SETTINGS_FILE}.`
-      : "– No triage setup from mattpocock/skills: label issues ready-for-agent yourself (or install the skills and use /triage, /to-tickets).",
+      : options.skills
+        ? '– No triage setup yet: run /setup-matt-pocock-skills once in your agent, then /triage, /to-tickets or /to-spec make issues ready-for-agent.'
+        : '– No triage setup from mattpocock/skills: label issues ready-for-agent yourself (or install the skills and use /triage, /to-tickets).',
   );
 
   // Add the repo to the ones `phat-mode watch` works on.
@@ -392,6 +406,7 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
   );
   console.log('\nNext:');
   if (!published) console.log(`  - Commit ${REPO_SETTINGS_FILE} and push it to the default branch: phat-mode reads it from GitHub, not from this folder.`);
+  if (skillsAdded) console.log('  - Commit the added skills, so everyone preparing issues for phat-mode has them.');
   console.log('  - Label an issue ready-for-agent, then `phat-mode run <issue>` (or `phat-mode watch`).');
   return checkOk ? 0 : 1;
 }
