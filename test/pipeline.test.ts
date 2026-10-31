@@ -828,18 +828,20 @@ describe('pipeline', () => {
     assert.match(github.prs[0]!.body, /From the issue\. For the human reviewer to tick off:\n\n- \[ \] hello\.txt says hello/);
   });
 
-  test('ignores issues that are not ready-for-agent, or not specified by someone trusted, without touching GitHub', async () => {
+  test('ignores issues that are not ready-for-agent, labelled agent-mode, or not specified by someone trusted, without touching GitHub', async () => {
     const { github, runIssue } = await fixture();
     github.addIssue(10, { labels: ['needs-triage'] });
     github.addIssue(11, { author: 'stranger' });
     github.addIssue(12, { state: 'CLOSED' });
-    for (const issue of [10, 11, 12]) {
+    github.addIssue(16, { labels: ['ready-for-agent', 'agent-mode'] });
+    for (const issue of [10, 11, 12, 16]) {
       const { outcome, faux } = await runIssue(issue, [plan()]);
       assert.equal(result(outcome).status, 'ignored');
       assert.equal(faux.state.callCount, 0);
     }
     assert.equal(github.writes, 0);
     assert.deepEqual(github.labels(10), ['needs-triage']);
+    assert.deepEqual(github.labels(16), ['agent-mode', 'ready-for-agent']);
   });
 
   test('a gap in the spec: triage notes in the triage format, moved back to needs-info', async () => {

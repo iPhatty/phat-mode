@@ -38,6 +38,8 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 |---|---|---|
 | `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` | the triage skills, and phat-mode when it hands back | the issue's triage state (names configurable under `labels`) |
 | `phat-mode:working` / `phat-mode:done` / `phat-mode:failed` | phat-mode | its own progress; one at a time |
+| `agent-mode` | you | shape this vague issue into tickets (agent mode, being built); never built itself (name configurable under `labels`) |
+| `phat-mode:shaped` | phat-mode | agent mode shaped this issue into tickets; stays on while they are built |
 
 | Outcome | Issue labels afterwards |
 |---|---|
@@ -141,7 +143,7 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 | `phat-mode resume` | Continue every interrupted run. |
 | `phat-mode status` | List runs (every repo) and where they are. |
 | `phat-mode abort <issue>` | Stop a run. |
-| `phat-mode doctor [repo]` | Check git, gh, the Copilot login, the models, and each repo's settings and access. |
+| `phat-mode doctor [repo]` | Check git, gh, the Copilot login, the models, and each repo's settings, access and labels. |
 
 `<issue>` is `12` (an issue in the repo of the current folder), `owner/name#12`, or the issue's URL; `[repo]` is `owner/name`. Without the link, `node src/cli.ts …` in this folder does the same.
 
@@ -170,7 +172,7 @@ At the repo root, read from GitHub (the default branch), so changes are reviewed
 | `checkCommand` | Required. Must pass before a pull request opens; agents run it too. Make it run every check you rely on. |
 | `baseBranch` | Branch pull requests target. Default: the repo's default branch. |
 | `allowedAuthors` | Trusted GitHub users for this repo. Default: yours (below). |
-| `labels` | Triage label names, if the repo's `docs/agents/triage-labels.md` renames them: `needsTriage`, `needsInfo`, `readyForAgent`, `readyForHuman`, `wontfix`. |
+| `labels` | Triage label names, if the repo's `docs/agents/triage-labels.md` renames them: `needsTriage`, `needsInfo`, `readyForAgent`, `readyForHuman`, `wontfix`, and `agentMode`. |
 
 Unknown settings are an error, so a typo is not silently ignored. Settings are read once per process: restart `watch` after changing them.
 
@@ -187,13 +189,14 @@ Optional; anything left out uses the defaults in [`src/config.ts`](src/config.ts
 }
 ```
 
+- `limits`: also `maxGrillRounds` (6) and `maxTickets` (8), for agent mode's shaping.
 - `repos`: what `watch` works on when no repos are named. `init` adds to it.
 - `allowedAuthors`: trusted on every repo that does not list its own. Default: you, the `gh` user.
 - Repo settings (`checkCommand`, `repo`, …) here are an error, pointing to `.phat-mode.json`.
 
 #### Models
 
-Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**) unless `models` overrides it for its role (`plan`, `implement`, `review`, `verify`; both reviewers use `review`). Built in, `review` uses **GPT-6.1 Sol**, so a different model family checks the code.
+Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**) unless `models` overrides it for its role (`plan`, `implement`, `review`, `verify`; both reviewers use `review`; agent mode's questioner uses `grill` and its answerer `shape`). Built in, `review` and `grill` use **GPT-6.1 Sol**, so a different model family checks the code and grills the answerer; `shape` follows `defaultModel`.
 
 ```json
 {

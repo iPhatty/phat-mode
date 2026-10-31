@@ -32,6 +32,7 @@ else if (a === 'api' && flag('--method') === 'PATCH') log({ patch: args.at(-3), 
 else if (a === 'issue' && b === 'comment') log({ comment: c, body: stdin() });
 else if (a === 'pr' && b === 'edit') log({ edit: c, body: stdin() });
 else if (a === 'pr' && b === 'ready') log({ ready: c });
+else if (a === 'label' && b === 'list') process.stdout.write(JSON.stringify(state.labels.map((name) => ({ name }))));
 else { process.stderr.write('fake gh: unexpected ' + args.join(' ')); process.exit(1); }
 `;
 
@@ -42,8 +43,8 @@ let dir: string;
 let path: string | undefined;
 const github = new GhGitHub('iPhatty/phat-mode');
 
-async function gitHubWith(state: { prs?: FakePr[]; comments?: FakeComment[] }) {
-  await writeFile(join(dir, 'state.json'), JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], ...state }));
+async function gitHubWith(state: { prs?: FakePr[]; comments?: FakeComment[]; labels?: string[] }) {
+  await writeFile(join(dir, 'state.json'), JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], ...state }));
   await writeFile(join(dir, 'log.jsonl'), '');
 }
 const writes = async () =>
@@ -117,5 +118,12 @@ describe('GhGitHub, on a public repo', () => {
     assert.deepEqual(await writes(), [
       { patch: 'repos/iPhatty/phat-mode/issues/comments/6', body: '<!-- phat-mode:plan -->\nNew plan.' },
     ]);
+  });
+
+  test('missingLabels: the names the repo does not have, without creating any', async () => {
+    await gitHubWith({ labels: ['ready-for-agent', 'phat-mode:working'] });
+    const fresh = new GhGitHub('iPhatty/phat-mode');
+    assert.deepEqual(await fresh.missingLabels(['ready-for-agent', 'agent-mode', 'phat-mode:shaped']), ['agent-mode', 'phat-mode:shaped']);
+    assert.deepEqual(await writes(), []);
   });
 });

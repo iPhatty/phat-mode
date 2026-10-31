@@ -1,5 +1,5 @@
 import { branchFor, type Config } from './config.ts';
-import { commentMarker, type GitHub, type ListedIssue, mergeLabels, PROGRESS_LABELS, progressChange } from './github.ts';
+import { commentMarker, type GitHub, type ListedIssue, mergeLabels, PROGRESS_LABELS, progressChange, RUN_PROGRESS } from './github.ts';
 import type { Logger } from './log.ts';
 import { handedBackComment } from './messages.ts';
 import { eligibility } from './spec.ts';
@@ -25,9 +25,7 @@ const PR_BRANCH = /^phat-mode\/issue-(\d+)$/;
 export const MARKER_HANDED_BACK = commentMarker('handed-back');
 
 const progressOf = (issue: Pick<ListedIssue, 'labels'>) =>
-  (Object.keys(PROGRESS_LABELS) as (keyof typeof PROGRESS_LABELS)[]).find((key) =>
-    issue.labels.includes(PROGRESS_LABELS[key].name),
-  );
+  RUN_PROGRESS.find((key) => issue.labels.includes(PROGRESS_LABELS[key].name));
 
 export async function nextStep(github: GitHub, config: Config, logger: Logger): Promise<WatchStep> {
   const { labels } = config;

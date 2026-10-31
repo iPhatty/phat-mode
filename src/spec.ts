@@ -116,10 +116,18 @@ export type Eligibility = { ok: true; spec: Spec } | { ok: false; reason: string
 
 /**
  * Whether phat-mode may work on an issue: open, labelled ready-for-agent (only people with triage access can set it),
- * and specified by someone trusted. Open blockers are checked separately, as that needs GitHub.
+ * not labelled agent-mode (that asks for shaping, not building), and specified by someone trusted. Open blockers are
+ * checked separately, as that needs GitHub.
  */
 export function eligibility(issue: Issue, config: Pick<Config, 'allowedAuthors' | 'labels' | 'repo'>): Eligibility {
   if (issue.state !== 'OPEN') return { ok: false, reason: `#${issue.number} is closed.` };
+  const agentMode = config.labels.agentMode;
+  if (issue.labels.includes(agentMode)) {
+    return {
+      ok: false,
+      reason: `#${issue.number} is labelled \`${agentMode}\`: phat-mode shapes it into tickets, it does not build it.`,
+    };
+  }
   const ready = config.labels.readyForAgent;
   if (!issue.labels.includes(ready)) {
     return { ok: false, reason: `#${issue.number} is not labelled \`${ready}\`. Triage it first (e.g. with /triage).` };

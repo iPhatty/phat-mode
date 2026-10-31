@@ -103,6 +103,15 @@ describe('watch', () => {
     assert.deepEqual(await step(github), { kind: 'start', issue: 3, title: 'Issue 3' });
   });
 
+  test('never builds an issue labelled agent-mode; says why', async () => {
+    const github = repo({ 2: { labels: ['ready-for-agent', 'agent-mode'] }, 3: {} });
+    assert.deepEqual(await step(github), { kind: 'start', issue: 3, title: 'Issue 3' });
+    const alone = repo({ 2: { labels: ['ready-for-agent', 'agent-mode'] } });
+    const idle = await step(alone);
+    assert.equal(idle.kind, 'idle');
+    assert.match(describeStep(idle), /#2 is labelled `agent-mode`: phat-mode shapes it into tickets, it does not build it/);
+  });
+
   test('nothing can start: says what each issue waits for, down to the human', async () => {
     const github = repo({
       9: { blockedBy: [18] },

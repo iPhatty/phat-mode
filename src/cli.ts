@@ -19,7 +19,7 @@ import {
 } from './config.ts';
 import { FileCredentialStore, importPiCredential } from './credentials.ts';
 import { run, runShell } from './exec.ts';
-import { GhGitHub, PROGRESS_LABELS } from './github.ts';
+import { GhGitHub, requiredLabels } from './github.ts';
 import { createCopilotModels, openPhatMode, RunsDoc } from './harness.ts';
 import { detectCommands, installProjectSkills, readiness, settingsFile } from './init.ts';
 import { LockedError } from './lock.ts';
@@ -266,8 +266,9 @@ async function doctor(machine: MachineConfig, repos: string[]): Promise<number> 
   if (!signedInToGh) return 1;
   if (repos.length === 0) console.log('– repos: none named, none in config.json "repos", and this folder is not a GitHub clone');
   for (const repo of repos) {
+    let config: Config | undefined;
     const loaded = await check(`${repo}: ${REPO_SETTINGS_FILE}`, async () => {
-      const config = await loadRepoConfig(machine, repo);
+      config = await loadRepoConfig(machine, repo);
       return `check \`${config.checkCommand}\`, install \`${config.installCommand}\`, PRs into ${config.baseBranch}, trusting ${config.allowedAuthors.join(', ')}`;
     });
     if (!loaded) continue;
@@ -275,6 +276,12 @@ async function doctor(machine: MachineConfig, repos: string[]): Promise<number> 
       const view = JSON.parse((await run('gh', ['repo', 'view', repo, '--json', 'viewerPermission'])).stdout);
       if (!['ADMIN', 'MAINTAIN', 'WRITE'].includes(view.viewerPermission)) throw new Error('no write access');
       return view.viewerPermission;
+    });
+    const { labels } = config!;
+    await check(`${repo}: labels`, async () => {
+      const missing = await new GhGitHub(repo).missingLabels(requiredLabels(labels));
+      if (missing.length > 0) throw new Error(`missing ${missing.join(', ')}; run \`phat-mode init\` in the repo`);
+      return `all there (agent mode: \`${labels.agentMode}\`)`;
     });
   }
   return ok ? 0 : 1;
@@ -356,11 +363,7 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
     console.log(`✓ Wrote ${REPO_SETTINGS_FILE}`);
   }
 
-  const labels = [
-    ...Object.values({ ...DEFAULT_LABELS, ...settings.labels }),
-    ...Object.values(PROGRESS_LABELS).map((label) => label.name),
-  ];
-  const created = await new GhGitHub(repo).ensureLabels(labels);
+  const created = await new GhGitHub(repo).ensureLabels(requiredLabels({ ...DEFAULT_LABELS, ...settings.labels }));
   console.log(`✓ Labels: ${created.length > 0 ? `created ${created.join(', ')}` : 'all there'}`);
 
   // The skills that make issues ready-for-agent, for the people who prepare them.
