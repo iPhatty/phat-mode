@@ -1,0 +1,4 @@
+{
+  "installCommand": "npm ci",
+  "checkCommand": "npm run check"
+}
