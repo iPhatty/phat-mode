@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
-import { defaultConfig } from '../src/config.ts';
+import { testConfig } from './fakes.ts';
 import { type Issue, mergeLabels, progressChange } from '../src/github.ts';
 import { blockedBy, eligibility, findAgentBrief, findSpec, listUnder, parentRef } from '../src/spec.ts';
 
@@ -58,7 +58,7 @@ const issue = (fields: Partial<Issue> = {}): Issue => ({
   ...fields,
 });
 const comment = (author: string, body: string, createdAt = '2026-10-01T00:00:00Z') => ({ author, body, createdAt });
-const config = { ...defaultConfig('/tmp/unused'), repo: 'iPhatty/phatty-lingo' };
+const config = testConfig('/tmp/unused', 'iPhatty/phatty-lingo');
 
 describe('listUnder', () => {
   test('bold labels: checkbox and plain items, wrapped lines joined, until the next section', () => {

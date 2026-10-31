@@ -15,10 +15,10 @@ import {
 } from '@earendil-works/pi-ai/providers/faux';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { setToolLogger } from '../src/agents.ts';
-import { branchFor, type Config, defaultConfig, paths } from '../src/config.ts';
+import { branchFor, type Config, paths } from '../src/config.ts';
 import { run } from '../src/exec.ts';
-import { FakeGitHub } from './fakes.ts';
-import { openPhatMode } from '../src/harness.ts';
+import { FakeGitHub, testConfig } from './fakes.ts';
+import { openPhatMode, RunsDoc } from '../src/harness.ts';
 import { LockedError } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
 import type { SpecFinding, StandardsFinding } from '../src/code-review.ts';
@@ -162,7 +162,7 @@ after(async () => {
 });
 
 /** `files`: extra files committed to the repo's main branch. */
-async function fixture(files: Record<string, string> = {}) {
+async function fixture(files: Record<string, string> = {}, repo = 'test/repo') {
   const dir = await mkdtemp(join(tmpdir(), 'phat-pipeline-'));
   temp.push(dir);
   // A local "GitHub" repository with one commit on main.
@@ -182,8 +182,7 @@ async function fixture(files: Record<string, string> = {}) {
   await git(['push', remote, 'main']);
 
   const config: Config = {
-    ...defaultConfig(join(dir, 'home')),
-    repo: 'test/repo',
+    ...testConfig(join(dir, 'home'), repo),
     defaultModel: { provider: 'faux', modelId: 'faux-1', thinkingLevel: 'medium' },
     models: {},
   };
@@ -206,13 +205,14 @@ async function fixture(files: Record<string, string> = {}) {
   process.env.GIT_AUTHOR_NAME = process.env.GIT_COMMITTER_NAME = 'phat-mode-test';
   process.env.GIT_AUTHOR_EMAIL = process.env.GIT_COMMITTER_EMAIL = 'test@example.com';
 
-  const open = async (responses: FauxResponseStep[]) => {
+  /** `servicesFor`: for runs on other repos too; by default, every run is on this one. */
+  const open = async (responses: FauxResponseStep[], servicesFor = async (_repo: string) => services) => {
     const faux = fauxProvider({ models: [{ id: 'faux-1' }] });
     faux.setResponses(responses);
     const models = createModels();
     models.setProvider(faux.provider);
     const storage = () => openNodeSqliteStorage(join(dir, 'state.sqlite'));
-    const phat = await openPhatMode(services, context, { storage, models });
+    const phat = await openPhatMode({ home: config.home, servicesFor }, context, { storage, models });
     return { phat, faux };
   };
 
@@ -228,7 +228,7 @@ async function fixture(files: Record<string, string> = {}) {
   const remoteFile = async (issue: number, file: string) =>
     (await run('git', ['--git-dir', remote, 'show', `${branchFor(issue)}:${file}`])).stdout;
 
-  return { config, github, checks, open, runIssue, remoteFile, remote };
+  return { config, services, github, checks, open, runIssue, remoteFile, remote };
 }
 
 const result = (outcome: { status: string; result?: PipelineResult }) => {
@@ -535,6 +535,54 @@ describe('pipeline', () => {
     ]);
     assert.equal(result(outcome).status, 'pr_opened');
     assert.equal((await readFile(join(scratch, 'list.json'), 'utf8')).length > 0, true, 'scratch folder exists and was written');
+  });
+
+  test('one process, two repos: each run uses its own repo, settings and GitHub, even with the same issue number', async () => {
+    const a = await fixture({}, 'test/a');
+    const b = await fixture({}, 'test/b');
+    b.config.checkCommand = 'make verify';
+    b.checks.results.push({ passed: false, output: 'lint: 1 error' });
+    a.github.addIssue(5, { title: 'Hello in a' });
+    b.github.addIssue(5, { title: 'Hello in b' });
+    const repos: Record<string, Services> = { 'test/a': a.services, 'test/b': b.services };
+    const asked: string[] = [];
+    const { phat } = await a.open(
+      [
+        // test/a#5
+        plan(),
+        write('hello.txt', 'hello from a\n'),
+        done(),
+        ...approve(),
+        describePr(),
+        // test/b#5: its own check command goes back to the implementer
+        plan(),
+        write('hello.txt', 'hello from b\n'),
+        done(),
+        expectLast((message) => assert.match(textOf(message), /run `make verify` until it passes[^]*Output of `make verify`:\n```\nlint: 1 error/), done()),
+        ...approve(),
+        describePr(),
+      ],
+      async (repo) => {
+        asked.push(repo);
+        return repos[repo]!;
+      },
+    );
+    phat.harness.resume();
+    for (const repo of ['test/a', 'test/b']) {
+      const { taskId } = await phat.start({ repo, issue: 5 }, context);
+      const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
+      assert.equal(result(outcome).status, 'pr_opened', repo);
+    }
+    const runs = Object.keys((await phat.harness.snapshot(RunsDoc, phat.root.id, context))!.runs);
+    await phat.close(context);
+
+    assert.deepEqual([...new Set(asked)], ['test/a', 'test/b'], 'services looked up once per repo');
+    assert.deepEqual(runs.sort(), ['test/a#5', 'test/b#5']);
+    assert.equal(await a.remoteFile(5, 'hello.txt'), 'hello from a\n');
+    assert.equal(await b.remoteFile(5, 'hello.txt'), 'hello from b\n');
+    assert.deepEqual([a.github.prs.length, b.github.prs.length], [1, 1]);
+    assert.equal(a.checks.runs, 1);
+    assert.equal(b.checks.runs, 2);
   });
 
   describe('parent issue', () => {

@@ -63,7 +63,7 @@ import {
   planPrompt,
   describePrompt,
   fixVerificationPrompt,
-  ROLE_INSTRUCTIONS,
+  roleInstructions,
   specReviewPrompt,
   standardsReviewPrompt,
   verifyPrompt,
@@ -148,7 +148,49 @@ const NO_VERIFY_SKILL =
 const axisCount = (report: AxisReport<unknown> | null) =>
   report === null ? 'no report' : `${report.findings.length} finding${report.findings.length === 1 ? '' : 's'}`;
 
-export function createPipeline(services: Services) {
+/**
+ * The pipeline, for every repo: each run uses the services for its own repo (`task.input.repo`), so one process works
+ * on any number of repos. `servicesFor` is called once per repo; a failure is retried on the next phase.
+ */
+export function createPipeline(servicesFor: (repo: string) => Promise<Services>) {
+  const loaded = new Map<string, Promise<RepoPhases>>();
+  const phasesFor = (repo: string) => {
+    let phases = loaded.get(repo);
+    if (phases === undefined) {
+      phases = servicesFor(repo).then(repoPhases);
+      loaded.set(repo, phases);
+      // Offline, say: try again next time rather than remembering the failure.
+      phases.catch(() => loaded.delete(repo));
+    }
+    return phases;
+  };
+  const Pipeline = defineTask<PipelineInput, PipelineState, PipelineResult>({
+    name: 'phat.pipeline',
+    version: 1,
+    initial: () => ({ phase: 'prepare' }),
+    phases: {
+      prepare: async (task, runtime, context) => (await phasesFor(task.input.repo)).prepare(task, runtime, context),
+      plan: async (task, runtime, context) => (await phasesFor(task.input.repo)).plan(task, runtime, context),
+      implement: async (task, runtime, context) => (await phasesFor(task.input.repo)).implement(task, runtime, context),
+      check: async (task, runtime, context) => (await phasesFor(task.input.repo)).check(task, runtime, context),
+      review: async (task, runtime, context) => (await phasesFor(task.input.repo)).review(task, runtime, context),
+      verify: async (task, runtime, context) => (await phasesFor(task.input.repo)).verify(task, runtime, context),
+      describe: async (task, runtime, context) => (await phasesFor(task.input.repo)).describe(task, runtime, context),
+      publish: async (task, runtime, context) => (await phasesFor(task.input.repo)).publish(task, runtime, context),
+      fail: async (task, runtime, context) => (await phasesFor(task.input.repo)).fail(task, runtime, context),
+    },
+    abort: (_task, runtime, context) =>
+      runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context),
+  });
+
+  const extension: Extension = defineExtension({ name: 'phat.pipeline', tasks: [Pipeline] });
+  return { Pipeline, extension };
+}
+
+type RepoPhases = ReturnType<typeof repoPhases>;
+
+/** Every phase of a run, for one repo. */
+function repoPhases(services: Services) {
   const { config, github, workspaces, checks, logger } = services;
   const { limits, labels } = config;
   /** The code review's fixed point. */
@@ -183,7 +225,7 @@ export function createPipeline(services: Services) {
         await body(task, runtime, context);
       } catch (error) {
         if (!(error instanceof StepFailure) || runtime.signal.aborted) throw error;
-        logger.error(`#${task.input.issue}: ${error.message}`);
+        logger.error(`${task.input.repo}#${task.input.issue}: ${error.message}`);
         await go(runtime, { phase: 'fail', issue: task.input.issue, reason: error.message }, context);
       }
     };
@@ -313,11 +355,7 @@ export function createPipeline(services: Services) {
     done: state.done,
   });
 
-  const Pipeline = defineTask<PipelineInput, PipelineState, PipelineResult>({
-    name: 'phat.pipeline',
-    version: 1,
-    initial: () => ({ phase: 'prepare' }),
-    phases: {
+  return {
       prepare: guarded<'prepare'>(async (task, runtime, context) => {
         const number = task.input.issue;
         const fetched = await github.getIssue(number);
@@ -358,7 +396,7 @@ export function createPipeline(services: Services) {
               model: { provider: model.provider, modelId: model.modelId },
               thinkingLevel: model.thinkingLevel,
               tools: ROLE_TOOLS[role],
-              instructions: ROLE_INSTRUCTIONS[role],
+              instructions: roleInstructions(config.checkCommand)[role],
               cwd: workspace,
             });
             Object.assign(await tx.doc(RoleDoc, created.id), { role, issue: number, workspace });
@@ -465,7 +503,7 @@ export function createPipeline(services: Services) {
         await toImplement(
           runtime,
           { ...work(state), checkFixes: state.checkFixes + 1 },
-          fixChecksPrompt(result.output),
+          fixChecksPrompt(result.output, config.checkCommand),
           context,
         );
       }),
@@ -535,7 +573,7 @@ export function createPipeline(services: Services) {
           );
           return;
         }
-        await toImplement(runtime, work(state), fixReviewPrompt(review), context);
+        await toImplement(runtime, work(state), fixReviewPrompt(review, config.checkCommand), context);
       }),
 
       verify: guarded<'verify'>(async (task, runtime, context) => {
@@ -603,7 +641,7 @@ export function createPipeline(services: Services) {
               : `Verification: ${report.features.map((result) => `${result.feature} ${result.status}`).join(', ') || 'no features'}`,
         );
         if (failures.length > 0 && round < limits.maxVerifyRounds) {
-          await toImplement(runtime, work(state), fixVerificationPrompt(failures), context);
+          await toImplement(runtime, work(state), fixVerificationPrompt(failures, config.checkCommand), context);
           return;
         }
         const verification: Verification = {
@@ -702,7 +740,7 @@ export function createPipeline(services: Services) {
         await finish(runtime, { status: 'pr_opened', url: pr.url }, context);
       }),
 
-      fail: async (task, runtime, context) => {
+      fail: async (task: Phase<'fail'>, runtime: Runtime, context: Context) => {
         const { issue, reason } = task.state.checkpoint;
         await github.upsertComment(issue, MARKERS.result, failedComment(reason, labels));
         // An agent could not do it: a human should.
@@ -715,11 +753,5 @@ export function createPipeline(services: Services) {
           context,
         );
       },
-    },
-    abort: (_task, runtime, context) =>
-      runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context),
-  });
-
-  const extension: Extension = defineExtension({ name: 'phat.pipeline', tasks: [Pipeline] });
-  return { Pipeline, extension };
+  };
 }

@@ -7,12 +7,18 @@ export type Logger = {
   error(message: string): void;
 };
 
-export const consoleLogger: Logger = {
-  info: (message) => console.log(`${time()}  ${message}`),
-  step: (issue, message) => console.log(`${time()}  #${issue}  ▸ ${message}`),
-  tool: (label, message) => console.log(`${time()}      ${label.padEnd(9)} ${message}`),
-  error: (message) => console.error(`${time()}  ✖ ${message}`),
-};
+/** Logs to the console. `repo`: steps show `name#12` instead of `#12`, for when several repos share the log. */
+export function consoleLoggerFor(repo?: string): Logger {
+  const prefix = repo === undefined ? '' : repo.slice(repo.indexOf('/') + 1);
+  return {
+    info: (message) => console.log(`${time()}  ${message}`),
+    step: (issue, message) => console.log(`${time()}  ${prefix}#${issue}  ▸ ${message}`),
+    tool: (label, message) => console.log(`${time()}      ${label.padEnd(9)} ${message}`),
+    error: (message) => console.error(`${time()}  ✖ ${message}`),
+  };
+}
+
+export const consoleLogger: Logger = consoleLoggerFor();
 
 export const silentLogger: Logger = {
   info: () => {},

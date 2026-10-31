@@ -208,20 +208,28 @@ export class GhGitHub implements GitHub {
     await this.#gh(['pr', 'edit', String(pr), '-R', this.#repo, '--body-file', '-'], body);
   }
 
-  async #ensureLabel(name: string): Promise<void> {
+  /** Create the labels that are missing (never edit existing ones). Returns the ones it created. */
+  async ensureLabels(names: readonly string[]): Promise<string[]> {
+    const created: string[] = [];
+    for (const name of names) if (await this.#ensureLabel(name)) created.push(name);
+    return created;
+  }
+
+  async #ensureLabel(name: string): Promise<boolean> {
     if (this.#knownLabels === undefined) {
       const labels = JSON.parse(
         await this.#gh(['label', 'list', '-R', this.#repo, '--limit', '1000', '--json', 'name']),
       ) as { name: string }[];
       this.#knownLabels = new Set(labels.map((label) => label.name));
     }
-    if (this.#knownLabels.has(name)) return;
+    if (this.#knownLabels.has(name)) return false;
     // Create only. Never --force: that would overwrite the colour and description someone else chose.
     const progress = Object.values(PROGRESS_LABELS).find((label) => label.name === name);
     const args = ['label', 'create', name, '-R', this.#repo];
     if (progress) args.push('--color', progress.color, '--description', progress.description);
-    await run('gh', args, { allowFailure: true });
+    const result = await run('gh', args, { allowFailure: true });
     this.#knownLabels.add(name);
+    return result.code === 0;
   }
 
   async openBlockers(issue: number, mentioned: readonly number[]): Promise<number[]> {

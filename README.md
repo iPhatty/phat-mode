@@ -50,7 +50,9 @@ To retry, label the issue `ready-for-agent` again and run it.
 
 ## Watch
 
-`phat-mode watch` keeps going on its own: after you merge a PR, it starts the next issue. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes). Each time it:
+`phat-mode watch` keeps going on its own: after you merge a PR, it starts the next issue. It works on the repos named on the command line (`phat-mode watch owner/a owner/b`), else the `repos` in your config.json (`phat-mode init` adds each repo it sets up), else the repo of the current folder. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes).
+
+One run at a time across all repos, in the order they are listed. The rules below apply per repo: a PR waiting for you in one repo does not hold up the others. Each time, for each repo, it:
 
 1. finishes any run that is still going;
 2. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge;
@@ -105,37 +107,92 @@ With nothing to fix, the PR opens. Otherwise the implementer fixes and both revi
 
 ## Setup
 
-Needs Node 24+, git, and the GitHub CLI signed in (`gh auth login`).
+Needs Node 24+, git (with `user.name` and `user.email` set; phat-mode commits as you), and the GitHub CLI signed in (`gh auth login`).
 
 ```bash
+cd ~/code/phat-mode
 npm install
-node src/cli.ts login --from-pi   # reuse the pi coding agent's GitHub Copilot login
-# or: node src/cli.ts login       # sign in to GitHub Copilot in the browser
-node src/cli.ts doctor            # checks everything
+npm link                     # puts `phat-mode` on your PATH, running this checkout
+phat-mode login --from-pi    # reuse the pi coding agent's GitHub Copilot login
+# or: phat-mode login        # sign in to GitHub Copilot in the browser
 ```
+
+Then, once per repo, in a clone of it:
+
+```bash
+cd ~/code/some-repo
+phat-mode init               # writes .phat-mode.json, creates the labels, says what the repo is missing
+git add .phat-mode.json && git commit -m "Set up phat-mode" && git push
+phat-mode doctor             # checks everything, including this repo's settings on GitHub
+```
+
+`init` suggests the install and check commands from the repo's files (npm, pnpm, yarn or bun scripts, Cargo, Go, `make check`) and asks before writing them; `--yes` accepts the suggestions, `--check "<cmd>"` and `--install "<cmd>"` set them. It runs the check command once to see that it passes, and reports whether the repo has what makes phat-mode's work good: an `AGENTS.md` (or `CLAUDE.md`, `CONTRIBUTING.md`) with the repo's rules, a [verification skill](#verification), and the triage setup from [mattpocock/skills](https://github.com/mattpocock/skills).
+
+A repo without a `.phat-mode.json` on its default branch is refused: phat-mode never guesses the check command that decides whether a change is good enough for a pull request.
 
 ## Commands
 
 | Command | |
 |---|---|
-| `node src/cli.ts watch` | Work through the ready issues one at a time, until Ctrl-C. See [Watch](#watch). |
-| `node src/cli.ts run <issue>` | Work on one issue until a PR is open. Run it again to resume. |
-| `node src/cli.ts resume` | Continue every interrupted run. |
-| `node src/cli.ts status` | List runs and where they are. |
-| `node src/cli.ts abort <issue>` | Stop a run. |
-| `node src/cli.ts doctor` | Check git, gh, the Copilot login and the models. |
+| `phat-mode init` | Set up the repo in this folder. See [Setup](#setup). |
+| `phat-mode watch [repo…]` | Work through the ready issues one at a time, until Ctrl-C. See [Watch](#watch). |
+| `phat-mode run <issue>` | Work on one issue until a PR is open. Run it again to resume. |
+| `phat-mode resume` | Continue every interrupted run. |
+| `phat-mode status` | List runs (every repo) and where they are. |
+| `phat-mode abort <issue>` | Stop a run. |
+| `phat-mode doctor [repo]` | Check git, gh, the Copilot login, the models, and each repo's settings and access. |
+
+`<issue>` is `12` (an issue in the repo of the current folder), `owner/name#12`, or the issue's URL; `[repo]` is `owner/name`. Without the link, `node src/cli.ts …` in this folder does the same.
 
 Ctrl-C is always safe: progress is saved, and `run` or `resume` continues from the last step.
 
-Only one phat-mode process can use `~/.phat-mode` at a time (Pi Durable storage has no cross-process locking). A second one exits with `phat-mode is already running (…)`. A lock left by a crashed process is taken over automatically.
+Only one phat-mode process can use `~/.phat-mode` at a time (Pi Durable storage has no cross-process locking), whatever the repo. A second one exits with `phat-mode is already running (…)`. A lock left by a crashed process is taken over automatically.
 
 ## Configuration
 
-Optional `~/.phat-mode/config.json`; anything left out uses the defaults in [`src/config.ts`](src/config.ts).
+Two files: what each repo decides for itself, in the repo, and your own settings, on your Mac.
 
-### Models
+### Each repo: `.phat-mode.json`
 
-Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**) unless `models` overrides it for its role (`plan`, `implement`, `review`; both reviewers use `review`). Built in, `review` uses **GPT-6.1 Sol**, so a different model family checks the code.
+At the repo root, read from GitHub (the default branch), so changes are reviewed like code and a branch cannot change them. Written by `phat-mode init`.
+
+```json
+{
+  "installCommand": "npm ci",
+  "checkCommand": "npm run check"
+}
+```
+
+| Setting | |
+|---|---|
+| `installCommand` | Required. Runs once in each fresh workspace (`"true"` for none). |
+| `checkCommand` | Required. Must pass before a pull request opens; agents run it too. Make it run every check you rely on. |
+| `baseBranch` | Branch pull requests target. Default: the repo's default branch. |
+| `allowedAuthors` | Trusted GitHub users for this repo. Default: yours (below). |
+| `labels` | Triage label names, if the repo's `docs/agents/triage-labels.md` renames them: `needsTriage`, `needsInfo`, `readyForAgent`, `readyForHuman`, `wontfix`. |
+
+Unknown settings are an error, so a typo is not silently ignored. Settings are read once per process: restart `watch` after changing them.
+
+### Yours: `~/.phat-mode/config.json`
+
+Optional; anything left out uses the defaults in [`src/config.ts`](src/config.ts).
+
+```json
+{
+  "repos": ["iPhatty/phatty-lingo"],
+  "allowedAuthors": ["iPhatty"],
+  "limits": { "maxCheckFixes": 3, "maxReviewRounds": 2 },
+  "watchIntervalMs": 120000
+}
+```
+
+- `repos`: what `watch` works on when no repos are named. `init` adds to it.
+- `allowedAuthors`: trusted on every repo that does not list its own. Default: you, the `gh` user.
+- Repo settings (`checkCommand`, `repo`, …) here are an error, pointing to `.phat-mode.json`.
+
+#### Models
+
+Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**) unless `models` overrides it for its role (`plan`, `implement`, `review`, `verify`; both reviewers use `review`). Built in, `review` uses **GPT-6.1 Sol**, so a different model family checks the code.
 
 ```json
 {
@@ -150,23 +207,10 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 - An override only needs the fields it changes; the rest come from `defaultModel`.
 - `"review": null` drops the built-in reviewer model, so it follows `defaultModel`.
 - `thinkingLevel`: `minimal`, `low`, `medium` or `high`.
-- `node src/cli.ts doctor` shows the model each role uses and checks it is on your Copilot account.
+- `phat-mode doctor` shows the model each role uses and checks it is on your Copilot account.
 - A run keeps the models it started with, also when resumed. New runs use the new config.
 
-### Everything else
-
-```json
-{
-  "repo": "iPhatty/phatty-lingo",
-  "allowedAuthors": ["iPhatty"],
-  "labels": { "readyForAgent": "ready-for-agent", "readyForHuman": "ready-for-human", "needsInfo": "needs-info" },
-  "checkCommand": "npm run check",
-  "limits": { "maxCheckFixes": 3, "maxReviewRounds": 2 },
-  "watchIntervalMs": 120000
-}
-```
-
-`~/.phat-mode/` also holds the state database (`state.sqlite`) and its lock, the Copilot login (`auth.json`, owner-only) and the workspaces (`workspaces/<repo>/issue-<n>`).
+`~/.phat-mode/` also holds the state database (`state.sqlite`, every repo's runs) and its lock, the Copilot login (`auth.json`, owner-only), and per repo the clone, workspaces (`workspaces/<owner>__<name>/issue-<n>`) and evidence.
 
 ## Safety
 
@@ -179,7 +223,8 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 
 ## How it works
 
-- `src/pipeline.ts`: the durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again.
+- `src/pipeline.ts`: the durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again. Each run uses the settings and services of its own repo, so one process works on any number of repos.
+- `src/config.ts` / `src/repos.ts`: your settings and each repo's `.phat-mode.json` (read from GitHub), and which repo an issue reference means. `src/init.ts`: what `phat-mode init` detects and reports.
 - `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
 - `src/verify.ts`: finds the repo's verify skill, protects it, collects evidence, and decides what blocks.
 - `src/skills.ts`: the pinned mattpocock/skills version. `src/pr.ts`: the pr skill and evidence sources.

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { type Config, defaultConfig } from '../src/config.ts';
+import type { Config } from '../src/config.ts';
 import { silentLogger } from '../src/log.ts';
 import { describeStep, MARKER_HANDED_BACK, nextStep } from '../src/watch.ts';
-import { FakeGitHub } from './fakes.ts';
+import { FakeGitHub, testConfig } from './fakes.ts';
 
-const config: Config = { ...defaultConfig('/nonexistent'), repo: 'test/repo' };
+const config: Config = testConfig('/nonexistent');
 const step = (github: FakeGitHub) => nextStep(github, config, silentLogger);
 
 /** Open issues, each blocked by the issues listed (GitHub's native dependencies). */

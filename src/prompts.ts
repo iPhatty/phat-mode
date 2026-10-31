@@ -22,7 +22,8 @@ Rules that always apply:
 - The spec is the contract: the <agent-brief> when present (the <issue> is then background), otherwise the <issue>. Build what it describes, meet every acceptance criterion, and do nothing it lists as out of scope.
 - You run unattended. Nobody can answer questions mid-task, so decide sensibly and say what you decided in your report.`;
 
-export const ROLE_INSTRUCTIONS: Record<Agent, string> = {
+/** Each agent's standing instructions. `checkCommand`: the repo's checks, from its .phat-mode.json. */
+export const roleInstructions = (checkCommand: string): Record<Agent, string> => ({
   plan: `${SHARED}
 
 Your role: planner. The issue was already triaged as ready for an agent; your job is to plan how to build it, not whether.
@@ -40,7 +41,7 @@ Your role: implementer. Make the change the spec asks for, following the plan.
 - Keep changes focused. Do not refactor unrelated code or touch anything out of scope.
 - Add or update tests for every behaviour change, ideally a failing test first.
 - Make sure every acceptance criterion is met.
-- Run the project's checks (\`npm run check\`) and fix every failure before you finish.
+- Run the project's checks (\`${checkCommand}\`) and fix every failure before you finish.
 Finish by calling report_done.`,
 
   standards: `${SHARED}
@@ -65,7 +66,7 @@ Your role: the verifier. You prove that the change works in the real app, by fol
 - Never claim more than you proved. A sub-feature the harness cannot drive is not_verified, with the missing capability named.
 - Always run the skill's cleanup, after every run, including failed ones, so no app instance, simulator or port is left behind. Evidence must survive cleanup.
 Finish by calling report_verification.`,
-};
+});
 
 const issueBlock = (issue: Issue) => `<issue number="${issue.number}" author="${issue.author}">
 Title: ${issue.title}
@@ -119,10 +120,10 @@ ${
 ${scratchNote(scratch)} The planner may have left files there already.`;
 }
 
-export function fixChecksPrompt(output: string): string {
-  return `The project's checks fail after your changes. Fix the cause (not the tests, unless the tests are wrong), run \`npm run check\` until it passes, then call report_done again.
+export function fixChecksPrompt(output: string, checkCommand: string): string {
+  return `The project's checks fail after your changes. Fix the cause (not the tests, unless the tests are wrong), run \`${checkCommand}\` until it passes, then call report_done again.
 
-Output of \`npm run check\`:
+Output of \`${checkCommand}\`:
 \`\`\`
 ${output}
 \`\`\``;
@@ -133,11 +134,11 @@ const standardsLine = (finding: StandardsFinding) =>
 const specLine = (finding: SpecFinding) =>
   `- [${finding.kind}]${finding.where ? ` \`${finding.where}\`` : ''}${finding.specLine ? ` re "${finding.specLine}"` : ''}: ${finding.detail}`;
 
-export function fixReviewPrompt(review: CodeReview): string {
+export function fixReviewPrompt(review: CodeReview, checkCommand: string): string {
   const fix = mustFix(review);
   const smells = judgementCalls(review);
   const sections = [
-    'The code review found problems with your change. Fix them, run `npm run check` until it passes, then call report_done again.',
+    `The code review found problems with your change. Fix them, run \`${checkCommand}\` until it passes, then call report_done again.`,
   ];
   if (fix.spec.length > 0) sections.push(`Must fix, Spec (does it do what the spec asks?):\n${fix.spec.map(specLine).join('\n')}`);
   if (fix.standards.length > 0) {
@@ -298,14 +299,14 @@ ${diff.length > 40_000 ? `${diff.slice(0, 40_000)}\n… (diff truncated; run the
 Report with report_verification. Give evidence as absolute paths to the files the skill saved: screenshots, accessibility trees, logs.`;
 }
 
-export function fixVerificationPrompt(failures: readonly FeatureResult[]): string {
+export function fixVerificationPrompt(failures: readonly FeatureResult[], checkCommand: string): string {
   const items = failures.map(
     (failure) =>
       `- ${failure.feature}${failure.subFeatures.length > 0 ? ` (${failure.subFeatures.join(', ')})` : ''}: ${failure.detail}${
         failure.checks.length > 0 ? `\n  Checks:\n${failure.checks.map((check) => `  - ${check}`).join('\n')}` : ''
       }${failure.after.length > 0 ? `\n  Evidence (you can read these, including screenshots): ${failure.after.join(', ')}` : ''}`,
   );
-  return `Verifying your change in the real app failed, and the same checks pass on the base branch, so your change caused it. Fix it, run \`npm run check\` until it passes, then call report_done again.
+  return `Verifying your change in the real app failed, and the same checks pass on the base branch, so your change caused it. Fix it, run \`${checkCommand}\` until it passes, then call report_done again.
 
 If the change is right and the feature map's expectations are out of date because the behaviour changed on purpose, update the feature file instead, and say so in report_done.
 

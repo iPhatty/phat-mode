@@ -57,9 +57,17 @@ export type OpenOptions = {
   onReport?: (error: unknown) => void;
 };
 
-export async function openPhatMode(services: Services, context: Context, options: OpenOptions = {}): Promise<PhatMode> {
-  const { config } = services;
-  const { Pipeline, extension } = createPipeline(services);
+/** What phat-mode needs to open: where it lives, and how to get the services for a repo. */
+export type Setup = {
+  /** `<home>`: state, lock and credentials, shared by every repo. */
+  home: string;
+  /** The services for one repo; called once per repo that has a run. */
+  servicesFor: (repo: string) => Promise<Services>;
+};
+
+export async function openPhatMode(setup: Setup, context: Context, options: OpenOptions = {}): Promise<PhatMode> {
+  const config = { home: setup.home };
+  const { Pipeline, extension } = createPipeline(setup.servicesFor);
   const registry = createRegistry();
   registry.install(Tools);
   registry.install(Guard);

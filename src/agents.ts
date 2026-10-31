@@ -114,7 +114,7 @@ export const reportPlan = defineTool({
 export const reportDone = defineTool({
   name: 'report_done',
   description:
-    'Report that your implementation is finished. Call this exactly once, as your final action, after `npm run check` passes.',
+    'Report that your implementation is finished. Call this exactly once, as your final action, after the project\'s checks pass.',
   parameters: Type.Object({
     summary: Type.String({ description: 'What you changed and why, for the pull request description.' }),
     testing: Type.String({ description: 'Which tests you added or changed, and what you ran.' }),

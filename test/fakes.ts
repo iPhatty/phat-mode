@@ -1,4 +1,16 @@
+import { type Config, defaultMachineConfig, repoConfig } from '../src/config.ts';
 import type { GitHub, Issue, LabelChange, PullRequest, PullRequestState } from '../src/github.ts';
+
+/** A repo's full settings, as phat-mode would build them from a .phat-mode.json with npm commands. */
+export const testConfig = (home: string, repo = 'test/repo', settings: Partial<Config> = {}): Config => ({
+  ...repoConfig(
+    defaultMachineConfig(home),
+    repo,
+    { installCommand: 'npm ci', checkCommand: 'npm run check' },
+    { defaultBranch: 'main', viewer: 'iPhatty' },
+  ),
+  ...settings,
+});
 
 /** GitHub in memory. */
 export class FakeGitHub implements GitHub {

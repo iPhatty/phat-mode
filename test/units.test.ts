@@ -6,7 +6,9 @@ import { describe, test } from 'node:test';
 import { FileCredentialStore, importPiCredential } from '../src/credentials.ts';
 import { agentEnv } from '../src/exec.ts';
 import { evidence, pullRequestBody } from '../src/messages.ts';
-import { ROLE_INSTRUCTIONS } from '../src/prompts.ts';
+import { roleInstructions } from '../src/prompts.ts';
+
+const ROLE_INSTRUCTIONS = roleInstructions('npm run check');
 
 const issue = { number: 7, title: 'Save progress', body: '', author: 'iPhatty', state: 'OPEN' as const, url: '', labels: [], comments: [] };
 const spec = { source: 'issue' as const, author: 'iPhatty', text: '', acceptanceCriteria: [], outOfScope: [], blockedBy: [] };
