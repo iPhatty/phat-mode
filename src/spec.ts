@@ -1,5 +1,5 @@
 import type { Config } from './config.ts';
-import { type Comment, type Issue, PROGRESS_LABELS } from './github.ts';
+import { type Comment, commentMarker, type Issue, PROGRESS_LABELS } from './github.ts';
 
 /**
  * What phat-mode builds from. mattpocock/skills makes an issue ready-for-agent in three ways:
@@ -159,6 +159,9 @@ export type ShapingEligibility =
   | { ok: true }
   /** ignored: left alone without touching GitHub. refused: phat-mode says why in a comment, and changes nothing else. */
   | { ok: false; kind: 'ignored' | 'refused'; reason: string };
+
+/** The comment saying why an issue is not shaped: one per issue, posted by `run` and `watch` alike. */
+export const MARKER_SHAPE_REFUSED = commentMarker('shape-refused');
 
 /**
  * Whether phat-mode may shape an issue, from the issue alone. Ignored without a word: closed, not labelled agent-mode,

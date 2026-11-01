@@ -138,7 +138,17 @@ export interface GitHub {
   addSubIssue(parent: number, child: number): Promise<void>;
   /** Add a native "blocked by" dependency: `issue` is blocked by `blocker`. Nothing happens if it already is. */
   addBlockedBy(issue: number, blocker: number): Promise<void>;
+  /** The issue's native sub-issues, with their state, lowest number first. */
+  listSubIssues(parent: number): Promise<SubIssue[]>;
+  /**
+   * Close an issue as completed, with phat-mode's comment carrying `marker`. The comment goes first and is upserted,
+   * so closing again after a crash never posts it twice.
+   */
+  closeIssue(issue: number, marker: string, body: string): Promise<void>;
 }
+
+/** A native sub-issue as listed under its parent. */
+export type SubIssue = { number: number; title: string; state: 'OPEN' | 'CLOSED' };
 
 /** Hidden marker that identifies a phat-mode comment. */
 export const commentMarker = (key: string) => `<!-- phat-mode:${key} -->`;
@@ -391,6 +401,21 @@ export class GhGitHub implements GitHub {
     if (existing.some((candidate) => candidate.number === blocker)) return;
     const id = await this.#databaseId(blocker);
     await this.#gh(['api', '--method', 'POST', path, '-F', `issue_id=${id}`]);
+  }
+
+  async listSubIssues(parent: number): Promise<SubIssue[]> {
+    const pages = JSON.parse(
+      await this.#gh(['api', '--paginate', '--slurp', `repos/${this.#repo}/issues/${parent}/sub_issues?per_page=100`]),
+    ) as { number: number; title: string; state: string }[][];
+    return pages
+      .flat()
+      .map((issue) => ({ number: issue.number, title: issue.title, state: issue.state === 'closed' ? ('CLOSED' as const) : ('OPEN' as const) }))
+      .sort((a, b) => a.number - b.number);
+  }
+
+  async closeIssue(issue: number, marker: string, body: string): Promise<void> {
+    await this.upsertComment(issue, marker, body);
+    await this.#gh(['issue', 'close', String(issue), '-R', this.#repo, '--reason', 'completed']);
   }
 
   /** Create the labels that are missing (never edit existing ones). Says which it created and which it could not. */

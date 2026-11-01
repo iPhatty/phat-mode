@@ -55,7 +55,7 @@ To retry, label the issue `ready-for-agent` again and run it.
 
 ## Agent mode: shaping
 
-Label a vague issue you opened `agent-mode` and run `phat-mode run <issue>`: phat-mode **shapes** it, with no human answering questions. Shaping is its own durable task, next to building: it survives crashes and Ctrl-C like a build, and `status`, `resume` and `abort` cover it (`status` says e.g. `shaping: running (grill)` or `building: running (implement)`).
+Label a vague issue you opened `agent-mode` and run `phat-mode run <issue>`, or leave it to [`phat-mode watch`](#watch): phat-mode **shapes** it, with no human answering questions. Shaping is its own durable task, next to building: it survives crashes and Ctrl-C like a build, and `status`, `resume` and `abort` cover it (`status` says e.g. `shaping: running (grill)` or `building: running (implement)`).
 
 1. **Prepare** (code): shapes only issues that are open, labelled `agent-mode`, and opened by a trusted author (`allowedAuthors`); anything else is ignored without touching GitHub. An issue that is already `phat-mode:shaped`, or also carries a triage state label (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), is refused with a comment, and its labels are left for you to sort out. Then it checks out the base branch, detached and read-only, in `workspaces/<owner>__<name>/shape-<n>`, and runs `installCommand` once.
 2. **Triage** (AI, the answerer, `shape` model): follows **phat-mode's pinned copy** of mattpocock/skills' [`triage`](skills/triage/) skill, verbatim (a copy in the repo is never used), plus phat-mode's autonomy overlay: *"the user is the answering agent. Wherever the skill asks the user to check, choose, approve or answer, ask the answering agent. Never wait for a human."* It runs triage's checks: is it already implemented (and where it looked), was something like it rejected before (`.out-of-scope/`), and for a bug, does it reproduce. It reads files and runs commands, but cannot change the checkout (no write or edit tools, and its files are read-only on disk); git, `gh` and credential folders are blocked, as for every agent.
@@ -85,9 +85,11 @@ Every outcome removes `agent-mode`. Everything shaping writes starts with `> *Sh
 One run at a time across all repos, in the order they are listed. The rules below apply per repo: a PR waiting for you in one repo does not hold up the others. Each time, for each repo, it:
 
 1. finishes any run that is still going;
-2. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge (with [`--yolo`](#yolo), it merges the ones it can first, lowest issue first, and says why it does not merge the others);
-3. hands an issue to a human if its PR was closed without merging (`ready-for-human`, with a comment; label it `ready-for-agent` again to retry);
-4. starts the **lowest-numbered issue that is ready and not blocked**: open, `ready-for-agent`, specified by a trusted author, no open blockers, and not `phat-mode:working` or `phat-mode:done`. `phat-mode:failed` with `ready-for-agent` again means: try again.
+2. closes every open `phat-mode:shaped` Parent whose sub-issues (its tickets) are all closed, with a summary comment listing them. A shaped issue with no sub-issues (shaped into one ticket) closes when its own PR merges;
+3. [shapes](#agent-mode-shaping) the **lowest-numbered `agent-mode` issue that may be shaped**, before any build and even while a PR waits for you to merge it, so its tickets are ready by the time building can go on. An `agent-mode` issue that cannot be shaped is said among the waiting lines, once; one that is refused (already shaped, or also carrying a triage state label) also gets the same comment as `run` posts, once;
+4. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge (with [`--yolo`](#yolo), it merges the ones it can first, lowest issue first, and says why it does not merge the others);
+5. hands an issue to a human if its PR was closed without merging (`ready-for-human`, with a comment; label it `ready-for-agent` again to retry);
+6. starts the **lowest-numbered issue that is ready and not blocked**: open, `ready-for-agent`, not `agent-mode`, specified by a trusted author, no open blockers, and not `phat-mode:working` or `phat-mode:done`. `phat-mode:failed` with `ready-for-agent` again means: try again.
 
 Merging a PR closes its issue (`Closes #N`), which unblocks the issues that wait for it, so blockers set up as GitHub issue dependencies or `Blocked by` lines give the order. When nothing can start, it says why, once: e.g. `#9 is blocked by #18 (ready-for-human)`.
 
@@ -179,7 +181,7 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 | Command | |
 |---|---|
 | `phat-mode init` | Set up the repo in this folder. See [Setup](#setup). |
-| `phat-mode watch [--yolo] [repo…]` | Work through the ready issues one at a time, until Ctrl-C. In a set-up repo, asks: this repo or all. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
+| `phat-mode watch [--yolo] [repo…]` | Shape the `agent-mode` issues and work through the ready ones, one run at a time, until Ctrl-C. In a set-up repo, asks: this repo or all. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
 | `phat-mode run [--yolo] <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. `--yolo` then waits and merges the PR. See [Yolo](#yolo). |
 | `phat-mode resume` | Continue every interrupted run, building or shaping. |
 | `phat-mode status` | List runs (every repo): shaping or building, and where they are. |

@@ -49,7 +49,7 @@ import {
   triagePrompt,
 } from './prompts.ts';
 import { pinnedSkill } from './skills.ts';
-import { shapingEligibility, trustedComments } from './spec.ts';
+import { MARKER_SHAPE_REFUSED, shapingEligibility, trustedComments } from './spec.ts';
 import { InstallError } from './workspace.ts';
 import { askForReport, failureGuard, perRepo, StepFailure } from './task-kit.ts';
 
@@ -104,7 +104,7 @@ type Phase<P extends ShapingState['phase']> = RunningTask<ShapingInput, Extract<
 
 const MARKERS = {
   result: commentMarker('shape'),
-  refused: commentMarker('shape-refused'),
+  refused: MARKER_SHAPE_REFUSED,
   qa: commentMarker('shape-qa'),
 };
 

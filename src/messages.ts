@@ -277,6 +277,19 @@ export const shapedByLine = (issue: number) => `> *Shaped by phat-mode (AI) from
 
 type ShapeLabels = { agentMode: string };
 
+/** On a shaped parent, as `watch` closes it: every ticket is closed, so the spec is done. */
+export function parentClosedComment(parent: number, tickets: readonly { number: number; title: string }[]): string {
+  return `${shapedByLine(parent)}
+
+## Done
+
+All ${tickets.length} tickets of this issue are closed:
+
+${list(tickets.map((ticket) => `#${ticket.number} ${ticket.title}`))}
+
+The spec above is built, so phat-mode closes this issue. Reopen it if something is missing.`;
+}
+
 /** Why phat-mode will not shape an issue; it changes nothing else, so a human can fix it. */
 export function shapeRefusedComment(issue: number, reason: string, labels: ShapeLabels): string {
   return `${shapedByLine(issue)}

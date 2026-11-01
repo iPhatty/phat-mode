@@ -23,7 +23,10 @@ const stdin = () => fs.readFileSync(0, 'utf8');
 const [a, b, c] = args;
 const path = args.find((arg) => arg.startsWith('repos/')) ?? '';
 if (a === 'api' && b === 'user') process.stdout.write(state.viewer + '\\n');
-else if (a === 'api' && args.includes('--slurp') && path.includes('/issues?')) {
+else if (a === 'api' && args.includes('--slurp') && path.includes('/sub_issues?')) {
+  log({ subIssues: path });
+  process.stdout.write(JSON.stringify(state.subIssuePages));
+} else if (a === 'api' && args.includes('--slurp') && path.includes('/issues?')) {
   log({ list: path });
   process.stdout.write(JSON.stringify([state.issues]));
 } else if (a === 'api' && flag('--method') === 'POST' && path.endsWith('/issues')) {
@@ -44,6 +47,7 @@ else if (a === 'pr' && b === 'list') {
 } else if (a === 'api' && args.includes('--slurp')) process.stdout.write(JSON.stringify([state.comments]));
 else if (a === 'api' && flag('--method') === 'PATCH') log({ patch: args.at(-3), body: JSON.parse(stdin()).body });
 else if (a === 'issue' && b === 'comment') log({ comment: c, body: stdin() });
+else if (a === 'issue' && b === 'close') log({ close: c, args: args.slice(3) });
 else if (a === 'issue' && b === 'edit') log({ issueEdit: c, args: args.slice(3), body: stdin() });
 else if (a === 'pr' && b === 'edit') log({ edit: c, body: stdin() });
 else if (a === 'pr' && b === 'ready') log({ ready: c });
@@ -77,10 +81,11 @@ async function gitHubWith(state: {
   ids?: Record<string, number>;
   parents?: Record<string, number>;
   blockedBy?: Record<string, { number: number; state: string }[]>;
+  subIssuePages?: { number: number; title: string; state: string }[][];
 }) {
   await writeFile(
     join(dir, 'state.json'),
-    JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], views: {}, issues: [], ids: {}, parents: {}, blockedBy: {}, ...state }),
+    JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], views: {}, issues: [], ids: {}, parents: {}, blockedBy: {}, subIssuePages: [], ...state }),
   );
   await writeFile(join(dir, 'log.jsonl'), '');
 }
@@ -304,6 +309,28 @@ describe('GhGitHub, on a public repo', () => {
     await github.addBlockedBy(33, 31);
     assert.deepEqual(await writes(), [
       { post: 'repos/iPhatty/phat-mode/issues/33/dependencies/blocked_by', field: 'issue_id=9001' },
+    ]);
+  });
+
+  test('listSubIssues: every page, with GitHub’s state as OPEN or CLOSED, lowest number first', async () => {
+    await gitHubWith({
+      subIssuePages: [
+        [{ number: 12, title: 'Second', state: 'open' }],
+        [{ number: 11, title: 'First', state: 'closed' }],
+      ],
+    });
+    assert.deepEqual(await github.listSubIssues(10), [
+      { number: 11, title: 'First', state: 'CLOSED' },
+      { number: 12, title: 'Second', state: 'OPEN' },
+    ]);
+    assert.deepEqual(await writes(), [{ subIssues: 'repos/iPhatty/phat-mode/issues/10/sub_issues?per_page=100' }]);
+  });
+
+  test('closeIssue posts its comment first, then closes the issue as completed', async () => {
+    await github.closeIssue(10, '<!-- phat-mode:shape-closed -->', 'All done.');
+    assert.deepEqual(await writes(), [
+      { comment: '10', body: '<!-- phat-mode:shape-closed -->\nAll done.' },
+      { close: '10', args: ['-R', 'iPhatty/phat-mode', '--reason', 'completed'] },
     ]);
   });
 });
