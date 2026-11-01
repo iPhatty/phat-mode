@@ -10,7 +10,10 @@ phat-mode is the **AFK agent** in a [mattpocock/skills](https://github.com/mattp
 
 ```
 /triage, /to-tickets or /to-spec  →  issue labelled ready-for-agent  →  phat-mode watch  →  PR  →  you merge  →  next issue
+vague issue labelled agent-mode   →  phat-mode watch shapes it    →  tickets labelled ready-for-agent  →  (built as above)
 ```
+
+Or skip the skills: label a rough issue you opened `agent-mode`, and phat-mode shapes it into a spec and tickets itself, with no human answering questions. See [Agent mode](#agent-mode).
 
 1. **Prepare**: only works on issues that are open, labelled `ready-for-agent`, specified by a trusted author, and not blocked by open issues. Anything else is left alone, with no reply. Labels it `phat-mode:working` and checks out branch `phat-mode/issue-12` in its own workspace.
 2. **Plan** (AI, Claude Opus 5.5): reads the spec and the code, and plans *how* to build it. If the spec has a gap, it posts triage notes and moves the issue back to `needs-info`. If an agent shouldn't do it, it moves it to `ready-for-human`.
@@ -39,8 +42,8 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 |---|---|---|
 | `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` | the triage skills, and phat-mode when it hands back | the issue's triage state (names configurable under `labels`) |
 | `phat-mode:working` / `phat-mode:done` / `phat-mode:failed` | phat-mode | its own progress; one at a time |
-| `agent-mode` | you | shape this vague issue into tickets ([agent mode](#agent-mode-shaping), being built); never built itself (name configurable under `labels`) |
-| `phat-mode:shaped` | phat-mode | agent mode shaped this issue into tickets; stays on while they are built |
+| `agent-mode` | you | shape this vague issue into tickets ([agent mode](#agent-mode)); never built itself (name configurable under `labels`) |
+| `phat-mode:shaped` | phat-mode | [agent mode](#agent-mode) shaped this issue: it marks the Parent (or a single shaped ticket) and stays on while the tickets are built; `watch` closes the Parent once all its sub-issues are closed |
 
 `phat-mode init` creates any of these the repo is missing, with a colour and description, under the names in `labels`; it never changes a label that is already there. Creating labels needs write access: if it cannot, `init` names the labels and GitHub's reason, and exits 1. Run it again after renaming labels.
 
@@ -51,9 +54,20 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 | Not for an agent | `ready-for-human`, with the reason |
 | Gave up (e.g. checks keep failing) | `ready-for-human` + `phat-mode:failed`, with the reason |
 
-To retry, label the issue `ready-for-agent` again and run it.
+To retry, label the issue `ready-for-agent` again and run it. Agent mode's outcomes are listed under [Agent mode](#agent-mode).
 
-## Agent mode: shaping
+## Agent mode
+
+```
+agent-mode issue → prepare → triage → grill (questioner ⇄ answerer, ≤ maxGrillRounds) → spec → tickets → publish
+                      │         │                                                                 ├─ one ticket:   the issue, ready-for-agent + phat-mode:shaped
+                      │         │                                                                 ├─ several:      sub-issues ready-for-agent, Parent phat-mode:shaped
+                      │         │                                                                 └─ > maxTickets: ready-for-human, draft breakdown
+                      │         ├─ unintelligible or contradicts itself                → needs-info
+                      │         └─ needs a human, already implemented, rejected before → ready-for-human
+                      └─ already shaped, or also has a triage state label → refused with a comment, labels left as they are
+any failure → ready-for-human + phat-mode:failed
+```
 
 Label a vague issue you opened `agent-mode` and run `phat-mode run <issue>`, or leave it to [`phat-mode watch`](#watch): phat-mode **shapes** it, with no human answering questions. Shaping is its own durable task, next to building: it survives crashes and Ctrl-C like a build, and `status`, `resume` and `abort` cover it (`status` says e.g. `shaping: running (grill)` or `building: running (implement)`).
 
@@ -68,6 +82,7 @@ The agents get the issue body and the comments of `allowedAuthors` only; anyone 
 
 | Outcome | Labels afterwards | Comment |
 |---|---|---|
+| Refused: already `phat-mode:shaped`, or `agent-mode` together with a triage state label | left as they are, `agent-mode` included | `Not shaped`, with the reason |
 | Unintelligible or contradicts itself | `needs-info` | triage notes in the skills' format |
 | Needs a human (design taste, outside access, manual testing) | `ready-for-human` | the reason |
 | Already implemented, or rejected before | `ready-for-human` | the findings; never `wontfix`, only you close an idea for good |
@@ -76,17 +91,27 @@ The agents get the issue body and the comments of `allowedAuthors` only; anyone 
 | More than `limits.maxTickets` tickets | `ready-for-human` | the draft breakdown; no tickets are opened |
 | Shaped into several tickets | `phat-mode:shaped` (each ticket: `ready-for-agent`) | the body is rewritten as the spec; the tickets are its sub-issues; the Grilling Q&A comment |
 
-Every outcome removes `agent-mode`. Everything shaping writes starts with `> *Shaped by phat-mode (AI) from #N.*`.
+Every outcome except a refusal removes `agent-mode`; a refused issue keeps all its labels until you sort them out. Everything shaping writes starts with `> *Shaped by phat-mode (AI) from #N.*`.
+
+### Models and limits
+
+- The **questioner** uses the `grill` role (built in: **GPT-6.1 Sol**) and the **answerer** uses `shape` (built in: follows `defaultModel`), so by default the grilling is not one model family agreeing with itself. Set either under `models` in your `config.json` (see [Models](#models)). Why two agents and pinned skills: [ADR 0001](docs/adr/0001-shaping-follows-pinned-skills-with-two-agents.md).
+- `limits.maxGrillRounds` (default 6): at the limit, the questions still open in the last round get the questioner's recommended answers, and those decisions are recorded as assumptions in the spec.
+- `limits.maxTickets` (default 8): a bigger breakdown goes to `ready-for-human` with the draft breakdown in a comment, and no tickets are opened.
+
+### How `watch` schedules shaping
+
+Each time [`watch`](#watch) looks at a repo, after finishing any run still going, it first closes finished Parents (every sub-issue closed), then shapes the lowest-numbered `agent-mode` issue that may be shaped, even while a phat-mode PR waits for you to merge it, and only then builds. It is still one run at a time across all repos, shaping or building.
 
 ## Watch
 
-`phat-mode watch` keeps going on its own: after you merge a PR, it starts the next issue. It works on the repos named on the command line (`phat-mode watch owner/a owner/b`), else the `repos` in your config.json (`phat-mode init` adds each repo it sets up), else the repo of the current folder. Run inside a set-up repo (one with `.phat-mode.json`) while other repos are listed, it asks whether to watch that repo alone (the default) or all of them; when it cannot ask (not a terminal), it watches all. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes).
+`phat-mode watch` keeps going on its own: it shapes `agent-mode` issues into tickets as they appear, and after you merge a PR, it starts the next issue. It works on the repos named on the command line (`phat-mode watch owner/a owner/b`), else the `repos` in your config.json (`phat-mode init` adds each repo it sets up), else the repo of the current folder. Run inside a set-up repo (one with `.phat-mode.json`) while other repos are listed, it asks whether to watch that repo alone (the default) or all of them; when it cannot ask (not a terminal), it watches all. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes).
 
 One run at a time across all repos, in the order they are listed. The rules below apply per repo: a PR waiting for you in one repo does not hold up the others. Each time, for each repo, it:
 
 1. finishes any run that is still going;
 2. closes every open `phat-mode:shaped` Parent whose sub-issues (its tickets) are all closed, with a summary comment listing them. A shaped issue with no sub-issues (shaped into one ticket) closes when its own PR merges;
-3. [shapes](#agent-mode-shaping) the **lowest-numbered `agent-mode` issue that may be shaped**, before any build and even while a PR waits for you to merge it, so its tickets are ready by the time building can go on. An `agent-mode` issue that cannot be shaped is said among the waiting lines, once; one that is refused (already shaped, or also carrying a triage state label) also gets the same comment as `run` posts, once;
+3. [shapes](#agent-mode) the **lowest-numbered `agent-mode` issue that may be shaped**, before any build and even while a PR waits for you to merge it, so its tickets are ready by the time building can go on. An `agent-mode` issue that cannot be shaped is said among the waiting lines, once; one that is refused (already shaped, or also carrying a triage state label) also gets the same comment as `run` posts, once;
 4. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge (with [`--yolo`](#yolo), it merges the ones it can first, lowest issue first, and says why it does not merge the others);
 5. hands an issue to a human if its PR was closed without merging (`ready-for-human`, with a comment; label it `ready-for-agent` again to retry);
 6. starts the **lowest-numbered issue that is ready and not blocked**: open, `ready-for-agent`, not `agent-mode`, specified by a trusted author, no open blockers, and not `phat-mode:working` or `phat-mode:done`. `phat-mode:failed` with `ready-for-agent` again means: try again.
