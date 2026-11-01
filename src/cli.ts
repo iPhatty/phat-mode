@@ -141,9 +141,9 @@ async function liveRuns(phat: Awaited<ReturnType<typeof open>>) {
 const firstLine = (error: unknown) => (error instanceof Error ? error.message.split('\n')[0]! : String(error));
 
 /**
- * Work through the ready issues of `repos`, one run at a time, until Ctrl-C: finish any run that is going, then start
- * the first ready issue, in the order the repos are listed. Within a repo, nothing new starts while a phat-mode pull
- * request is open; other repos carry on. See src/watch.ts.
+ * Work through the ready and `agent-mode` issues of `repos`, one run at a time, until Ctrl-C: finish any run that is
+ * going, then shape or start the next issue, in the order the repos are listed. Within a repo, shaping goes ahead
+ * while a phat-mode pull request is open, but no new build starts; other repos carry on. See src/watch.ts.
  */
 const YOLO_WARNING =
   '⚠ --yolo: phat-mode merges its own pull requests (squash) when it found them clean, every check passed and the ' +
@@ -154,7 +154,7 @@ async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Pr
   const phat = await open(machine, configFor);
   phat.harness.resume();
   const minutes = Math.round(machine.watchIntervalMs / 60_000) || 1;
-  consoleLogger.info(`Watching ${repos.join(', ')}: one issue at a time, looking every ${minutes} min. Ctrl-C to stop.`);
+  consoleLogger.info(`Watching ${repos.join(', ')}: one run at a time, looking every ${minutes} min. Ctrl-C to stop.`);
   if (yolo) consoleLogger.info(YOLO_WARNING);
   // What was last said about each repo: say it once, not on every look.
   const last = new Map<string, string>();
@@ -175,8 +175,8 @@ async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Pr
         const config = await configFor(repo);
         const step = await nextStep(new GhGitHub(repo), config, consoleLoggerFor(repo), { yolo });
         say(repo, describeStep(step));
-        if (step.kind === 'start') {
-          const { taskId } = await phat.start({ repo, issue: step.issue }, context);
+        if (step.kind === 'start' || step.kind === 'shape') {
+          const { taskId } = await phat.start({ repo, issue: step.issue }, context, step.kind === 'shape' ? 'shape' : 'build');
           await waitAndReport(phat, taskId);
           ran = true;
         }

@@ -3,7 +3,8 @@ import { describe, test } from 'node:test';
 import type { Config } from '../src/config.ts';
 import type { CheckState } from '../src/github.ts';
 import { silentLogger } from '../src/log.ts';
-import { describeStep, MARKER_HANDED_BACK, nextStep } from '../src/watch.ts';
+import { MARKER_SHAPE_REFUSED } from '../src/spec.ts';
+import { describeStep, MARKER_HANDED_BACK, MARKER_PARENT_CLOSED, nextStep } from '../src/watch.ts';
 import { yoloMarker, type YoloVerdict } from '../src/yolo.ts';
 import { FakeGitHub, testConfig } from './fakes.ts';
 
@@ -161,13 +162,16 @@ describe('watch', () => {
     assert.deepEqual(await step(github), { kind: 'start', issue: 3, title: 'Issue 3' });
   });
 
-  test('never builds an issue labelled agent-mode; says why', async () => {
+  test('never builds an issue labelled agent-mode; says why, once', async () => {
     const github = repo({ 2: { labels: ['ready-for-agent', 'agent-mode'] }, 3: {} });
     assert.deepEqual(await step(github), { kind: 'start', issue: 3, title: 'Issue 3' });
     const alone = repo({ 2: { labels: ['ready-for-agent', 'agent-mode'] } });
     const idle = await step(alone);
     assert.equal(idle.kind, 'idle');
-    assert.match(describeStep(idle), /#2 is labelled `agent-mode`: phat-mode shapes it into tickets, it does not build it/);
+    assert.equal(
+      describeStep(idle),
+      'Nothing can start:\n    - #2 is labelled `agent-mode` and also `ready-for-agent`: those are conflicting instructions.',
+    );
   });
 
   test('nothing can start: says what each issue waits for, down to the human', async () => {
@@ -185,6 +189,149 @@ describe('watch', () => {
   });
 
   test('nothing ready at all', async () => {
-    assert.equal(describeStep(await step(new FakeGitHub())), 'Nothing labelled ready-for-agent. Waiting for new issues.');
+    assert.equal(describeStep(await step(new FakeGitHub())), 'Nothing labelled ready-for-agent or agent-mode. Waiting for new issues.');
+  });
+});
+
+describe('watch, agent mode', () => {
+  test('shapes while a phat-mode pull request waits to be merged', async () => {
+    const github = repo({ 2: {}, 5: { labels: ['agent-mode'] } });
+    opened(github, 2);
+    const shape = await step(github);
+    assert.deepEqual(shape, { kind: 'shape', issue: 5, title: 'Issue 5' });
+    assert.equal(describeStep(shape), 'Shaping next: #5 Issue 5');
+  });
+
+  test('shaping comes before a ready build, lowest-numbered first', async () => {
+    const github = repo({ 2: {}, 7: { labels: ['agent-mode'] }, 4: { labels: ['agent-mode'] } });
+    assert.deepEqual(await step(github), { kind: 'shape', issue: 4, title: 'Issue 4' });
+  });
+
+  test('an agent-mode issue that cannot be shaped does not hold up a later one', async () => {
+    const github = repo({ 3: { labels: ['agent-mode', 'needs-info'] }, 4: { labels: ['agent-mode'], author: 'stranger' }, 6: { labels: ['agent-mode'] } });
+    assert.deepEqual(await step(github), { kind: 'shape', issue: 6, title: 'Issue 6' });
+  });
+
+  test('a shaped parent closes once all its tickets are closed, not before', async () => {
+    const github = repo({ 10: { labels: ['phat-mode:shaped'] }, 11: {}, 12: {} });
+    github.issues.get(11)!.title = 'Store greetings';
+    github.issues.get(12)!.title = 'Show greetings';
+    github.parents.set(11, 10);
+    github.parents.set(12, 10);
+    // Shaped into one ticket: no sub-issues; it closes when its own pull request merges.
+    github.addIssue(20, { labels: ['phat-mode:shaped', 'ready-for-agent'] });
+    // Already closed: nothing to do.
+    github.addIssue(30, { labels: ['phat-mode:shaped'], state: 'CLOSED' });
+    github.addIssue(31, { state: 'CLOSED' });
+    github.parents.set(31, 30);
+
+    const close = (number: number) => {
+      github.issues.get(number)!.state = 'CLOSED';
+      github.openIssues.delete(number);
+    };
+    close(11);
+    await step(github);
+    assert.deepEqual(github.closed, []);
+    assert.equal(github.comments.length, 0);
+
+    close(12);
+    await step(github);
+    await step(github);
+    assert.deepEqual(github.closed, [10]);
+    assert.equal(github.issues.get(10)!.state, 'CLOSED');
+    const comments = github.comments.filter((comment) => comment.issue === 10);
+    assert.equal(comments.length, 1);
+    assert.equal(comments[0]!.marker, MARKER_PARENT_CLOSED);
+    assert.match(comments[0]!.body, /^> \*Shaped by phat-mode \(AI\) from #10\.\*/);
+    assert.match(comments[0]!.body, /All 2 tickets of this issue are closed:\n\n- #11 Store greetings\n- #12 Show greetings/);
+    assert.equal(github.issues.get(20)!.state, 'OPEN');
+  });
+
+  test('a parent closes even while a pull request waits to be merged', async () => {
+    const github = repo({ 2: {}, 10: { labels: ['phat-mode:shaped'] }, 11: {} });
+    github.parents.set(11, 10);
+    github.issues.get(11)!.state = 'CLOSED';
+    opened(github, 2);
+    assert.equal((await step(github)).kind, 'wait_for_merge');
+    assert.deepEqual(github.closed, [10]);
+  });
+
+  test('refusals and conflicts appear among the waiting lines, once, and are said on the issue once', async () => {
+    const github = repo({
+      2: { blockedBy: [9] },
+      3: { labels: ['agent-mode', 'ready-for-agent'] },
+      4: { labels: ['agent-mode', 'phat-mode:shaped'] },
+      5: { labels: ['agent-mode'], author: 'stranger' },
+      9: { labels: ['ready-for-human'] },
+    });
+    const idle = await step(github);
+    assert.equal(idle.kind, 'idle');
+    assert.equal(
+      describeStep(idle),
+      [
+        'Nothing can start:',
+        '    - #3 is labelled `agent-mode` and also `ready-for-agent`: those are conflicting instructions.',
+        '    - #4 is already `phat-mode:shaped`: phat-mode does not shape an issue again.',
+        '    - #5 was opened by stranger, not by iPhatty: only issues by a trusted author are shaped.',
+        '    - #2 is blocked by #9 (ready-for-human)',
+      ].join('\n'),
+    );
+    await step(github);
+    // The refusals are said on the issue, once each; the stranger's issue is left alone.
+    assert.deepEqual(
+      github.comments.map((comment) => [comment.issue, comment.marker]),
+      [
+        [3, MARKER_SHAPE_REFUSED],
+        [4, MARKER_SHAPE_REFUSED],
+      ],
+    );
+    assert.match(github.comments[0]!.body, /## Not shaped[^]*conflicting instructions/);
+    assert.deepEqual(github.labels(3), ['agent-mode', 'ready-for-agent']);
+  });
+
+  test('while a pull request waits, the reasons an agent-mode issue cannot be shaped show too', async () => {
+    const github = repo({ 2: {}, 3: { labels: ['agent-mode', 'needs-triage'] } });
+    opened(github, 2);
+    const waiting = await step(github);
+    assert.equal(waiting.kind, 'wait_for_merge');
+    assert.equal(
+      describeStep(waiting),
+      `Waiting for you to merge #2: ${github.prs[0]!.url}\n` +
+        '    - #3 is labelled `agent-mode` and also `needs-triage`: those are conflicting instructions.',
+    );
+  });
+  test('a conflicting agent-mode issue whose pull request was closed is not handed back: it is left for you', async () => {
+    const github = repo({ 2: { labels: ['agent-mode', 'ready-for-agent'] } });
+    opened(github, 2);
+    github.prs[0]!.state = 'CLOSED';
+    const idle = await step(github);
+    assert.equal(idle.kind, 'idle');
+    assert.deepEqual(github.labels(2), ['agent-mode', 'phat-mode:done', 'ready-for-agent']);
+    assert.deepEqual(github.comments.map((comment) => comment.marker), [MARKER_SHAPE_REFUSED]);
+  });
+
+  test('phat-mode:working does not hide a refusal: conflicts and already-shaped are still said, once', async () => {
+    const github = repo({
+      3: { labels: ['agent-mode', 'ready-for-agent', 'phat-mode:working'] },
+      4: { labels: ['agent-mode', 'phat-mode:shaped', 'phat-mode:working'] },
+      5: { labels: ['agent-mode', 'phat-mode:working'] },
+    });
+    const idle = await step(github);
+    assert.equal(
+      describeStep(idle),
+      [
+        'Nothing can start:',
+        '    - #3 is labelled `agent-mode` and also `ready-for-agent`: those are conflicting instructions.',
+        '    - #4 is already `phat-mode:shaped`: phat-mode does not shape an issue again.',
+        '    - #5 is labelled phat-mode:working, but no run is going. Run `phat-mode status`, or remove the label to start again.',
+      ].join('\n'),
+    );
+    assert.deepEqual(
+      github.comments.map((comment) => [comment.issue, comment.marker]),
+      [
+        [3, MARKER_SHAPE_REFUSED],
+        [4, MARKER_SHAPE_REFUSED],
+      ],
+    );
   });
 });

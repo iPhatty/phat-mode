@@ -1,5 +1,5 @@
 import { type Config, defaultMachineConfig, repoConfig } from '../src/config.ts';
-import type { GitHub, Issue, LabelChange, PullRequest, PullRequestState, PullRequestStatus } from '../src/github.ts';
+import type { GitHub, Issue, LabelChange, PullRequest, PullRequestState, PullRequestStatus, SubIssue } from '../src/github.ts';
 
 /** A repo's full settings, as phat-mode would build them from a .phat-mode.json with npm commands. */
 export const testConfig = (home: string, repo = 'test/repo', settings: Partial<Config> = {}): Config => ({
@@ -86,6 +86,24 @@ export class FakeGitHub implements GitHub {
     if (native.includes(blocker)) return;
     this.native.set(issue, [...native, blocker]);
     this.blockedByEdges.push({ issue, blocker });
+  }
+  async listSubIssues(parent: number): Promise<SubIssue[]> {
+    return [...this.parents.entries()]
+      .filter(([, of]) => of === parent)
+      .map(([child]) => this.issues.get(child)!)
+      .map(({ number, title, state }) => ({ number, title, state }))
+      .sort((a, b) => a.number - b.number);
+  }
+  /** Issues phat-mode closed, in order. */
+  closed: number[] = [];
+  async closeIssue(number: number, marker: string, body: string) {
+    await this.upsertComment(number, marker, body);
+    this.writes++;
+    const issue = this.issues.get(number);
+    if (!issue) throw new Error(`no issue ${number}`);
+    issue.state = 'CLOSED';
+    this.openIssues.delete(number);
+    this.closed.push(number);
   }
 
   addIssue(number: number, fields: Partial<Issue> = {}) {
