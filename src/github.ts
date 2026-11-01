@@ -96,6 +96,8 @@ export type LabelChange = { add?: readonly string[]; remove?: readonly string[] 
 export interface GitHub {
   /** The issue with its labels and comments. */
   getIssue(issue: number): Promise<Issue>;
+  /** Replace an issue's body. */
+  editIssueBody(issue: number, body: string): Promise<void>;
   /** Post a comment, or update phat-mode's own one carrying `marker`, so a rerun never posts twice. */
   upsertComment(issue: number, marker: string, body: string): Promise<void>;
   /** The open pull request from `branch` in the repo itself (never a fork's), if any. */
@@ -239,6 +241,10 @@ export class GhGitHub implements GitHub {
         JSON.stringify({ body: text }),
       );
     }
+  }
+
+  async editIssueBody(issue: number, body: string): Promise<void> {
+    await this.#gh(['issue', 'edit', String(issue), '-R', this.#repo, '--body-file', '-'], body);
   }
 
   async findPullRequest(branch: string): Promise<PullRequest | undefined> {

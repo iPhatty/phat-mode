@@ -1,4 +1,4 @@
-import type { Agent, DoneReport, PlanReport } from './agents.ts';
+import type { Agent, DoneReport, GrillQuestion, GrillRound, PlanReport } from './agents.ts';
 import {
   type CodeReview,
   type CodeReviewSkill,
@@ -46,6 +46,12 @@ export const roleInstructions = (checkCommand: string): Record<Agent, string> =>
 Your role: the answering agent. You hold every decision while this issue is shaped, deciding from the codebase, the glossary and the ADRs, never from a human.
 Each request tells you which step of shaping you are doing, and gives you phat-mode's pinned copy of the skill to follow, with an overlay that puts you in the user's place. Follow that copy, never one installed in the project.
 Finish each request with the report tool it names.`,
+
+  question: `${SHAPE_SHARED}
+
+Your role: the questioner. You grill the answering agent about this request, following phat-mode's pinned copy of the grilling skill (given in the first request), never one installed in the project. The answering agent answers, never a human.
+Finding facts is your job: look them up yourself with read and bash instead of asking. Put only decisions to the answering agent.
+Finish each request by calling report_questions.`,
 
   plan: `${SHARED}
 
@@ -380,4 +386,105 @@ How the skill applies here, in shaping:
 - Otherwise proceed: phat-mode grills and specifies it next.
 
 Finish by calling report_triage.`;
+}
+
+/** How a round's questions read, as the `grilling` skill formats them. */
+const roundBlock = (questions: readonly GrillQuestion[]) =>
+  questions
+    .map(
+      (question, index) =>
+        `❓ **Q${index + 1}** - **${question.title}** (${question.door} door): ${question.question}\n\n➡️ ${question.recommendation}`,
+    )
+    .join('\n\n---\n\n');
+
+/**
+ * The questioner's request for one round. Round 1: the issue, the pinned `grilling` skill and the overlay. Later rounds:
+ * the answers to the round before.
+ */
+export function grillPrompt(options: {
+  issue: Issue;
+  comments: readonly Comment[];
+  skill: PinnedSkill;
+  round: number;
+  maxRounds: number;
+  previous?: GrillRound;
+}): string {
+  const { issue, comments, skill, round, maxRounds, previous } = options;
+  const report = `Report the round with report_questions: every question of the frontier, in order (they are numbered Q1, Q2, … by their place), each with your recommended answer and whether the decision is a one-way door (hard to reverse) or a two-way door. When the frontier is empty, report frontierEmpty: true and no questions.`;
+  if (previous === undefined || round === 1) {
+    return `Grill the answering agent about this request, following the \`grilling\` skill below. This is round ${round}.
+
+${shapedIssueBlock(issue, comments)}
+
+${skillBlock(skill)}
+
+${overlayBlock}
+
+How the skill applies here, in shaping:
+- The answering agent decides from the codebase, the glossary and the ADRs. It has already checked that the request is not implemented yet, not rejected before, and makes sense.
+- Ask one round per request; phat-mode passes it to the answering agent and brings you its answers. There are at most ${maxRounds} rounds: ask what matters most first. Questions still open after the last round are decided using your recommendations.
+- Look up facts yourself (read files, run commands); never ask for something you could find.
+
+${report}`;
+  }
+  return `The answering agent answered round ${round - 1}:
+
+${previous.questions
+  .map((question, index) => {
+    const answer = previous.answers[index];
+    return `**Q${index + 1}** - **${question.title}**\n\nAnswer (${answer?.door ?? question.door} door): ${answer?.answer ?? question.recommendation}`;
+  })
+  .join('\n\n')}
+
+Recompute the frontier and ask round ${round}${round === maxRounds ? ', the last round: questions still open after it are decided using your recommendations' : ''}. ${report}`;
+}
+
+/** The answerer's request for one round of the questioner's. At the round limit, it decides with the recommendations. */
+export function answerPrompt(round: number, questions: readonly GrillQuestion[], atLimit: boolean): string {
+  const how = atLimit
+    ? `This is the last round grilling allows. Decide each question using the questioner's recommendation, unless the code, the glossary or the ADRs clearly rule it out; then decide what they point to. Each of these decisions is listed as an assumption for a human to check.`
+    : `Decide each question from the codebase, the glossary and the ADRs (read files and run commands as you need). Take the recommendation when it fits; when it does not, decide otherwise and say why. Never wait for a human: you are the user the grilling skill asks.`;
+  return `The questioner asks round ${round} of grilling this request.
+
+${roundBlock(questions)}
+
+${how}
+
+Report with report_answers: one answer per question, by its number, with whether the decision is a one-way door (hard to reverse) or a two-way door.`;
+}
+
+/** The answerer synthesises the spec, following `to-spec` and `domain-modeling`; code publishes it. */
+export function shapeSpecPrompt(toSpec: PinnedSkill, domainModeling: PinnedSkill): string {
+  return `Grilling is done. Now write the spec, following the \`to-spec\` skill below, from what was decided while grilling and what you know of the codebase. Use the \`domain-modeling\` skill below for the domain's vocabulary.
+
+${skillBlock(toSpec)}
+
+${skillBlock(domainModeling)}
+
+${overlayBlock}
+
+How the skills apply here, in shaping:
+- Synthesise only: do not interview anyone, publish anything, apply labels or write files. phat-mode writes the spec into the issue itself, from your report.
+- The seams are yours to choose, as the answering agent: no sign-off is needed.
+- Use the template's sections. Assumptions: every decision taken on the human's behalf while grilling (and since), each with why and whether it is a one-way door (hard to reverse) or a two-way door.
+- Domain: the glossary terms (in the glossary format) and ADRs (only those the ADR format says are worth one) this work introduces. Do not write them: the ticket that first needs each one will.
+
+Finish by calling report_shape_spec.`;
+}
+
+/** The answerer breaks the spec into tickets, following `to-tickets`; code publishes them. */
+export function ticketsPrompt(toTickets: PinnedSkill): string {
+  return `Now break the spec into tickets, following the \`to-tickets\` skill below.
+
+${skillBlock(toTickets)}
+
+${overlayBlock}
+
+How the skill applies here, in shaping:
+- Break down only: do not publish, create issues or apply labels. phat-mode publishes from your report. The breakdown needs no approval.
+- A request that fits in one ticket is one ticket; do not split it for its own sake.
+- Give each ticket its acceptance criteria, and its blocking edges as indexes in your list (0 for the first ticket).
+- For each glossary term and ADR in the spec's Domain section, add "write term X" / "write ADR Y" to the acceptance criteria of the first ticket that introduces it.
+
+Finish by calling report_tickets.`;
 }

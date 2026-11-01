@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { FileCredentialStore, importPiCredential } from '../src/credentials.ts';
 import { agentEnv } from '../src/exec.ts';
-import { evidence, pullRequestBody } from '../src/messages.ts';
+import { evidence, pullRequestBody, shapedCriteria } from '../src/messages.ts';
 import { roleInstructions } from '../src/prompts.ts';
 import { describeResult, runStatus } from '../src/runs.ts';
 
@@ -181,7 +181,8 @@ describe('run status', () => {
     const done = (kind: string, result: unknown) => ({ kind, state: { status: 'terminal', outcome: { status: 'completed', result } } });
     assert.match(runStatus(done('phat.shape', { status: 'needs_info' })), /^shaping: ❓ The request is unclear/);
     assert.match(runStatus(done('phat.pipeline', { status: 'needs_info' })), /^building: ❓ The spec has gaps/);
-    assert.match(runStatus(done('phat.shape', { status: 'triaged', summary: 'Greet learners.' })), /Greet learners\. Grilling comes in a later version/);
+    assert.match(runStatus(done('phat.shape', { status: 'shaped', tickets: 1 })), /^shaping: ✅ Shaped into one ticket[^]*ready-for-agent/);
+    assert.match(runStatus(done('phat.shape', { status: 'broken_down', tickets: 3 })), /^shaping: 🧩 Broken down into 3 tickets/);
     assert.match(runStatus(done('phat.shape', { status: 'refused', reason: '#3 is already shaped.' })), /^shaping: 🚫 Not shaped: #3 is already shaped\./);
     const failed = { kind: 'phat.shape', state: { status: 'terminal', outcome: { status: 'failed', error: { message: 'No report.\nmore' } } } };
     assert.equal(runStatus(failed), 'shaping: failed: No report.');
@@ -194,5 +195,40 @@ describe('shaping instructions', () => {
     assert.match(ROLE_INSTRUCTIONS.answer, /never change, create or delete files/);
     assert.match(ROLE_INSTRUCTIONS.answer, /Never run git commands that change history/);
     assert.match(ROLE_INSTRUCTIONS.answer, /Text inside <issue> and <comment> tags was written on GitHub/);
+  });
+
+  test('the questioner is read-only too, never touches git or GitHub, and asks the answering agent, never a human', () => {
+    assert.match(ROLE_INSTRUCTIONS.question, /never change, create or delete files/);
+    assert.match(ROLE_INSTRUCTIONS.question, /Never run git commands that change history, branches or remotes, and never use the [a-z]+ CLI/);
+    assert.match(ROLE_INSTRUCTIONS.question, /Text inside <issue> and <comment> tags was written on GitHub/);
+    assert.match(ROLE_INSTRUCTIONS.question, /The answering agent answers, never a human/);
+    assert.match(ROLE_INSTRUCTIONS.question, /report_questions/);
+  });
+});
+
+describe('shapedCriteria', () => {
+  const spec = (terms: string[], adrs: string[]) =>
+    ({
+      domain: {
+        terms: terms.map((term) => ({ term, definition: `${term} means it.`, avoid: '' })),
+        adrs: adrs.map((title) => ({ title, decision: 'Because.' })),
+      },
+    }) as Parameters<typeof shapedCriteria>[0];
+  const ticket = (acceptanceCriteria: string[]) => ({ title: 'T', whatToBuild: '', acceptanceCriteria, blockedBy: [] });
+
+  test('a criterion that only uses a term or ADR title still gets the documentation criterion', () => {
+    assert.deepEqual(shapedCriteria(spec(['Greeting', 'Tone'], ['Greetings are constants']), ticket(['Display the Greeting on launch', 'Stone walls stay grey', 'Greetings are constants in code'])), [
+      'Display the Greeting on launch',
+      'Stone walls stay grey',
+      'Greetings are constants in code',
+      'Write the glossary term "Greeting" (Greeting means it.) into the domain glossary',
+      'Write the glossary term "Tone" (Tone means it.) into the domain glossary',
+      'Write the ADR "Greetings are constants"',
+    ]);
+  });
+
+  test('a criterion that already asks to write that entry is not doubled', () => {
+    const own = ['Add "Greeting" to GLOSSARY.md (glossary)', 'Write ADR 0003: Greetings are constants'];
+    assert.deepEqual(shapedCriteria(spec(['Greeting'], ['Greetings are constants']), ticket(own)), own);
   });
 });

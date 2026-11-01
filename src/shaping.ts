@@ -8,10 +8,25 @@ import {
   type RunningTask,
   type TaskRuntime,
 } from '@earendil-works/pi-durable';
-import { modelRole, ROLE_TOOLS, RoleDoc, SHAPE_AGENTS, type ShapeAgent } from './agents.ts';
-import { modelFor } from './config.ts';
-import { commentMarker, type Issue, mergeLabels, progressChange } from './github.ts';
 import {
+  type GrillQuestion,
+  type GrillRound,
+  modelRole,
+  ReportsDoc,
+  ROLE_TOOLS,
+  RoleDoc,
+  SHAPE_AGENTS,
+  type ShapeAgent,
+  type ShapeSpecReport,
+  type TicketsReport,
+} from './agents.ts';
+import { modelFor } from './config.ts';
+import { commentMarker, type Issue, mergeLabels, PROGRESS_LABELS, progressChange } from './github.ts';
+import {
+  grillComment,
+  LIMIT_NOTE,
+  NO_ANSWER_NOTE,
+  shapedBody,
   shapeFailedComment,
   shapeFoundComment,
   shapeNeedsHumanComment,
@@ -19,7 +34,14 @@ import {
   shapeRefusedComment,
 } from './messages.ts';
 import type { PipelineInput, Services } from './pipeline.ts';
-import { roleInstructions, triagePrompt } from './prompts.ts';
+import {
+  answerPrompt,
+  grillPrompt,
+  roleInstructions,
+  shapeSpecPrompt,
+  ticketsPrompt,
+  triagePrompt,
+} from './prompts.ts';
 import { pinnedSkill } from './skills.ts';
 import { shapingEligibility, trustedComments } from './spec.ts';
 import { InstallError } from './workspace.ts';
@@ -28,7 +50,8 @@ import { askForReport, failureGuard, perRepo, StepFailure } from './task-kit.ts'
 /**
  * Shaping: turning a vague `agent-mode` issue into a spec and tickets, with no human answering questions. Its own
  * durable task, next to the build pipeline: prepare (eligibility, a read-only checkout), triage (the answerer runs the
- * pinned `triage` skill's checks), and fail. Only this code touches GitHub; the agents only read and report.
+ * pinned `triage` skill's checks), grill (the questioner and the answerer, in rounds), spec and tickets (the answerer
+ * synthesises), publish, and fail. Only this code touches GitHub; the agents only read and report.
  */
 
 export type ShapingInput = PipelineInput;
@@ -38,9 +61,18 @@ type Conversations = Record<ShapeAgent, ConversationId>;
 /** `issue`: the issue as the agents may see it, with only trusted authors' comments. */
 type Setup = { issue: Issue; workspace: string; conversations: Conversations };
 
+/** `rounds`: the grilling so far. `baseline`: how many reports the agent asked next had made before, so only new ones count. */
+type Grilled = Setup & { rounds: GrillRound[] };
+
 export type ShapingState =
   | { phase: 'prepare' }
   | (Setup & { phase: 'triage' })
+  | (Grilled & { phase: 'grill'; round: number; step: 'ask'; baseline: number })
+  | (Grilled & { phase: 'grill'; round: number; step: 'answer'; questions: GrillQuestion[]; baseline: number })
+  | (Grilled & { phase: 'spec'; baseline: number })
+  | (Grilled & { phase: 'tickets'; spec: ShapeSpecReport; baseline: number })
+  /** `shapedAt`: when shaping finished, fixed so a rerun writes the same body. */
+  | (Grilled & { phase: 'publish'; spec: ShapeSpecReport; tickets: TicketsReport['tickets']; shapedAt: string })
   | { phase: 'fail'; issue: number; reason: string };
 
 export type ShapingResult =
@@ -50,8 +82,10 @@ export type ShapingResult =
   | { status: 'needs_human' }
   | { status: 'already_implemented' }
   | { status: 'previously_rejected' }
-  /** Triage found nothing in the way. A placeholder until grilling, the spec and the tickets are built. */
-  | { status: 'triaged'; summary: string };
+  /** One ticket: the issue's body is the spec, and it is ready-for-agent. */
+  | { status: 'shaped'; tickets: 1 }
+  /** Several tickets. A placeholder until publishing them is built: only the Q&A comment is written. */
+  | { status: 'broken_down'; tickets: number };
 
 /** The name runs of this task are recorded under; `status` tells shaping from building by it. */
 export const SHAPING_TASK = 'phat.shape';
@@ -59,7 +93,32 @@ export const SHAPING_TASK = 'phat.shape';
 type Runtime = TaskRuntime<ShapingInput, ShapingState, ShapingResult, object>;
 type Phase<P extends ShapingState['phase']> = RunningTask<ShapingInput, Extract<ShapingState, { phase: P }>, ShapingResult>;
 
-const MARKERS = { result: commentMarker('shape'), refused: commentMarker('shape-refused') };
+const MARKERS = {
+  result: commentMarker('shape'),
+  refused: commentMarker('shape-refused'),
+  qa: commentMarker('shape-qa'),
+};
+
+/**
+ * Every decision taken with no answer from the answerer (at the round limit, or left unanswered) is an assumption,
+ * whatever the answerer wrote in the spec.
+ */
+export function withRoundAssumptions(spec: ShapeSpecReport, rounds: readonly GrillRound[]): ShapeSpecReport {
+  const decided = rounds.flatMap((round, index) =>
+    round.questions.flatMap((question, number) => {
+      const answer = round.answers[number];
+      if (answer === undefined || !(round.atLimit || answer.recommended)) return [];
+      return [
+        {
+          decision: `${question.title}: ${answer.answer}`,
+          why: `Round ${index + 1}, Q${number + 1}: ${round.atLimit ? LIMIT_NOTE : NO_ANSWER_NOTE}.`,
+          door: answer.door,
+        },
+      ];
+    }),
+  );
+  return { ...spec, assumptions: [...spec.assumptions, ...decided] };
+}
 
 /** Shaping, for every repo: each run uses the services of its own repo, as the build pipeline does. */
 export function createShaping(servicesFor: (repo: string) => Promise<Services>) {
@@ -71,6 +130,10 @@ export function createShaping(servicesFor: (repo: string) => Promise<Services>) 
     phases: {
       prepare: async (task, runtime, context) => (await phasesFor(task.input.repo)).prepare(task, runtime, context),
       triage: async (task, runtime, context) => (await phasesFor(task.input.repo)).triage(task, runtime, context),
+      grill: async (task, runtime, context) => (await phasesFor(task.input.repo)).grill(task, runtime, context),
+      spec: async (task, runtime, context) => (await phasesFor(task.input.repo)).spec(task, runtime, context),
+      tickets: async (task, runtime, context) => (await phasesFor(task.input.repo)).tickets(task, runtime, context),
+      publish: async (task, runtime, context) => (await phasesFor(task.input.repo)).publish(task, runtime, context),
       fail: async (task, runtime, context) => (await phasesFor(task.input.repo)).fail(task, runtime, context),
     },
     abort: (_task, runtime, context) =>
@@ -90,6 +153,24 @@ function repoPhases(services: Services) {
 
   const finish = (runtime: Runtime, result: ShapingResult, context: Context) =>
     runtime.commit(() => ({ status: 'terminal', outcome: { status: 'completed', result } }), context);
+
+  /** Number of reports a conversation has, read inside a transition so the baseline is stored with it. */
+  const goWithBaseline = (
+    runtime: Runtime,
+    conversation: ConversationId,
+    next: (baseline: number) => ShapingState,
+    context: Context,
+  ) =>
+    runtime.commit(
+      async (tx) => ({ status: 'running', checkpoint: next((await tx.doc(ReportsDoc, conversation)).items.length) }),
+      context,
+    );
+
+  const setupOf = ({ issue, workspace, conversations }: Setup): Setup => ({ issue, workspace, conversations });
+
+  /** Grilling is done: the answerer writes the spec next. */
+  const toSpec = (runtime: Runtime, setup: Setup, rounds: GrillRound[], context: Context) =>
+    goWithBaseline(runtime, setup.conversations.answer, (baseline) => ({ ...setupOf(setup), phase: 'spec', rounds, baseline }), context);
 
   /** Run one phase; turn a StepFailure into the `fail` phase, which reports it on the issue. */
   const guarded = failureGuard<Runtime>(logger, (runtime, issue, reason, context) =>
@@ -177,10 +258,169 @@ function repoPhases(services: Services) {
           await finish(runtime, { status: report.decision }, context);
           return;
         case 'proceed':
-          // A placeholder: grilling, the spec and the tickets come later. Nothing is written, agent-mode stays.
-          await finish(runtime, { status: 'triaged', summary: report.summary }, context);
+          await goWithBaseline(
+            runtime,
+            conversations.question,
+            (baseline) => ({ ...setupOf(task.state.checkpoint), phase: 'grill', round: 1, step: 'ask', rounds: [], baseline }),
+            context,
+          );
           return;
       }
+    }),
+
+    /**
+     * The questioner asks a round (the whole frontier), the answerer answers it, until the frontier is empty or
+     * `maxGrillRounds` rounds were asked. The last round allowed is decided with the questioner's recommendations.
+     */
+    grill: guarded<Phase<'grill'>>(async (task, runtime, context) => {
+      const state = task.state.checkpoint;
+      const { issue, conversations, rounds, round } = state;
+      const maxRounds = config.limits.maxGrillRounds;
+      if (state.step === 'ask') {
+        logger.step(issue.number, `Grilling, round ${round} of at most ${maxRounds} (${modelFor(config, 'grill').modelId})`);
+        const report = await askForReport(
+          runtime,
+          {
+            conversation: conversations.question,
+            requestId: `grill-${round}`,
+            prompt: grillPrompt({
+              issue,
+              comments: issue.comments,
+              skill: await pinnedSkill('grilling'),
+              round,
+              maxRounds,
+              previous: rounds.at(-1),
+            }),
+            baseline: state.baseline,
+            type: 'questions',
+            tool: 'report_questions',
+          },
+          context,
+        );
+        if (report === undefined) throw new StepFailure(`The questioner did not report round ${round} of grilling.`);
+        if (report.frontierEmpty || report.questions.length === 0) {
+          logger.step(issue.number, 'Grilling: the frontier is empty');
+          await toSpec(runtime, state, rounds, context);
+          return;
+        }
+        await goWithBaseline(
+          runtime,
+          conversations.answer,
+          (baseline) => ({ ...setupOf(state), phase: 'grill', round, step: 'answer', questions: report.questions, rounds, baseline }),
+          context,
+        );
+        return;
+      }
+
+      const atLimit = round >= maxRounds;
+      logger.step(issue.number, `Answering round ${round}${atLimit ? ', the last one allowed' : ''} (${modelFor(config, 'shape').modelId})`);
+      const report = await askForReport(
+        runtime,
+        {
+          conversation: conversations.answer,
+          requestId: `answer-${round}`,
+          prompt: answerPrompt(round, state.questions, atLimit),
+          baseline: state.baseline,
+          type: 'answers',
+          tool: 'report_answers',
+        },
+        context,
+      );
+      if (report === undefined) throw new StepFailure(`The answering agent did not answer round ${round} of grilling.`);
+      const answers = state.questions.map((question, index) => {
+        const answer = report.answers.find((candidate) => candidate.question === index + 1);
+        return answer !== undefined && answer.answer.trim() !== ''
+          ? { answer: answer.answer, door: answer.door, recommended: false }
+          : { answer: question.recommendation, door: question.door, recommended: true };
+      });
+      const grilled = [...rounds, { questions: state.questions, answers, atLimit }];
+      // Before moving on, so a crash here only repeats this (harmless) update.
+      await github.upsertComment(issue.number, MARKERS.qa, grillComment(issue.number, grilled));
+      if (atLimit) {
+        await toSpec(runtime, state, grilled, context);
+        return;
+      }
+      await goWithBaseline(
+        runtime,
+        conversations.question,
+        (baseline) => ({ ...setupOf(state), phase: 'grill', round: round + 1, step: 'ask', rounds: grilled, baseline }),
+        context,
+      );
+    }),
+
+    spec: guarded<Phase<'spec'>>(async (task, runtime, context) => {
+      const state = task.state.checkpoint;
+      const { issue, conversations, rounds } = state;
+      logger.step(issue.number, 'Writing the spec');
+      const [toSpecSkill, domainModeling] = await Promise.all([
+        pinnedSkill('to-spec'),
+        pinnedSkill('domain-modeling', ['GLOSSARY-FORMAT.md', 'ADR-FORMAT.md']),
+      ]);
+      const report = await askForReport(
+        runtime,
+        {
+          conversation: conversations.answer,
+          requestId: 'spec',
+          prompt: shapeSpecPrompt(toSpecSkill, domainModeling),
+          baseline: state.baseline,
+          type: 'shape_spec',
+          tool: 'report_shape_spec',
+        },
+        context,
+      );
+      if (report === undefined) throw new StepFailure('The answering agent did not report the spec.');
+      const spec = withRoundAssumptions(report, rounds);
+      await goWithBaseline(
+        runtime,
+        conversations.answer,
+        (baseline) => ({ ...setupOf(state), phase: 'tickets', rounds, spec, baseline }),
+        context,
+      );
+    }),
+
+    tickets: guarded<Phase<'tickets'>>(async (task, runtime, context) => {
+      const state = task.state.checkpoint;
+      const { issue, conversations } = state;
+      logger.step(issue.number, 'Breaking the spec into tickets');
+      const report = await askForReport(
+        runtime,
+        {
+          conversation: conversations.answer,
+          requestId: 'tickets',
+          prompt: ticketsPrompt(await pinnedSkill('to-tickets')),
+          baseline: state.baseline,
+          type: 'tickets',
+          tool: 'report_tickets',
+        },
+        context,
+      );
+      if (report === undefined) throw new StepFailure('The answering agent did not report the ticket breakdown.');
+      if (report.tickets.length === 0) throw new StepFailure('The answering agent broke the spec into no tickets at all.');
+      logger.step(issue.number, `Tickets: ${report.tickets.length}`);
+      await go(runtime, { ...setupOf(state), phase: 'publish', rounds: state.rounds, spec: state.spec, tickets: report.tickets, shapedAt: new Date().toISOString() }, context);
+    }),
+
+    publish: guarded<Phase<'publish'>>(async (task, runtime, context) => {
+      const { issue, rounds, spec, tickets, shapedAt } = task.state.checkpoint;
+      const [ticket] = tickets;
+      if (ticket === undefined || tickets.length > 1) {
+        // A placeholder until publishing several tickets is built: nothing but the Q&A comment, and agent-mode stays.
+        await finish(runtime, { status: 'broken_down', tickets: tickets.length }, context);
+        return;
+      }
+      // The body as it was when shaping began (never refetched), so a rerun after a crash still keeps the original.
+      await github.editIssueBody(issue.number, shapedBody(issue.number, spec, ticket, issue.body, shapedAt));
+      await github.upsertComment(issue.number, MARKERS.qa, grillComment(issue.number, rounds));
+      // Labels last: ready-for-agent lets a build start.
+      await github.editLabels(
+        issue.number,
+        mergeLabels(progressChange(null), {
+          add: [labels.readyForAgent, PROGRESS_LABELS.shaped.name],
+          remove: [labels.agentMode],
+        }),
+      );
+      logger.step(issue.number, `Shaped into one ticket: now ${labels.readyForAgent}`);
+      await finish(runtime, { status: 'shaped', tickets: 1 }, context);
     }),
 
     fail: async (task: Phase<'fail'>, runtime: Runtime, context: Context) => {

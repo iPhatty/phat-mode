@@ -27,8 +27,10 @@ export function describeResult(result: PipelineResult | ShapingResult, taskKind?
         return '♻️  Already implemented. phat-mode posted where it found it and moved the issue to ready-for-human.';
       case 'previously_rejected':
         return '🗂️  Rejected before (.out-of-scope/). phat-mode posted what it found and moved the issue to ready-for-human.';
-      case 'triaged':
-        return `🔎 Triage found nothing in the way: ${shaping.summary} Grilling comes in a later version; the issue keeps agent-mode.`;
+      case 'shaped':
+        return '✅ Shaped into one ticket: the issue\'s body is now the spec, and it is ready-for-agent.';
+      case 'broken_down':
+        return `🧩 Broken down into ${shaping.tickets} tickets. Publishing several tickets comes in a later version; the issue keeps agent-mode.`;
     }
   }
   const build = result as PipelineResult;

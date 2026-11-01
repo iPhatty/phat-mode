@@ -22,12 +22,21 @@ import type { Role } from './config.ts';
  */
 export type BuildAgent = 'plan' | 'implement' | 'standards' | 'spec' | 'verify';
 export const AGENTS: readonly BuildAgent[] = ['plan', 'implement', 'standards', 'spec', 'verify'];
-/** The agents that shape a vague issue. The answerer (`shape` model) decides from the codebase; read-only. */
-export type ShapeAgent = 'answer';
-export const SHAPE_AGENTS: readonly ShapeAgent[] = ['answer'];
+/**
+ * The agents that shape a vague issue, both read-only, in separate conversations: the answerer (`shape` model) decides
+ * from the codebase; the questioner (`grill` model) grills it, following the pinned `grilling` skill.
+ */
+export type ShapeAgent = 'answer' | 'question';
+export const SHAPE_AGENTS: readonly ShapeAgent[] = ['answer', 'question'];
 export type Agent = BuildAgent | ShapeAgent;
 export const modelRole = (agent: Agent): Role =>
-  agent === 'standards' || agent === 'spec' ? 'review' : agent === 'answer' ? 'shape' : agent;
+  agent === 'standards' || agent === 'spec'
+    ? 'review'
+    : agent === 'answer'
+      ? 'shape'
+      : agent === 'question'
+        ? 'grill'
+        : agent;
 
 /** Who a conversation is: stored with it, so hooks know its role and workspace, also after a restart. */
 export const RoleDoc = defineDoc<{ role: Agent | null; issue: number | null; workspace: string | null }>({
@@ -85,9 +94,53 @@ export type TriageReport = {
   reason: string;
 };
 
+export type Door = 'one-way' | 'two-way';
+
+/** One question of a grilling round, as the `grilling` skill asks it: numbered by its place, with a recommendation. */
+export type GrillQuestion = { title: string; question: string; recommendation: string; door: Door };
+
+/** The questioner's round: the whole frontier, or `frontierEmpty` when every branch is settled. */
+export type QuestionsReport = { frontierEmpty: boolean; questions: GrillQuestion[] };
+
+/** The answerer's answers to one round. `question`: 1-based, within the round. */
+export type AnswersReport = { answers: { question: number; answer: string; door: Door }[] };
+
+/**
+ * A grilling round, as the pipeline keeps it: the questions, and one answer per question, in order. `recommended`: the
+ * answerer gave none, so the questioner's recommendation was taken. `atLimit`: the last round `maxGrillRounds` allows,
+ * decided with the recommendations; its decisions are assumptions.
+ */
+export type GrillRound = {
+  questions: GrillQuestion[];
+  answers: { answer: string; door: Door; recommended: boolean }[];
+  atLimit: boolean;
+};
+
+/** The spec, in the `to-spec` sections, plus what the agents decided for the human and the domain docs it proposes. */
+export type ShapeSpecReport = {
+  problemStatement: string;
+  solution: string;
+  userStories: string[];
+  implementationDecisions: string[];
+  testingDecisions: string[];
+  outOfScope: string[];
+  furtherNotes: string;
+  assumptions: { decision: string; why: string; door: Door }[];
+  domain: { terms: { term: string; definition: string; avoid: string }[]; adrs: { title: string; decision: string }[] };
+};
+
+/** The breakdown, following `to-tickets`. `blockedBy`: 0-based indexes of other tickets in the list. */
+export type TicketsReport = {
+  tickets: { title: string; whatToBuild: string; acceptanceCriteria: string[]; blockedBy: number[] }[];
+};
+
 export type Report =
   | { type: 'plan'; data: PlanReport }
   | { type: 'triage'; data: TriageReport }
+  | { type: 'questions'; data: QuestionsReport }
+  | { type: 'answers'; data: AnswersReport }
+  | { type: 'shape_spec'; data: ShapeSpecReport }
+  | { type: 'tickets'; data: TicketsReport }
   | { type: 'done'; data: DoneReport }
   | { type: 'pr'; data: PrReport }
   | { type: 'standards'; data: StandardsReport }
@@ -166,6 +219,123 @@ export const reportTriage = defineTool({
       (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'triage', data: { ...args } as TriageReport });
     }, context);
     return recorded('Triage recorded.');
+  },
+});
+
+const doorParameter = StringEnum(['one-way', 'two-way'], {
+  description: 'two-way: cheap to walk back later. one-way: hard to reverse (data, public interfaces, deletions).',
+});
+
+export const reportQuestions = defineTool({
+  name: 'report_questions',
+  description:
+    'Report your grilling round: the whole frontier, or that it is empty. Call this exactly once, as your final action. Your turn ends when you call it.',
+  parameters: Type.Object({
+    frontierEmpty: Type.Boolean({
+      description: 'true when every branch of the design tree is settled and nothing is left to ask. questions is then empty.',
+    }),
+    questions: Type.Array(
+      Type.Object({
+        title: Type.String({ description: 'A short title for the question.' }),
+        question: Type.String({ description: 'The question, worded so "yes" accepts your recommendation. Markdown.' }),
+        recommendation: Type.String({ description: 'Your recommended answer.' }),
+        door: doorParameter,
+      }),
+      { description: 'The frontier: every question you can ask now, in order. They are numbered Q1, Q2, … by their place.' },
+    ),
+  }),
+  execute: async (args, api, context) => {
+    await api.commit(async (tx) => {
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'questions', data: { ...args } as QuestionsReport });
+    }, context);
+    return recorded('Questions recorded.');
+  },
+});
+
+export const reportAnswers = defineTool({
+  name: 'report_answers',
+  description: 'Report your answers to a grilling round. Call this exactly once, as your final action. Your turn ends when you call it.',
+  parameters: Type.Object({
+    answers: Type.Array(
+      Type.Object({
+        question: Type.Number({ description: 'The question number within the round: 1 for Q1, 2 for Q2, …' }),
+        answer: Type.String({ description: 'Your decision, and briefly why (what in the code, glossary or ADRs decided it).' }),
+        door: doorParameter,
+      }),
+      { description: 'One answer per question of the round.' },
+    ),
+  }),
+  execute: async (args, api, context) => {
+    await api.commit(async (tx) => {
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'answers', data: { ...args } as AnswersReport });
+    }, context);
+    return recorded('Answers recorded.');
+  },
+});
+
+export const reportShapeSpec = defineTool({
+  name: 'report_shape_spec',
+  description: 'Report the spec you synthesised. Call this exactly once, as your final action. Your turn ends when you call it.',
+  parameters: Type.Object({
+    problemStatement: Type.String({ description: 'Markdown: the problem, from the user\'s perspective.' }),
+    solution: Type.String({ description: 'Markdown: the solution, from the user\'s perspective.' }),
+    userStories: Type.Array(Type.String(), { description: 'Each "As an <actor>, I want a <feature>, so that <benefit>".' }),
+    implementationDecisions: Type.Array(Type.String(), { description: 'One decision per item. No file paths or code.' }),
+    testingDecisions: Type.Array(Type.String(), { description: 'One decision per item: good tests, which modules, prior art.' }),
+    outOfScope: Type.Array(Type.String(), { description: 'One item per thing that is out of scope.' }),
+    furtherNotes: Type.String({ description: 'Markdown. Empty if none.' }),
+    assumptions: Type.Array(
+      Type.Object({
+        decision: Type.String({ description: 'What was decided without a human.' }),
+        why: Type.String({ description: 'Why: what in the code, glossary or ADRs, or the recommendation taken.' }),
+        door: doorParameter,
+      }),
+      { description: 'Every decision taken on the human\'s behalf.' },
+    ),
+    domain: Type.Object({
+      terms: Type.Array(
+        Type.Object({
+          term: Type.String(),
+          definition: Type.String(),
+          avoid: Type.String({ description: 'Aliases to avoid, comma-separated. Empty if none.' }),
+        }),
+        { description: 'Proposed glossary terms. Empty if none.' },
+      ),
+      adrs: Type.Array(
+        Type.Object({ title: Type.String(), decision: Type.String({ description: 'The decision and why, in a few sentences.' }) }),
+        { description: 'Proposed ADRs. Empty if none.' },
+      ),
+    }),
+  }),
+  execute: async (args, api, context) => {
+    await api.commit(async (tx) => {
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'shape_spec', data: { ...args } as ShapeSpecReport });
+    }, context);
+    return recorded('Spec recorded.');
+  },
+});
+
+export const reportTickets = defineTool({
+  name: 'report_tickets',
+  description: 'Report the ticket breakdown. Call this exactly once, as your final action. Your turn ends when you call it.',
+  parameters: Type.Object({
+    tickets: Type.Array(
+      Type.Object({
+        title: Type.String(),
+        whatToBuild: Type.String({ description: 'Markdown: the end-to-end behaviour this slice builds.' }),
+        acceptanceCriteria: Type.Array(Type.String(), { description: 'One verifiable criterion per item.' }),
+        blockedBy: Type.Array(Type.Number(), {
+          description: '0-based indexes, in this list, of the tickets that must be done first. Empty if none.',
+        }),
+      }),
+      { description: 'The tickets, in dependency order. One ticket when the request fits in one.' },
+    ),
+  }),
+  execute: async (args, api, context) => {
+    await api.commit(async (tx) => {
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'tickets', data: { ...args } as TicketsReport });
+    }, context);
+    return recorded('Tickets recorded.');
   },
 });
 
@@ -328,7 +498,8 @@ export const tools = {
 
 /** The tools each role may use. Only the implementer can change files; shaping's agents only read and run commands. */
 export const ROLE_TOOLS: Record<Agent, ToolRegistration[]> = {
-  answer: [tools.read, tools.bash, reportTriage],
+  answer: [tools.read, tools.bash, reportTriage, reportAnswers, reportShapeSpec, reportTickets],
+  question: [tools.read, tools.bash, reportQuestions],
   plan: [tools.read, tools.bash, reportPlan],
   implement: [tools.read, tools.bash, tools.write, tools.edit, reportDone, reportPr],
   standards: [tools.read, tools.bash, reportStandards],
@@ -348,6 +519,8 @@ function describeCall(name: string, args: Record<string, unknown>): string {
   return name;
 }
 
+const isShapeAgent = (role: Agent | null | undefined) => SHAPE_AGENTS.some((agent) => agent === role);
+
 /** Blocks unsafe commands and writes outside the workspace, and logs every tool call. */
 export const Guard = defineExtension({
   name: 'phat.guard',
@@ -360,7 +533,7 @@ export const Guard = defineExtension({
         let block: string | undefined;
         if (call.name === 'bash') {
           const command = String(args.command ?? '');
-          block = bashBlockReason(command) ?? (role?.role === 'answer' ? readOnlyBashBlockReason(command) : undefined);
+          block = bashBlockReason(command) ?? (isShapeAgent(role?.role) ? readOnlyBashBlockReason(command) : undefined);
         } else if (call.name === 'read') {
           block = await readBlockReason(String(args.path ?? ''), role?.workspace ?? null);
         } else if (call.name === 'write' || call.name === 'edit') {
@@ -379,5 +552,5 @@ export const Guard = defineExtension({
 
 export const Tools: Extension = defineExtension({
   name: 'phat.tools',
-  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportTriage, reportDone, reportPr, reportStandards, reportSpec, reportVerification],
+  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportTriage, reportQuestions, reportAnswers, reportShapeSpec, reportTickets, reportDone, reportPr, reportStandards, reportSpec, reportVerification],
 });

@@ -90,10 +90,25 @@ function specFrom(source: Spec['source'], author: string, text: string, repo: st
   };
 }
 
-/** The newest Agent Brief comment by a trusted author, from where the brief starts. */
+/**
+ * When shaping rewrote an issue's body into its spec: a hidden marker in the body. Briefs from before then were
+ * written for the request as it was, not for the spec, so they no longer count; later ones (a human's amendment) do.
+ */
+export const shapedAtMarker = (at: string) => `<!-- phat-mode:shaped-at:${at} -->`;
+
+/** The time in a body's shaped-at marker, in milliseconds; undefined without a valid marker. */
+export function shapedAt(body: string): number | undefined {
+  const match = /<!-- phat-mode:shaped-at:([^ ]+) -->/.exec(body);
+  const time = match ? Date.parse(match[1]!) : Number.NaN;
+  return Number.isNaN(time) ? undefined : time;
+}
+
+/** The newest Agent Brief comment by a trusted author, from where the brief starts; none from before shaping. */
 export function findAgentBrief(issue: Issue, trusted: readonly string[], repo = ''): Spec | undefined {
+  const shaped = trusted.includes(issue.author) ? shapedAt(issue.body) : undefined;
   const comment = issue.comments
     .filter((candidate) => trusted.includes(candidate.author) && BRIEF_START.test(candidate.body))
+    .filter((candidate) => shaped === undefined || Date.parse(candidate.createdAt) > shaped)
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     .at(-1);
   if (comment === undefined) return undefined;

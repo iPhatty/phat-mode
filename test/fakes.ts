@@ -78,6 +78,12 @@ export class FakeGitHub implements GitHub {
     if (!issue) throw new Error(`no issue ${number}`);
     return structuredClone(issue);
   }
+  async editIssueBody(number: number, body: string) {
+    this.writes++;
+    const issue = this.issues.get(number);
+    if (!issue) throw new Error(`no issue ${number}`);
+    issue.body = body;
+  }
   async upsertComment(issue: number, marker: string, body: string) {
     this.writes++;
     const existing = this.comments.find((comment) => comment.issue === issue && comment.marker === marker);
