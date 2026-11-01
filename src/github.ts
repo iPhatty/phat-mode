@@ -1,4 +1,4 @@
-import type { Labels } from './config.ts';
+import { DEFAULT_LABELS, type Labels } from './config.ts';
 import { run } from './exec.ts';
 
 export type Comment = {
@@ -59,10 +59,35 @@ export const PROGRESS_LABELS = {
 export const RUN_PROGRESS = ['working', 'done', 'failed'] as const;
 export type Progress = (typeof RUN_PROGRESS)[number];
 
-/** Every label phat-mode needs on a repo: the triage labels (with `agentMode`), as named there, and its progress labels. */
-export function requiredLabels(labels: Labels): string[] {
-  return [...new Set([...Object.values(labels), ...Object.values(PROGRESS_LABELS).map((label) => label.name)])];
+/** A label as phat-mode creates it. */
+export type LabelSpec = { name: string; color: string; description: string };
+
+/** How phat-mode creates each triage label (meanings from mattpocock/skills' triage-labels.md), whatever it is named. */
+const TRIAGE_STYLES: Record<keyof Labels, Omit<LabelSpec, 'name'>> = {
+  needsTriage: { color: 'D876E3', description: 'Maintainer needs to evaluate this issue' },
+  needsInfo: { color: 'D93F0B', description: 'Waiting on reporter for more information' },
+  readyForAgent: { color: '1D76DB', description: 'Fully specified, ready for an AFK agent' },
+  readyForHuman: { color: 'C5DEF5', description: 'Requires human implementation' },
+  wontfix: { color: 'FFFFFF', description: 'Will not be actioned' },
+  agentMode: { color: 'BFD4F2', description: 'phat-mode shapes this vague issue into tickets' },
+};
+
+/**
+ * Every label phat-mode needs on a repo: the triage labels (with `agentMode`), as named there, and its progress labels.
+ * Each name once: if two roles share a name, the first one's style wins.
+ */
+export function requiredLabels(labels: Labels): LabelSpec[] {
+  const triage = (Object.keys(TRIAGE_STYLES) as (keyof Labels)[]).map((role) => ({ name: labels[role], ...TRIAGE_STYLES[role] }));
+  const byName = new Map<string, LabelSpec>();
+  for (const label of [...triage, ...Object.values(PROGRESS_LABELS)]) if (!byName.has(label.name)) byName.set(label.name, { ...label });
+  return [...byName.values()];
 }
+
+/** What `ensureLabels` did: the labels it created, and the ones it could not, with GitHub's reason. */
+export type EnsuredLabels = { created: string[]; failed: { name: string; reason: string }[] };
+
+/** The labels phat-mode knows by their default names, for creating one on the fly with its usual style. */
+const KNOWN_LABELS = new Map(requiredLabels(DEFAULT_LABELS).map((label) => [label.name, label]));
 
 /** Labels to add and remove. Removing a label that is not there is fine. */
 export type LabelChange = { add?: readonly string[]; remove?: readonly string[] };
@@ -302,11 +327,31 @@ export class GhGitHub implements GitHub {
     await this.#gh(['pr', 'comment', String(pr), '-R', this.#repo, '--body-file', '-'], body);
   }
 
-  /** Create the labels that are missing (never edit existing ones). Returns the ones it created. */
-  async ensureLabels(names: readonly string[]): Promise<string[]> {
-    const created: string[] = [];
-    for (const name of names) if (await this.#ensureLabel(name)) created.push(name);
-    return created;
+  /** Create the labels that are missing (never edit existing ones). Says which it created and which it could not. */
+  async ensureLabels(labels: readonly LabelSpec[]): Promise<EnsuredLabels> {
+    const result: EnsuredLabels = { created: [], failed: [] };
+    for (const label of labels) {
+      const outcome = await this.#createLabel(label);
+      if (outcome === 'created') result.created.push(label.name);
+      else if (outcome !== 'exists') result.failed.push({ name: label.name, reason: outcome.failed });
+    }
+    return result;
+  }
+
+  /** Create a label unless the repo has it. A label that cannot be created stays missing, so a later call tries again. */
+  async #createLabel({ name, color, description }: { name: string } & Partial<LabelSpec>): Promise<'created' | 'exists' | { failed: string }> {
+    const known = await this.#loadKnownLabels();
+    if (known.has(name)) return 'exists';
+    // Create only. Never --force: that would overwrite the colour and description someone else chose.
+    const args = ['label', 'create', name, '-R', this.#repo];
+    if (color !== undefined) args.push('--color', color);
+    if (description !== undefined) args.push('--description', description);
+    const result = await run('gh', args, { allowFailure: true });
+    const reason = (result.stderr || result.stdout).trim();
+    // Already there (the list stops at 1000 labels, or someone just made it): nothing to do.
+    if (result.code !== 0 && !/already exists/i.test(reason)) return { failed: reason || `gh exited with ${result.code}` };
+    known.add(name);
+    return result.code === 0 ? 'created' : 'exists';
   }
 
   /** Which of `names` the repo does not have. */
@@ -323,18 +368,6 @@ export class GhGitHub implements GitHub {
       this.#knownLabels = new Set(labels.map((label) => label.name));
     }
     return this.#knownLabels;
-  }
-
-  async #ensureLabel(name: string): Promise<boolean> {
-    const known = await this.#loadKnownLabels();
-    if (known.has(name)) return false;
-    // Create only. Never --force: that would overwrite the colour and description someone else chose.
-    const progress = Object.values(PROGRESS_LABELS).find((label) => label.name === name);
-    const args = ['label', 'create', name, '-R', this.#repo];
-    if (progress) args.push('--color', progress.color, '--description', progress.description);
-    const result = await run('gh', args, { allowFailure: true });
-    known.add(name);
-    return result.code === 0;
   }
 
   async openBlockers(issue: number, mentioned: readonly number[]): Promise<number[]> {
@@ -371,7 +404,8 @@ export class GhGitHub implements GitHub {
     const names = new Set(current.map((label) => label.name));
     const add = (change.add ?? []).filter((name) => !names.has(name));
     const remove = (change.remove ?? []).filter((name) => names.has(name) && !(change.add ?? []).includes(name));
-    for (const name of add) await this.#ensureLabel(name);
+    // Styled as phat-mode would on init, if it knows the name; adding the label below reports any real failure.
+    for (const name of add) await this.#createLabel(KNOWN_LABELS.get(name) ?? { name });
     if (add.length > 0) {
       await this.#gh(['api', '--method', 'POST', `repos/${this.#repo}/issues/${number}/labels`, '--input', '-'], JSON.stringify({ labels: add }));
     }

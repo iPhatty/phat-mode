@@ -298,7 +298,7 @@ async function doctor(machine: MachineConfig, repos: string[]): Promise<number> 
     });
     const { labels } = config!;
     await check(`${repo}: labels`, async () => {
-      const missing = await new GhGitHub(repo).missingLabels(requiredLabels(labels));
+      const missing = await new GhGitHub(repo).missingLabels(requiredLabels(labels).map((label) => label.name));
       if (missing.length > 0) throw new Error(`missing ${missing.join(', ')}; run \`phat-mode init\` in the repo`);
       return `all there (agent mode: \`${labels.agentMode}\`)`;
     });
@@ -382,8 +382,14 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
     console.log(`✓ Wrote ${REPO_SETTINGS_FILE}`);
   }
 
-  const created = await new GhGitHub(repo).ensureLabels(requiredLabels({ ...DEFAULT_LABELS, ...settings.labels }));
-  console.log(`✓ Labels: ${created.length > 0 ? `created ${created.join(', ')}` : 'all there'}`);
+  const labels = await new GhGitHub(repo).ensureLabels(requiredLabels({ ...DEFAULT_LABELS, ...settings.labels }));
+  if (labels.failed.length === 0) console.log(`✓ Labels: ${labels.created.length > 0 ? `created ${labels.created.join(', ')}` : 'all there'}`);
+  else {
+    if (labels.created.length > 0) console.log(`✓ Labels: created ${labels.created.join(', ')}`);
+    console.log(`✖ Could not create ${labels.failed.length === 1 ? 'a label' : 'labels'} phat-mode needs:`);
+    for (const { name, reason } of labels.failed) console.log(`  - ${name}: ${tail(reason, 300)}`);
+    console.log('  Creating labels needs write access to the repo. Create them on GitHub, or run `phat-mode init` again with access.');
+  }
 
   // The skills that make issues ready-for-agent, for the people who prepare them, and the ones that make a verify skill.
   let skillsAdded = false;
@@ -437,7 +443,7 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
   if (!published) console.log(`  - Commit ${REPO_SETTINGS_FILE} and push it to the default branch: phat-mode reads it from GitHub, not from this folder.`);
   if (skillsAdded) console.log('  - Commit the added skills, so everyone preparing issues and verification skills for phat-mode has them.');
   console.log('  - Label an issue ready-for-agent, then `phat-mode run <issue>` (or `phat-mode watch`).');
-  return checkOk ? 0 : 1;
+  return checkOk && labels.failed.length === 0 ? 0 : 1;
 }
 
 async function status(machine: MachineConfig): Promise<number> {

@@ -274,11 +274,26 @@ describe('labels', () => {
   });
 
   test('requiredLabels: the triage labels, agent-mode and every progress label, as the repo names them', () => {
-    const names = requiredLabels(DEFAULT_LABELS);
+    const names = requiredLabels(DEFAULT_LABELS).map((label) => label.name);
     for (const name of ['ready-for-agent', 'agent-mode', 'phat-mode:working', 'phat-mode:shaped']) assert.ok(names.includes(name), name);
-    const renamed = requiredLabels({ ...DEFAULT_LABELS, agentMode: 'shape-me' });
+    const renamed = requiredLabels({ ...DEFAULT_LABELS, agentMode: 'shape-me' }).map((label) => label.name);
     assert.ok(renamed.includes('shape-me'));
     assert.equal(renamed.includes('agent-mode'), false);
+  });
+
+  test('requiredLabels: every label has a colour and a description, a renamed one keeps its role’s', () => {
+    for (const label of requiredLabels(DEFAULT_LABELS)) {
+      assert.match(label.color, /^[0-9A-F]{6}$/, label.name);
+      assert.ok(label.description.length > 0 && label.description.length <= 100, label.name);
+    }
+    const ready = requiredLabels(DEFAULT_LABELS).find((label) => label.name === 'ready-for-agent')!;
+    const renamed = requiredLabels({ ...DEFAULT_LABELS, readyForAgent: 'go' }).find((label) => label.name === 'go')!;
+    assert.deepEqual({ ...renamed, name: ready.name }, ready);
+  });
+
+  test('requiredLabels: two roles given one name ask for that label once', () => {
+    const names = requiredLabels({ ...DEFAULT_LABELS, needsInfo: 'blocked', readyForHuman: 'blocked' }).map((label) => label.name);
+    assert.equal(names.filter((name) => name === 'blocked').length, 1);
   });
 
   test('mergeLabels: adding wins over removing', () => {

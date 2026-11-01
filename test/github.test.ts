@@ -33,6 +33,8 @@ else if (a === 'issue' && b === 'comment') log({ comment: c, body: stdin() });
 else if (a === 'pr' && b === 'edit') log({ edit: c, body: stdin() });
 else if (a === 'pr' && b === 'ready') log({ ready: c });
 else if (a === 'label' && b === 'list') process.stdout.write(JSON.stringify(state.labels.map((name) => ({ name }))));
+else if (a === 'label' && b === 'create' && state.labelError) { process.stderr.write(state.labelError); process.exit(1); }
+else if (a === 'label' && b === 'create') log({ label: c, color: flag('--color'), description: flag('--description') });
 else if (a === 'pr' && b === 'view') process.stdout.write(JSON.stringify(pick([state.views[c]])[0]));
 else if (a === 'pr' && b === 'merge' && state.refuse) { process.stderr.write(state.refuse); process.exit(1); }
 else if (a === 'pr' && b === 'merge') log({ merge: args.slice(2) });
@@ -53,6 +55,7 @@ async function gitHubWith(state: {
   labels?: string[];
   views?: Record<string, unknown>;
   refuse?: string;
+  labelError?: string;
 }) {
   await writeFile(
     join(dir, 'state.json'),
@@ -201,5 +204,33 @@ describe('GhGitHub, on a public repo', () => {
     const fresh = new GhGitHub('iPhatty/phat-mode');
     assert.deepEqual(await fresh.missingLabels(['ready-for-agent', 'agent-mode', 'phat-mode:shaped']), ['agent-mode', 'phat-mode:shaped']);
     assert.deepEqual(await writes(), []);
+  });
+
+  test('ensureLabels: creates only the missing ones, with their colour and description', async () => {
+    await gitHubWith({ labels: ['ready-for-agent'] });
+    const fresh = new GhGitHub('iPhatty/phat-mode');
+    const result = await fresh.ensureLabels([
+      { name: 'ready-for-agent', color: '0E8A16', description: 'Ready' },
+      { name: 'needs-info', color: 'D93F0B', description: 'Waiting on reporter' },
+    ]);
+    assert.deepEqual(result, { created: ['needs-info'], failed: [] });
+    assert.deepEqual(await writes(), [{ label: 'needs-info', color: 'D93F0B', description: 'Waiting on reporter' }]);
+  });
+
+  test('ensureLabels: a label it could not create is reported as failed, with GitHub’s reason, and still missing', async () => {
+    await gitHubWith({ labelError: 'HTTP 403: Resource not accessible by integration' });
+    const fresh = new GhGitHub('iPhatty/phat-mode');
+    const result = await fresh.ensureLabels([{ name: 'needs-info', color: 'D93F0B', description: 'Waiting on reporter' }]);
+    assert.deepEqual(result.created, []);
+    assert.deepEqual(result.failed.map((failure) => failure.name), ['needs-info']);
+    assert.match(result.failed[0]!.reason, /403/);
+    assert.deepEqual(await fresh.missingLabels(['needs-info']), ['needs-info']);
+  });
+
+  test('ensureLabels: a label that turns out to exist already (beyond the listed ones) is neither created nor failed', async () => {
+    await gitHubWith({ labelError: 'label with name "needs-info" already exists; use `--force` to update its color and description' });
+    const fresh = new GhGitHub('iPhatty/phat-mode');
+    const result = await fresh.ensureLabels([{ name: 'needs-info', color: 'D93F0B', description: 'Waiting on reporter' }]);
+    assert.deepEqual(result, { created: [], failed: [] });
   });
 });

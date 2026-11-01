@@ -41,6 +41,8 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 | `agent-mode` | you | shape this vague issue into tickets ([agent mode](#agent-mode-shaping), being built); never built itself (name configurable under `labels`) |
 | `phat-mode:shaped` | phat-mode | agent mode shaped this issue into tickets; stays on while they are built |
 
+`phat-mode init` creates any of these the repo is missing, with a colour and description, under the names in `labels`; it never changes a label that is already there. Creating labels needs write access: if it cannot, `init` names the labels and GitHub's reason, and exits 1. Run it again after renaming labels.
+
 | Outcome | Issue labels afterwards |
 |---|---|
 | PR opened | `ready-for-agent` + `phat-mode:done` (the PR gets `ready-for-human`; the issue closes when the PR merges) |
