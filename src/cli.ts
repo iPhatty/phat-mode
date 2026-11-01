@@ -20,12 +20,13 @@ import {
 import { FileCredentialStore, importPiCredential } from './credentials.ts';
 import { run, runShell } from './exec.ts';
 import { GhGitHub, requiredLabels } from './github.ts';
-import { createCopilotModels, openPhatMode, RunsDoc } from './harness.ts';
+import { createCopilotModels, openPhatMode, type RunKind, type RunResult, RunsDoc } from './harness.ts';
 import { detectCommands, installProjectSkills, readiness, settingsFile } from './init.ts';
 import { LockedError } from './lock.ts';
 import { consoleLogger, consoleLoggerFor } from './log.ts';
-import type { PipelineResult, Services } from './pipeline.ts';
+import type { Services } from './pipeline.ts';
 import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef, watchScope } from './repos.ts';
+import { describeResult, type RunRecord, runStatus } from './runs.ts';
 import { MATTPOCOCK_SKILLS, PSTACK_SKILLS, VERIFICATION_SKILLS } from './skills.ts';
 import { describeStep, nextStep } from './watch.ts';
 import { runOrWait, SETTLE_MS, waitToMerge } from './yolo.ts';
@@ -42,8 +43,9 @@ Usage:
   phat-mode init                Set up the repo in this folder: .phat-mode.json, labels, and what it is missing
   phat-mode login [--from-pi]   Sign in to GitHub Copilot (or copy the pi coding agent's login)
   phat-mode doctor [repo]       Check that everything phat-mode needs is set up
-  phat-mode run <issue>         Work on a ready-for-agent issue until a PR is open (resumes if interrupted)
-                                --yolo: then merge it once it is clean and every check passed
+  phat-mode run <issue>         Work on a ready-for-agent issue until a PR is open, or shape an agent-mode
+                                issue (resumes if interrupted)
+                                --yolo: then merge the PR once it is clean and every check passed
   phat-mode resume              Continue every run that was interrupted
   phat-mode watch [repo...]     Keep going: work on the next ready issue each time you merge a PR (Ctrl-C to stop).
                                 In a set-up repo, asks whether to watch it alone or all your repos.
@@ -83,6 +85,7 @@ function servicesFor(config: Config): Services {
       cloneDir: paths.repoClone(config),
       workspaceDir: (issue) => paths.workspace(config, issue),
       baseWorkspaceDir: paths.baseWorkspace(config),
+      shapeWorkspaceDir: (issue) => paths.shapeWorkspace(config, issue),
       installCommand: config.installCommand,
       installTimeoutMs: config.limits.installTimeoutMs,
     }),
@@ -108,23 +111,11 @@ async function open(machine: MachineConfig, configFor: (repo: string) => Promise
   return phat;
 }
 
-function describe(result: PipelineResult): string {
-  switch (result.status) {
-    case 'pr_opened':
-      return `✅ Pull request opened: ${result.url}`;
-    case 'needs_info':
-      return '❓ The spec has gaps. phat-mode posted triage notes and moved the issue to needs-info.';
-    case 'needs_human':
-      return '🧑 phat-mode decided a human should do this and moved the issue to ready-for-human.';
-    case 'ignored':
-      return `⏭️  Ignored: ${result.reason}`;
-  }
-}
-
-async function waitAndReport(phat: Awaited<ReturnType<typeof open>>, taskId: TaskId<PipelineResult>): Promise<number> {
-  const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
+async function waitAndReport(phat: Awaited<ReturnType<typeof open>>, taskId: TaskId<RunResult>): Promise<number> {
+  const settled = await phat.harness.waitForTask(taskId, context);
+  const { outcome } = settled.state;
   if (outcome.status === 'completed') {
-    console.log(`\n${describe(outcome.result)}`);
+    console.log(`\n${describeResult(outcome.result, settled.kind)}`);
     return 0;
   }
   if (outcome.status === 'failed') {
@@ -138,9 +129,9 @@ async function waitAndReport(phat: Awaited<ReturnType<typeof open>>, taskId: Tas
 /** Runs that have not finished (interrupted, or still going), by `owner/name#issue`. */
 async function liveRuns(phat: Awaited<ReturnType<typeof open>>) {
   const runs = (await phat.harness.snapshot(RunsDoc, phat.root.id, context))?.runs ?? {};
-  const live: { key: string; taskId: TaskId<PipelineResult> }[] = [];
+  const live: { key: string; taskId: TaskId<RunResult> }[] = [];
   for (const [key, list] of Object.entries(runs)) {
-    const taskId = list.at(-1)!.taskId as unknown as TaskId<PipelineResult>;
+    const taskId = list.at(-1)!.taskId as unknown as TaskId<RunResult>;
     const record = await phat.harness.getTask(taskId, context);
     if (record !== undefined && record.state.status !== 'terminal') live.push({ key, taskId });
   }
@@ -457,17 +448,8 @@ async function status(machine: MachineConfig): Promise<number> {
     if (keys.length === 0) console.log('No runs yet.');
     for (const key of keys) {
       const latest = runs[key]!.at(-1)!;
-      const record = await phat.harness.getTask(latest.taskId as unknown as TaskId<PipelineResult>, context);
-      const state = record?.state;
-      let text = 'unknown';
-      if (state?.status === 'terminal') {
-        const outcome = state.outcome;
-        text = outcome.status === 'completed' ? describe(outcome.result) : `${outcome.status}${outcome.status === 'failed' ? `: ${outcome.error.message.split('\n')[0]}` : ''}`;
-      } else if (state !== undefined) {
-        const phase = 'checkpoint' in state ? (state.checkpoint as { phase?: string }).phase : undefined;
-        text = `${state.status}${phase ? ` (${phase})` : ''}, run \`phat-mode resume\` to continue`;
-      }
-      console.log(`${key}  ${text}`);
+      const record = await phat.harness.getTask(latest.taskId as unknown as TaskId<RunResult>, context);
+      console.log(`${key}  ${runStatus(record as RunRecord | undefined)}`);
     }
   } finally {
     await phat.close(context);
@@ -555,13 +537,16 @@ async function main(argv: string[]): Promise<number> {
       const configFor = repoConfigs(machine);
       // Fail before starting if the repo is not set up, rather than inside the run.
       await configFor(repo);
-      const phat = await open(machine, configFor);
+      // An agent-mode issue is shaped, not built. A run still going is resumed whatever its kind.
+      const agentMode = (await configFor(repo)).labels.agentMode;
       const github = new GhGitHub(repo);
+      const kind: RunKind = (await github.getIssue(issue)).labels.includes(agentMode) ? 'shape' : 'build';
+      const phat = await open(machine, configFor);
       if (yolo) consoleLogger.info(YOLO_WARNING);
       const runGoing = (await liveRuns(phat)).some((run) => run.key === `${repo}#${issue}`);
       if (!yolo || (await runOrWait(github, issue, { runGoing })) === 'run') {
-        const { taskId, resumed } = await phat.start({ repo, issue }, context);
-        consoleLogger.info(`${resumed ? 'Resuming' : 'Starting'} ${repo}#${issue}`);
+        const { taskId, resumed } = await phat.start({ repo, issue }, context, kind);
+        consoleLogger.info(`${resumed ? 'Resuming' : kind === 'shape' ? 'Shaping' : 'Starting'} ${repo}#${issue}`);
         phat.harness.resume();
         const code = await waitAndReport(phat, taskId);
         const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
@@ -614,7 +599,7 @@ async function main(argv: string[]): Promise<number> {
         console.log(`No run for ${repo}#${issue}.`);
       } else {
         phat.harness.resume();
-        const taskId = list.at(-1)!.taskId as unknown as TaskId<PipelineResult>;
+        const taskId = list.at(-1)!.taskId as unknown as TaskId<RunResult>;
         console.log(`Abort ${repo}#${issue}: ${await phat.harness.abortTask(taskId, context)}`);
         await phat.harness.waitForTask(taskId, context);
       }

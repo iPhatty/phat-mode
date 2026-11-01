@@ -9,13 +9,12 @@ import {
   type TaskRuntime,
 } from '@earendil-works/pi-durable';
 import {
-  type Agent,
   AGENTS,
+  type BuildAgent,
   type DoneReport,
   modelRole,
   type PlanReport,
   type PrReport,
-  type Report,
   ReportsDoc,
   ROLE_TOOLS,
   RoleDoc,
@@ -26,8 +25,6 @@ import {
   loadCodeReviewSkill,
   mustFix,
   needsFixes,
-  type SpecReport,
-  type StandardsReport,
   standardsSources,
 } from './code-review.ts';
 import { eligibility, type ParentIssue, parentRef, type Spec } from './spec.ts';
@@ -59,7 +56,6 @@ import {
   fixChecksPrompt,
   fixReviewPrompt,
   implementPrompt,
-  NUDGE,
   planPrompt,
   describePrompt,
   fixVerificationPrompt,
@@ -68,6 +64,7 @@ import {
   standardsReviewPrompt,
   verifyPrompt,
 } from './prompts.ts';
+import { askForReport, failureGuard, perRepo, StepFailure } from './task-kit.ts';
 import { type Checks, EVIDENCE_BRANCH, tail, type Workspaces } from './workspace.ts';
 import { verdictFor, yoloMarker } from './yolo.ts';
 
@@ -81,15 +78,7 @@ export type Services = {
 
 export type PipelineInput = { repo: string; issue: number };
 
-type Conversations = Record<Agent, ConversationId>;
-type ReportData = {
-  plan: PlanReport;
-  done: DoneReport;
-  pr: PrReport;
-  standards: StandardsReport;
-  spec: SpecReport;
-  verification: VerificationReport;
-};
+type Conversations = Record<BuildAgent, ConversationId>;
 
 /** Known once the workspace is ready. `spec`: what to build, from an Agent Brief or the issue body. */
 type Setup = { issue: Issue; spec: Spec; workspace: string; conversations: Conversations };
@@ -132,9 +121,6 @@ export type PipelineResult =
 type Runtime = TaskRuntime<PipelineInput, PipelineState, PipelineResult, object>;
 type Phase<P extends PipelineState['phase']> = RunningTask<PipelineInput, Extract<PipelineState, { phase: P }>, PipelineResult>;
 
-/** A failure the pipeline reports on the issue, instead of a crash. */
-class StepFailure extends Error {}
-
 const MARKERS = { plan: commentMarker('plan'), result: commentMarker('result') };
 
 /** A parent issue is background; long specs (PRDs) are cut so they do not crowd out the issue itself. */
@@ -154,17 +140,7 @@ const axisCount = (report: AxisReport<unknown> | null) =>
  * on any number of repos. `servicesFor` is called once per repo; a failure is retried on the next phase.
  */
 export function createPipeline(servicesFor: (repo: string) => Promise<Services>) {
-  const loaded = new Map<string, Promise<RepoPhases>>();
-  const phasesFor = (repo: string) => {
-    let phases = loaded.get(repo);
-    if (phases === undefined) {
-      phases = servicesFor(repo).then(repoPhases);
-      loaded.set(repo, phases);
-      // Offline, say: try again next time rather than remembering the failure.
-      phases.catch(() => loaded.delete(repo));
-    }
-    return phases;
-  };
+  const phasesFor = perRepo(async (repo) => repoPhases(await servicesFor(repo)));
   const Pipeline = defineTask<PipelineInput, PipelineState, PipelineResult>({
     name: 'phat.pipeline',
     version: 1,
@@ -187,8 +163,6 @@ export function createPipeline(servicesFor: (repo: string) => Promise<Services>)
   const extension: Extension = defineExtension({ name: 'phat.pipeline', tasks: [Pipeline] });
   return { Pipeline, extension };
 }
-
-type RepoPhases = ReturnType<typeof repoPhases>;
 
 /** Every phase of a run, for one repo. */
 function repoPhases(services: Services) {
@@ -219,56 +193,9 @@ function repoPhases(services: Services) {
     );
 
   /** Run one phase; turn a StepFailure into the `fail` phase, which reports it on the issue. */
-  const guarded =
-    <P extends PipelineState['phase']>(body: (task: Phase<P>, runtime: Runtime, context: Context) => Promise<void>) =>
-    async (task: Phase<P>, runtime: Runtime, context: Context) => {
-      try {
-        await body(task, runtime, context);
-      } catch (error) {
-        if (!(error instanceof StepFailure) || runtime.signal.aborted) throw error;
-        logger.error(`${task.input.repo}#${task.input.issue}: ${error.message}`);
-        await go(runtime, { phase: 'fail', issue: task.input.issue, reason: error.message }, context);
-      }
-    };
-
-  /** Send one request to an agent and wait for its answer. Same request id after a restart: same request. */
-  async function ask(runtime: Runtime, conversation: ConversationId, requestId: string, content: string, context: Context) {
-    const handle = await runtime.conversation(conversation, context);
-    if (handle === undefined) throw new Error(`Conversation ${conversation} is missing`);
-    const settled = await (await handle.submit({ type: 'input', content, requestId }, context)).wait(context);
-    if (settled.status !== 'done') {
-      throw new StepFailure(`An agent stopped without answering (${settled.reason}).`);
-    }
-  }
-
-  async function latestReport<T extends Report['type']>(
-    runtime: Runtime,
-    conversation: ConversationId,
-    baseline: number,
-    type: T,
-    context: Context,
-  ): Promise<ReportData[T] | undefined> {
-    const doc = await runtime.snapshot(ReportsDoc, conversation, context);
-    const report = (doc?.items ?? [])
-      .slice(baseline)
-      .filter((item) => item.type === type)
-      .at(-1);
-    return report?.data as ReportData[T] | undefined;
-  }
-
-  /** Ask, then read the report the agent made; nudge once if it forgot to report. */
-  async function askForReport<T extends Report['type']>(
-    runtime: Runtime,
-    options: { conversation: ConversationId; requestId: string; prompt: string; baseline: number; type: T; tool: string },
-    context: Context,
-  ) {
-    const { conversation, requestId, prompt, baseline, type, tool } = options;
-    await ask(runtime, conversation, requestId, prompt, context);
-    const report = await latestReport(runtime, conversation, baseline, type, context);
-    if (report !== undefined) return report;
-    await ask(runtime, conversation, `${requestId}:nudge`, NUDGE(tool), context);
-    return latestReport(runtime, conversation, baseline, type, context);
-  }
+  const guarded = failureGuard<Runtime>(logger, (runtime, issue, reason, context) =>
+    go(runtime, { phase: 'fail', issue, reason }, context),
+  );
 
   const toImplement = (runtime: Runtime, work: Work, prompt: string, context: Context) => {
     if (work.runs >= limits.maxImplementRuns) {
@@ -357,7 +284,7 @@ function repoPhases(services: Services) {
   });
 
   return {
-      prepare: guarded<'prepare'>(async (task, runtime, context) => {
+      prepare: guarded<Phase<'prepare'>>(async (task, runtime, context) => {
         const number = task.input.issue;
         const fetched = await github.getIssue(number);
         const eligible = eligibility(fetched, config);
@@ -407,7 +334,7 @@ function repoPhases(services: Services) {
         }, context);
       }),
 
-      plan: guarded<'plan'>(async (task, runtime, context) => {
+      plan: guarded<Phase<'plan'>>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const { issue, spec } = state;
         logger.step(issue.number, `Plan (${modelFor(config, 'plan').modelId})`);
@@ -450,7 +377,7 @@ function repoPhases(services: Services) {
         await toImplement(runtime, start, implementPrompt(issue, spec, plan, scratchFor(state.workspace)), context);
       }),
 
-      implement: guarded<'implement'>(async (task, runtime, context) => {
+      implement: guarded<Phase<'implement'>>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         logger.step(state.issue.number, `Implement, run ${state.runs} (${modelFor(config, 'implement').modelId})`);
         const done = await askForReport(
@@ -468,7 +395,7 @@ function repoPhases(services: Services) {
         await go(runtime, { ...work(state), phase: 'check', done: done ?? state.done }, context);
       }),
 
-      check: guarded<'check'>(async (task, runtime, context) => {
+      check: guarded<Phase<'check'>>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const number = state.issue.number;
         if ((await workspaces.diff(state.workspace)).trim() === '') {
@@ -509,7 +436,7 @@ function repoPhases(services: Services) {
         );
       }),
 
-      review: guarded<'review'>(async (task, runtime, context) => {
+      review: guarded<Phase<'review'>>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const number = state.issue.number;
         const round = state.reviewRounds;
@@ -577,7 +504,7 @@ function repoPhases(services: Services) {
         await toImplement(runtime, work(state), fixReviewPrompt(review, config.checkCommand), context);
       }),
 
-      verify: guarded<'verify'>(async (task, runtime, context) => {
+      verify: guarded<Phase<'verify'>>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const number = state.issue.number;
         const round = state.verifyRounds;
@@ -657,7 +584,7 @@ function repoPhases(services: Services) {
         await toDescribe(runtime, state, verification, context);
       }),
 
-      describe: guarded<'describe'>(async (task, runtime, context) => {
+      describe: guarded<Phase<'describe'>>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const number = state.issue.number;
         logger.step(number, `Writing the pull request description (${modelFor(config, 'implement').modelId})`);
@@ -698,7 +625,7 @@ function repoPhases(services: Services) {
         );
       }),
 
-      publish: guarded<'publish'>(async (task, runtime, context) => {
+      publish: guarded<Phase<'publish'>>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const { issue, workspace } = state;
         const branch = branchFor(issue.number);

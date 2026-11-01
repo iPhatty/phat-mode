@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, test } from 'node:test';
-import { bashBlockReason, writeBlockReason } from '../src/guards.ts';
+import { bashBlockReason, readBlockReason, readOnlyBashBlockReason, writeBlockReason } from '../src/guards.ts';
 
 describe('bashBlockReason', () => {
   test('allows ordinary development commands', () => {
@@ -98,5 +101,53 @@ describe('writeBlockReason', () => {
   test('blocks the .git directory', () => {
     assert.match(writeBlockReason('.git/config', workspace) ?? '', /\.git/);
     assert.match(writeBlockReason('.git', workspace) ?? '', /\.git/);
+  });
+});
+
+describe('readOnlyBashBlockReason', () => {
+  test('blocks changing permissions, so a read-only checkout stays read-only', () => {
+    for (const command of ['chmod -R u+w .', 'cd src && chmod 644 a.ts', 'chown me x', '/bin/chmod u+w x', 'chflags nouchg x', 'xattr -c x']) {
+      assert.match(readOnlyBashBlockReason(command) ?? '', /read-only/, command);
+    }
+  });
+
+  test('allows reading and running commands', () => {
+    for (const command of ['npm run check', 'grep -rn chmodSync src', 'cat README.md', 'ls -la']) {
+      assert.equal(readOnlyBashBlockReason(command), undefined, command);
+    }
+  });
+});
+
+describe('readBlockReason', () => {
+  test('blocks credential folders and phat-mode’s home outside its workspaces, however the path is written', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'phat-guard-'));
+    try {
+      const home = join(dir, 'home');
+      const ws = join(home, 'workspaces', 'a__b', 'shape-1');
+      await mkdir(ws, { recursive: true });
+      await mkdir(join(dir, 'fake', '.ssh'), { recursive: true });
+      await writeFile(join(dir, 'fake', '.ssh', 'id_rsa'), 'key');
+      await writeFile(join(home, 'auth.json'), '{}');
+      await symlink(join(dir, 'fake', '.ssh', 'id_rsa'), join(ws, 'innocent.txt'));
+      await symlink(join(home, 'auth.json'), join(ws, 'notes.md'));
+      for (const path of [
+        '~/.ssh/id_rsa',
+        '/Users/x/.aws/credentials',
+        '~/.config/gh/hosts.yml',
+        '~/.pi/agent/auth.json',
+        '~/.phat-mode/auth.json',
+        '../../../auth.json',
+        join(home, 'state.sqlite'),
+        'innocent.txt',
+        'notes.md',
+      ]) {
+        assert.match((await readBlockReason(path, ws, join(dir, 'unused'))) ?? '', /credential folders/, path);
+      }
+      for (const path of ['README.md', join(ws, 'src/a.ts'), '../issue-1-scratch/notes.md', '/etc/hosts']) {
+        assert.equal(await readBlockReason(path, ws, join(dir, 'unused')), undefined, path);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

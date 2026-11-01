@@ -18,9 +18,19 @@ import { FileCredentialStore } from './credentials.ts';
 import { agentEnv } from './exec.ts';
 import { acquireLock } from './lock.ts';
 import { createPipeline, type PipelineInput, type PipelineResult, type Services } from './pipeline.ts';
+import { createShaping, type ShapingResult } from './shaping.ts';
 
-/** Every run phat-mode started, newest last per issue. Stored on the root conversation. */
-export const RunsDoc = defineDoc<{ runs: Record<string, { taskId: number; startedAt: number }[]> }>({
+/** What a run is: building an issue into a pull request, or shaping an agent-mode issue into tickets. */
+export type RunKind = 'build' | 'shape';
+
+/** What any run ends with. */
+export type RunResult = PipelineResult | ShapingResult;
+
+/**
+ * Every run phat-mode started, newest last per issue. Stored on the root conversation. `kind`: missing in records from
+ * before shaping, which were all builds.
+ */
+export const RunsDoc = defineDoc<{ runs: Record<string, { taskId: number; startedAt: number; kind?: RunKind }[]> }>({
   kind: 'phat.runs',
   version: 1,
   scope: 'conversation',
@@ -40,8 +50,11 @@ export function createCopilotModels(credentials: CredentialStore): Models {
 export type PhatMode = {
   harness: Harness;
   root: Conversation;
-  /** Start a run for an issue, or return the one still running for it. */
-  start(input: PipelineInput, context: Context): Promise<{ taskId: TaskId<PipelineResult>; resumed: boolean }>;
+  /**
+   * Start a run for an issue, or return the one still running for it, whatever its kind. `kind`: build (default) or
+   * shape.
+   */
+  start(input: PipelineInput, context: Context, kind?: RunKind): Promise<{ taskId: TaskId<RunResult>; resumed: boolean }>;
   close(context: Context): Promise<void>;
 };
 
@@ -68,10 +81,12 @@ export type Setup = {
 export async function openPhatMode(setup: Setup, context: Context, options: OpenOptions = {}): Promise<PhatMode> {
   const config = { home: setup.home };
   const { Pipeline, extension } = createPipeline(setup.servicesFor);
+  const shaping = createShaping(setup.servicesFor);
   const registry = createRegistry();
   registry.install(Tools);
   registry.install(Guard);
   registry.install(extension);
+  registry.install(shaping.extension);
 
   // Take the lock before touching the database, so a second process never resumes the same tasks.
   const lock =
@@ -105,22 +120,25 @@ export async function openPhatMode(setup: Setup, context: Context, options: Open
   }
   const opened = harness;
 
-  async function start(input: PipelineInput, context: Context) {
+  async function start(input: PipelineInput, context: Context, kind: RunKind = 'build') {
     const key = runKey(input);
     const runs = (await opened.snapshot(RunsDoc, root.id, context))?.runs[key] ?? [];
     const latest = runs.at(-1);
     if (latest !== undefined) {
-      const record = await opened.getTask(latest.taskId as unknown as TaskId<PipelineResult>, context);
+      const record = await opened.getTask(latest.taskId as unknown as TaskId<RunResult>, context);
       if (record !== undefined && record.state.status !== 'terminal') {
-        return { taskId: latest.taskId as unknown as TaskId<PipelineResult>, resumed: true };
+        return { taskId: latest.taskId as unknown as TaskId<RunResult>, resumed: true };
       }
     }
     const taskId = await root.commit(async (tx) => {
       // Background: runs for different issues never block each other or the root conversation.
-      const id = await tx.createTask(Pipeline, input, { ownership: { kind: 'conversation' }, background: true });
+      const options = { ownership: { kind: 'conversation' as const }, background: true };
+      const id = (
+        kind === 'shape' ? await tx.createTask(shaping.Shaping, input, options) : await tx.createTask(Pipeline, input, options)
+      ) as TaskId<RunResult>;
       const doc = await tx.doc(RunsDoc, root.id);
       // Assign a new list: documents track assignments, not mutations of a detached array.
-      doc.runs[key] = [...(doc.runs[key] ?? []), { taskId: id, startedAt: Date.now() }];
+      doc.runs[key] = [...(doc.runs[key] ?? []), { taskId: id, startedAt: Date.now(), kind }];
       return id;
     }, context);
     return { taskId, resumed: false };

@@ -1,5 +1,5 @@
 import type { Config } from './config.ts';
-import type { Issue } from './github.ts';
+import { type Comment, type Issue, PROGRESS_LABELS } from './github.ts';
 
 /**
  * What phat-mode builds from. mattpocock/skills makes an issue ready-for-agent in three ways:
@@ -138,4 +138,52 @@ export function eligibility(issue: Issue, config: Pick<Config, 'allowedAuthors' 
     ok: false,
     reason: `#${issue.number} was opened by ${issue.author} and has no Agent Brief from ${config.allowedAuthors.join(', ')}.`,
   };
+}
+
+export type ShapingEligibility =
+  | { ok: true }
+  /** ignored: left alone without touching GitHub. refused: phat-mode says why in a comment, and changes nothing else. */
+  | { ok: false; kind: 'ignored' | 'refused'; reason: string };
+
+/**
+ * Whether phat-mode may shape an issue, from the issue alone. Ignored without a word: closed, not labelled agent-mode,
+ * or opened by someone untrusted (strangers' text must never drive autonomous specs). Refused with a comment: already
+ * shaped (re-shaping would fight the tickets in progress), or carrying a triage state label too (conflicting
+ * instructions are never guessed at).
+ */
+export function shapingEligibility(issue: Issue, config: Pick<Config, 'allowedAuthors' | 'labels'>): ShapingEligibility {
+  const { labels } = config;
+  if (issue.state !== 'OPEN') return { ok: false, kind: 'ignored', reason: `#${issue.number} is closed.` };
+  if (!issue.labels.includes(labels.agentMode)) {
+    return { ok: false, kind: 'ignored', reason: `#${issue.number} is not labelled \`${labels.agentMode}\`.` };
+  }
+  if (!config.allowedAuthors.includes(issue.author)) {
+    return {
+      ok: false,
+      kind: 'ignored',
+      reason: `#${issue.number} was opened by ${issue.author}, not by ${config.allowedAuthors.join(', ')}: only issues by a trusted author are shaped.`,
+    };
+  }
+  if (issue.labels.includes(PROGRESS_LABELS.shaped.name)) {
+    return {
+      ok: false,
+      kind: 'refused',
+      reason: `#${issue.number} is already \`${PROGRESS_LABELS.shaped.name}\`: phat-mode does not shape an issue again.`,
+    };
+  }
+  const states = [labels.needsTriage, labels.needsInfo, labels.readyForAgent, labels.readyForHuman, labels.wontfix];
+  const conflicting = issue.labels.filter((label) => states.includes(label));
+  if (conflicting.length > 0) {
+    return {
+      ok: false,
+      kind: 'refused',
+      reason: `#${issue.number} is labelled \`${labels.agentMode}\` and also ${conflicting.map((label) => `\`${label}\``).join(', ')}: those are conflicting instructions.`,
+    };
+  }
+  return { ok: true };
+}
+
+/** Only the comments by trusted authors: anyone else's never reach an agent. */
+export function trustedComments(issue: Issue, allowedAuthors: readonly string[]): Comment[] {
+  return issue.comments.filter((comment) => allowedAuthors.includes(comment.author));
 }

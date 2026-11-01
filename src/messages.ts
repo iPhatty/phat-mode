@@ -1,4 +1,4 @@
-import type { DoneReport, PlanReport, PrReport } from './agents.ts';
+import type { DoneReport, PlanReport, PrReport, TriageReport } from './agents.ts';
 import { type AxisReport, type CodeReview, needsFixes, type SpecFinding, type StandardsFinding } from './code-review.ts';
 import type { Evidence } from './pr.ts';
 import { basename, extname } from 'node:path';
@@ -268,4 +268,93 @@ export function pullRequestBody(details: PullRequestDetails): string {
     `---\nCloses #${issue.number}\n\n🤖 Opened by phat-mode. Description written following the [pr @ ${MATTPOCOCK_SKILLS.short}](${MATTPOCOCK_SKILLS.url('pr')}) skill. A human must review and merge it.`,
   );
   return sections.join('\n\n');
+}
+
+// ─── Shaping ────────────────────────────────────────────────────────────────
+
+/** Everything shaping writes on GitHub starts with this line, so AI-written text is always marked. */
+export const shapedByLine = (issue: number) => `> *Shaped by phat-mode (AI) from #${issue}.*`;
+
+type ShapeLabels = { agentMode: string };
+
+/** Why phat-mode will not shape an issue; it changes nothing else, so a human can fix it. */
+export function shapeRefusedComment(issue: number, reason: string, labels: ShapeLabels): string {
+  return `${shapedByLine(issue)}
+
+## Not shaped
+
+${reason}
+
+phat-mode left the labels as they are and will not shape this issue until a human sorts them out. To shape it, leave only \`${labels.agentMode}\` (no triage state label, and not \`phat-mode:shaped\`).`;
+}
+
+/** The triage notes in the triage skill's format: the request is unintelligible or contradicts itself. */
+export function shapeNeedsInfoComment(
+  issue: Issue,
+  report: TriageReport,
+  labels: ShapeLabels & { needsInfo: string },
+): string {
+  return `${shapedByLine(issue.number)}
+
+## Triage Notes
+
+phat-mode tried to shape this, could not make sense of the request, and moved it to \`${labels.needsInfo}\`.
+
+**What we've established so far:**
+
+${list(report.established.length > 0 ? report.established : [report.summary])}
+
+**What we still need from you (@${issue.author}):**
+
+${list(report.questions.length > 0 ? report.questions : [report.reason || 'What exactly should this do?'])}
+
+Once these are answered, label it \`${labels.agentMode}\` again (without \`${labels.needsInfo}\`) to have it shaped.`;
+}
+
+const findingsSection = (report: TriageReport) =>
+  report.findings.trim() ? `\n\n**What phat-mode found:**\n\n${report.findings.trim()}` : '';
+
+/** A human should do it: design taste, outside access or manual testing. */
+export function shapeNeedsHumanComment(issue: number, report: TriageReport, labels: { readyForHuman: string }): string {
+  return `${shapedByLine(issue)}
+
+## Handed to a human
+
+phat-mode moved this to \`${labels.readyForHuman}\`: an agent should not shape it.
+
+**Why:** ${report.reason.trim() || report.summary}
+
+**What phat-mode understood:** ${report.summary}${findingsSection(report)}`;
+}
+
+/** Already in the codebase, or rejected before: the findings, for a human to decide. Never wontfix. */
+export function shapeFoundComment(
+  issue: number,
+  report: TriageReport,
+  labels: { readyForHuman: string; wontfix: string },
+): string {
+  const what =
+    report.decision === 'already_implemented'
+      ? 'phat-mode found that this already exists in the codebase'
+      : 'phat-mode found a similar request that was rejected before (`.out-of-scope/`)';
+  return `${shapedByLine(issue)}
+
+## ${report.decision === 'already_implemented' ? 'Already implemented' : 'Rejected before'}
+
+${what}, so it moved this to \`${labels.readyForHuman}\` instead of shaping it. Only a human closes an idea for good: close it as \`${labels.wontfix}\`, or say what is different and shape it again.
+
+**What phat-mode understood:** ${report.summary}${findingsSection(report) || `\n\n${report.reason}`}`;
+}
+
+/** Shaping failed: a human should look, as with a failed build. */
+export function shapeFailedComment(issue: number, reason: string, labels: ShapeLabels & { readyForHuman: string }): string {
+  return `${shapedByLine(issue)}
+
+## Shaping failed
+
+phat-mode could not finish shaping this issue, so it moved it to \`${labels.readyForHuman}\`.
+
+${reason}
+
+To let phat-mode try again, remove \`${labels.readyForHuman}\` and \`phat-mode:failed\`, and label it \`${labels.agentMode}\`.`;
 }
