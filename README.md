@@ -38,7 +38,7 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 |---|---|---|
 | `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` | the triage skills, and phat-mode when it hands back | the issue's triage state (names configurable under `labels`) |
 | `phat-mode:working` / `phat-mode:done` / `phat-mode:failed` | phat-mode | its own progress; one at a time |
-| `agent-mode` | you | shape this vague issue into tickets (agent mode, being built); never built itself (name configurable under `labels`) |
+| `agent-mode` | you | shape this vague issue into tickets ([agent mode](#agent-mode-shaping), being built); never built itself (name configurable under `labels`) |
 | `phat-mode:shaped` | phat-mode | agent mode shaped this issue into tickets; stays on while they are built |
 
 | Outcome | Issue labels afterwards |
@@ -49,6 +49,27 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 | Gave up (e.g. checks keep failing) | `ready-for-human` + `phat-mode:failed`, with the reason |
 
 To retry, label the issue `ready-for-agent` again and run it.
+
+## Agent mode: shaping
+
+> **Being built.** Today shaping runs triage's checks and stops there; grilling, the spec and the tickets come next.
+
+Label a vague issue you opened `agent-mode` and run `phat-mode run <issue>`: phat-mode **shapes** it, with no human answering questions. Shaping is its own durable task, next to building: it survives crashes and Ctrl-C like a build, and `status`, `resume` and `abort` cover it (`status` says `shaping: running (triage)` or `building: running (implement)`).
+
+1. **Prepare** (code): shapes only issues that are open, labelled `agent-mode`, and opened by a trusted author (`allowedAuthors`); anything else is ignored without touching GitHub. An issue that is already `phat-mode:shaped`, or also carries a triage state label (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), is refused with a comment, and its labels are left for you to sort out. Then it checks out the base branch, detached and read-only, in `workspaces/<owner>__<name>/shape-<n>`, and runs `installCommand` once.
+2. **Triage** (AI, the answerer, `shape` model): follows **phat-mode's pinned copy** of mattpocock/skills' [`triage`](skills/triage/) skill, verbatim (a copy in the repo is never used), plus phat-mode's autonomy overlay: *"the user is the answering agent. Wherever the skill asks the user to check, choose, approve or answer, ask the answering agent. Never wait for a human."* It runs triage's checks: is it already implemented (and where it looked), was something like it rejected before (`.out-of-scope/`), and for a bug, does it reproduce. It reads files and runs commands, but cannot change the checkout (no write or edit tools, and its files are read-only on disk); git, `gh` and credential folders are blocked, as for every agent.
+
+The agents get the issue body and the comments of `allowedAuthors` only; anyone else's comments never reach them.
+
+| Outcome | Labels afterwards | Comment |
+|---|---|---|
+| Unintelligible or contradicts itself | `needs-info` | triage notes in the skills' format |
+| Needs a human (design taste, outside access, manual testing) | `ready-for-human` | the reason |
+| Already implemented, or rejected before | `ready-for-human` | the findings; never `wontfix`, only you close an idea for good |
+| Failure | `ready-for-human` + `phat-mode:failed` | the reason |
+| Nothing in the way | unchanged (`agent-mode` stays) | none yet: the run ends here until grilling is built |
+
+Every way out removes `agent-mode`. Everything shaping writes starts with `> *Shaped by phat-mode (AI) from #N.*`.
 
 ## Watch
 
@@ -77,7 +98,7 @@ Each reviewer gets the skill's brief verbatim, from **phat-mode's own pinned cop
 - The **review process** belongs to phat-mode: identical on every repo, and exactly what the tests cover. The code under review cannot change how it is reviewed.
 - **What good code means** belongs to each repo: its `AGENTS.md`, `CONTRIBUTING.md` and similar, which the Standards reviewer reads. A documented repo rule overrides a baseline smell, as the skill says.
 
-Matt's skills are pinned together in `skills/`: the two phat-mode follows (`code-review`, `pr`) and the ones `init` installs into each repo (see [Setup](#setup)). To upgrade: copy the new upstream files in, update `MATTPOCOCK_SKILLS` in `src/skills.ts` and the commit in each `skills/*/README.md`, and run `npm test` (it fails if a skill's layout changed).
+Matt's skills are pinned together in `skills/`: the ones phat-mode follows (`code-review`, `pr`, and `triage` when shaping) and the ones `init` installs into each repo (see [Setup](#setup)). To upgrade: copy the new upstream files in, update `MATTPOCOCK_SKILLS` in `src/skills.ts` and the commit in each `skills/*/README.md`, and run `npm test` (it fails if a skill's layout changed).
 
 ### Evidence
 
@@ -139,9 +160,9 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 |---|---|
 | `phat-mode init` | Set up the repo in this folder. See [Setup](#setup). |
 | `phat-mode watch [repo…]` | Work through the ready issues one at a time, until Ctrl-C. See [Watch](#watch). |
-| `phat-mode run <issue>` | Work on one issue until a PR is open. Run it again to resume. |
-| `phat-mode resume` | Continue every interrupted run. |
-| `phat-mode status` | List runs (every repo) and where they are. |
+| `phat-mode run <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. |
+| `phat-mode resume` | Continue every interrupted run, building or shaping. |
+| `phat-mode status` | List runs (every repo): shaping or building, and where they are. |
 | `phat-mode abort <issue>` | Stop a run. |
 | `phat-mode doctor [repo]` | Check git, gh, the Copilot login, the models, and each repo's settings, access and labels. |
 
@@ -214,27 +235,28 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 - `phat-mode doctor` shows the model each role uses and checks it is on your Copilot account.
 - A run keeps the models it started with, also when resumed. New runs use the new config.
 
-`~/.phat-mode/` also holds the state database (`state.sqlite`, every repo's runs) and its lock, the Copilot login (`auth.json`, owner-only), and per repo the clone, workspaces (`workspaces/<owner>__<name>/issue-<n>`) and evidence.
+`~/.phat-mode/` also holds the state database (`state.sqlite`, every repo's runs) and its lock, the Copilot login (`auth.json`, owner-only), and per repo the clone, workspaces (`workspaces/<owner>__<name>/issue-<n>`, and `shape-<n>` for shaping) and evidence.
 
 ## Safety
 
-- Only `ready-for-agent` issues (a label only people with triage access can set) specified by `allowedAuthors` are worked on; others are ignored without any reply. Briefs from anyone else are ignored.
+- Only `ready-for-agent` issues (a label only people with triage access can set) specified by `allowedAuthors` are worked on, and only `agent-mode` issues opened by `allowedAuthors` are shaped; others are ignored without any reply. Briefs from anyone else are ignored.
 - Issue and brief text is treated as untrusted input in every prompt.
 - Public repos: only pull requests from branches in the repo itself count as phat-mode's (a fork's `phat-mode/issue-N` branch is ignored), and only comments posted by the `gh` user are updated as phat-mode's own.
 - Agents never touch git history or GitHub: `git push/commit/checkout/...` and `gh` are blocked. The pipeline does those itself.
-- Only the implementer can write files, and only inside its workspace (never `.git`).
-- Agent commands run without your tokens in their environment, and credential folders are blocked.
+- Only the implementer can write files, and only inside its workspace (never `.git`). Shaping's checkout is read-only on disk too (its files and folders, `node_modules` aside), and its agent may not change permissions, so commands it runs cannot change it.
+- Agent commands run without your tokens in their environment, and credential folders are blocked, for commands and for the read tool (checked where a path really leads, so symlinks and `..` do not get around it).
 - **Not a sandbox yet.** Agents run shell commands as you, on your Mac. Use it on repos and issues you trust. Containers come in a later stage.
 
 ## How it works
 
-- `src/pipeline.ts`: the durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again. Each run uses the settings and services of its own repo, so one process works on any number of repos.
+- `src/shaping.ts`: shaping, a second durable task with the same patterns (prepare, triage, fail). `src/task-kit.ts`: what both tasks share (asking an agent with a fixed request ID, reading its report, per-repo services). `src/runs.ts`: how `run` and `status` describe either kind of run.
+- `src/pipeline.ts`: the build pipeline's durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again. Each run uses the settings and services of its own repo, so one process works on any number of repos.
 - `src/config.ts` / `src/repos.ts`: your settings and each repo's `.phat-mode.json` (read from GitHub), and which repo an issue reference means. `src/init.ts`: what `phat-mode init` detects, installs and reports.
 - `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
 - `src/verify.ts`: finds the repo's verify skill, protects it, collects evidence, and decides what blocks.
 - `src/skills.ts`: the pinned mattpocock/skills version, and which skills `init` installs. `src/pr.ts`: the pr skill and evidence sources.
 - `src/code-review.ts`: reads phat-mode's pinned code-review skill, finds standards sources, and decides what must be fixed.
-- `src/agents.ts`: the four agents (planner, implementer, Standards and Spec reviewers), their tools, the report tools agents finish with, and the guard hook.
+- `src/agents.ts`: the build agents (planner, implementer, Standards and Spec reviewers, verifier) and shaping's answerer, their tools, the report tools agents finish with, and the guard hook.
 - `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code.
 - Issue comments carry hidden markers, so a rerun updates its comment instead of posting again.
 

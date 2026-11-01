@@ -259,6 +259,9 @@ export const paths = {
   repoClone: (config: Config) => join(config.home, 'repos', config.repo.replace('/', '__')),
   workspace: (config: Config, issue: number) =>
     join(config.home, 'workspaces', config.repo.replace('/', '__'), `issue-${issue}`),
+  /** The read-only checkout of the base branch that shaping's agents explore. */
+  shapeWorkspace: (config: Config, issue: number) =>
+    join(config.home, 'workspaces', config.repo.replace('/', '__'), `shape-${issue}`),
   /** The base branch checkout, for "before" evidence. */
   baseWorkspace: (config: Config) => join(config.home, 'workspaces', config.repo.replace('/', '__'), 'base'),
   /** phat-mode's copies of verification evidence, kept until published. */

@@ -1,9 +1,9 @@
 import { readFile } from 'node:fs/promises';
 
 /**
- * phat-mode follows two of mattpocock/skills' skills, pinned in skills/: `code-review` for its reviewers and `pr` for
- * the pull request description. Pinned, so they are the same on every repo and exactly what the tests cover; a copy
- * installed in the repo under review is never used. It also pins the skills people use alongside it
+ * phat-mode follows mattpocock/skills' skills, pinned in skills/: `code-review` for its reviewers, `pr` for the pull
+ * request description, and `triage` when it shapes an `agent-mode` issue. Pinned, so they are the same on every repo
+ * and exactly what the tests cover; a copy installed in the repo under review or being shaped is never used. It also pins the skills people use alongside it
  * (`PROJECT_SKILLS`), which `phat-mode init` installs into the repo. Upgrade all together: copy the new upstream files
  * into skills/, update `commit` here and in skills/<name>/README.md, and run `npm test`.
  */
@@ -28,8 +28,8 @@ export const MATTPOCOCK_SKILLS = {
  *   `code-review` need.
  * - `grilling`, `domain-modeling`: `triage` calls them to flesh an issue out.
  * - `codebase-design`, `code-review`: `tdd` calls the first for its vocabulary and leaves refactoring to the second.
- * phat-mode itself runs none of them (its reviewers use its own copy of `code-review`). The tests fail if an upgrade
- * makes one of them refer to a skill that is not here.
+ * phat-mode never uses the installed copies: its reviewers and shaping use its own pinned ones. The tests fail if an
+ * upgrade makes one of them refer to a skill that is not here.
  */
 export const PROJECT_SKILLS = [
   'setup-matt-pocock-skills',
@@ -51,3 +51,24 @@ export const readSkill = (skill: string) => readFile(new URL(`../skills/${skill}
 
 /** SKILL.md without its front matter. */
 export const skillBody = (text: string) => text.replace(/^---\n[^]*?\n---\n+/, '').trim();
+
+/** A pinned skill as an agent is given it: SKILL.md's body and the reference docs it links to, verbatim. */
+export type PinnedSkill = {
+  name: string;
+  /** e.g. `mattpocock/skills@49dd158`. */
+  source: string;
+  text: string;
+  references: { file: string; text: string }[];
+};
+
+/** Read a pinned skill from phat-mode's own skills/, never from a repo. `references`: files next to SKILL.md. */
+export async function pinnedSkill(name: string, references: readonly string[] = []): Promise<PinnedSkill> {
+  return {
+    name,
+    source: MATTPOCOCK_SKILLS.label,
+    text: skillBody(await readSkill(name)),
+    references: await Promise.all(
+      references.map(async (file) => ({ file, text: (await readFile(new URL(file, skillDir(name)), 'utf8')).trim() })),
+    ),
+  };
+}

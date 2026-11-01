@@ -3,7 +3,7 @@ import { access, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { branchFor } from './config.ts';
-import { run, runShell, type RunResult } from './exec.ts';
+import { CommandError, run, runShell, type RunResult } from './exec.ts';
 
 /** Git work for one issue. Pipeline code calls these, never the model. */
 export interface Workspaces {
@@ -21,6 +21,12 @@ export interface Workspaces {
   /** A clean checkout of the base branch, for "before" evidence. One per repository, reset on every call. */
   prepareBase(): Promise<string>;
   /**
+   * A clean, detached checkout of the base branch for shaping an issue: no branch, so it never clashes with a later
+   * build of the same issue. Reset on every call; dependencies installed once. Its files and folders are read-only
+   * (`node_modules` aside), so commands the agents run cannot change them. An `InstallError` when installing fails.
+   */
+  prepareShaping(issue: number): Promise<string>;
+  /**
    * Commit the current state locally (never pushed), so restoreSnapshot can throw away whatever an agent changes
    * afterwards. Safe to repeat.
    */
@@ -31,6 +37,13 @@ export interface Workspaces {
   undoSnapshot(workspace: string): Promise<void>;
   /** Commit files to the evidence branch and push it. Returns the commit. */
   publishEvidence(files: readonly EvidenceFile[]): Promise<string>;
+}
+
+/** The repo's install command failed: the repo's problem, not a passing one such as being offline. */
+export class InstallError extends Error {
+  constructor(command: string, cause: CommandError) {
+    super(`\`${command}\` failed (exit ${cause.result.code}):\n\n\`\`\`\n${tail(`${cause.result.stdout}\n${cause.result.stderr}`, 3000)}\n\`\`\``);
+  }
 }
 
 /** Evidence branch: verification evidence lives here, never on the pull request's branch. */
@@ -48,6 +61,8 @@ export type GitWorkspacesOptions = {
   workspaceDir: (issue: number) => string;
   /** The base branch checkout for "before" evidence. Default: next to cloneDir. */
   baseWorkspaceDir?: string;
+  /** The checkout for shaping an issue. Default: `shape-<issue>` next to the issue's workspace. */
+  shapeWorkspaceDir?: (issue: number) => string;
   installCommand?: string;
   installTimeoutMs?: number;
 };
@@ -85,7 +100,23 @@ export class GitWorkspaces implements Workspaces {
 
   async #install(workspace: string): Promise<void> {
     const { installCommand, installTimeoutMs } = this.#options;
-    if (installCommand !== undefined) await runShell(installCommand, { cwd: workspace, timeoutMs: installTimeoutMs });
+    if (installCommand === undefined) return;
+    try {
+      await runShell(installCommand, { cwd: workspace, timeoutMs: installTimeoutMs });
+    } catch (error) {
+      if (error instanceof CommandError) throw new InstallError(installCommand, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Make the checkout's own files and folders read-only, or writable again. `node_modules` keeps its permissions, so
+   * tools may still write their caches there; `.git` (a file pointing into the clone) is left alone.
+   */
+  async #setReadOnly(dir: string, readOnly: boolean): Promise<void> {
+    if (!(await exists(dir))) return;
+    const skip = ['-path', join(dir, 'node_modules'), '-prune', '-o', '-path', join(dir, '.git'), '-prune', '-o'];
+    await run('find', [dir, ...skip, '-exec', 'chmod', readOnly ? 'a-w' : 'u+w', '{}', '+']);
   }
 
   get #baseDir() {
@@ -93,8 +124,22 @@ export class GitWorkspaces implements Workspaces {
   }
 
   async prepareBase(): Promise<string> {
+    return this.#detachedCheckout(this.#baseDir);
+  }
+
+  async prepareShaping(issue: number): Promise<string> {
+    const { shapeWorkspaceDir, workspaceDir } = this.#options;
+    const dir = shapeWorkspaceDir?.(issue) ?? join(dirname(workspaceDir(issue)), `shape-${issue}`);
+    // Writable while it is reset and installed, read-only for the agents.
+    await this.#setReadOnly(dir, false);
+    await this.#detachedCheckout(dir);
+    await this.#setReadOnly(dir, true);
+    return dir;
+  }
+
+  /** A clean, detached checkout of the base branch in `baseDir`, reset if it is there; installs when needed. */
+  async #detachedCheckout(baseDir: string): Promise<string> {
     const cloneDir = await this.#ensureClone();
-    const baseDir = this.#baseDir;
     let reinstall = !(await exists(join(baseDir, 'node_modules')));
     if (!(await exists(join(baseDir, '.git')))) {
       await mkdir(dirname(baseDir), { recursive: true });

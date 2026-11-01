@@ -9,7 +9,7 @@ import {
   ToolTask,
 } from '@earendil-works/pi-durable';
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools';
-import { bashBlockReason, writeBlockReason } from './guards.ts';
+import { bashBlockReason, readBlockReason, readOnlyBashBlockReason, writeBlockReason } from './guards.ts';
 import { consoleLogger, type Logger, oneLine } from './log.ts';
 
 import type { SpecReport, StandardsReport } from './code-review.ts';
@@ -17,12 +17,17 @@ import type { VerificationReport } from './verify.ts';
 import type { Role } from './config.ts';
 
 /**
- * The agents of one issue. The two reviewers follow mattpocock/skills' code-review skill, one per axis, and both use
- * the `review` model.
+ * The agents that build one issue. The two reviewers follow mattpocock/skills' code-review skill, one per axis, and
+ * both use the `review` model.
  */
-export type Agent = 'plan' | 'implement' | 'standards' | 'spec' | 'verify';
-export const AGENTS: readonly Agent[] = ['plan', 'implement', 'standards', 'spec', 'verify'];
-export const modelRole = (agent: Agent): Role => (agent === 'standards' || agent === 'spec' ? 'review' : agent);
+export type BuildAgent = 'plan' | 'implement' | 'standards' | 'spec' | 'verify';
+export const AGENTS: readonly BuildAgent[] = ['plan', 'implement', 'standards', 'spec', 'verify'];
+/** The agents that shape a vague issue. The answerer (`shape` model) decides from the codebase; read-only. */
+export type ShapeAgent = 'answer';
+export const SHAPE_AGENTS: readonly ShapeAgent[] = ['answer'];
+export type Agent = BuildAgent | ShapeAgent;
+export const modelRole = (agent: Agent): Role =>
+  agent === 'standards' || agent === 'spec' ? 'review' : agent === 'answer' ? 'shape' : agent;
 
 /** Who a conversation is: stored with it, so hooks know its role and workspace, also after a restart. */
 export const RoleDoc = defineDoc<{ role: Agent | null; issue: number | null; workspace: string | null }>({
@@ -62,13 +67,35 @@ export type PrReport = {
   blastNote: string;
 };
 
+/** The answerer's triage checks, following the pinned `triage` skill: redundancy, prior rejection, reproduction. */
+export type TriageReport = {
+  /**
+   * proceed: nothing in the way; shape it. needs_info: unintelligible or contradicts itself. needs_human: needs design
+   * taste, outside access or manual testing. already_implemented / previously_rejected: found in the code, or in
+   * `.out-of-scope/`.
+   */
+  decision: 'proceed' | 'needs_info' | 'needs_human' | 'already_implemented' | 'previously_rejected';
+  summary: string;
+  /** Where it looked and what it found; for a bug, whether it reproduced. */
+  findings: string;
+  /** For needs_info: what is already clear, for the triage notes. */
+  established: string[];
+  questions: string[];
+  /** For needs_human: why. */
+  reason: string;
+};
+
 export type Report =
   | { type: 'plan'; data: PlanReport }
+  | { type: 'triage'; data: TriageReport }
   | { type: 'done'; data: DoneReport }
   | { type: 'pr'; data: PrReport }
   | { type: 'standards'; data: StandardsReport }
   | { type: 'spec'; data: SpecReport }
   | { type: 'verification'; data: VerificationReport };
+
+/** Each report's data, by its type. */
+export type ReportData = { [T in Report['type']]: Extract<Report, { type: T }>['data'] };
 
 /** Reports an agent made, in order. The pipeline reads the ones after a baseline it stored before asking. */
 export const ReportsDoc = defineDoc<{ items: Report[] }>({
@@ -108,6 +135,37 @@ export const reportPlan = defineTool({
       (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'plan', data: { ...args } as PlanReport });
     }, context);
     return recorded('Plan recorded.');
+  },
+});
+
+export const reportTriage = defineTool({
+  name: 'report_triage',
+  description:
+    'Report the result of the triage checks. Call this exactly once, as your final action. Your turn ends when you call it.',
+  parameters: Type.Object({
+    decision: StringEnum(['proceed', 'needs_info', 'needs_human', 'already_implemented', 'previously_rejected'], {
+      description:
+        'proceed: nothing stands in the way of shaping it. needs_info: the request is unintelligible or contradicts itself. ' +
+        'needs_human: it needs design taste, outside access or manual testing an agent cannot do. ' +
+        'already_implemented: the behaviour already exists in the codebase. ' +
+        'previously_rejected: a similar request was rejected before (.out-of-scope/).',
+    }),
+    summary: Type.String({ description: 'One or two sentences: what is being asked for, in your own words.' }),
+    findings: Type.String({
+      description:
+        'Markdown: where you looked and what you found (redundancy search, .out-of-scope/, and for a bug whether it reproduced, with the code path). For already_implemented: where it lives. For previously_rejected: the .out-of-scope/ file and why it matches.',
+    }),
+    established: Type.Array(Type.String(), { description: 'For needs_info: what is already clear. Empty otherwise.' }),
+    questions: Type.Array(Type.String(), {
+      description: 'For needs_info: specific, actionable questions for the author. Empty otherwise.',
+    }),
+    reason: Type.String({ description: 'For needs_human: why a human should do this. Empty otherwise.' }),
+  }),
+  execute: async (args, api, context) => {
+    await api.commit(async (tx) => {
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'triage', data: { ...args } as TriageReport });
+    }, context);
+    return recorded('Triage recorded.');
   },
 });
 
@@ -268,8 +326,9 @@ export const tools = {
   edit: createEditTool(),
 };
 
-/** The tools each role may use. Only the implementer can change files. */
+/** The tools each role may use. Only the implementer can change files; shaping's agents only read and run commands. */
 export const ROLE_TOOLS: Record<Agent, ToolRegistration[]> = {
+  answer: [tools.read, tools.bash, reportTriage],
   plan: [tools.read, tools.bash, reportPlan],
   implement: [tools.read, tools.bash, tools.write, tools.edit, reportDone, reportPr],
   standards: [tools.read, tools.bash, reportStandards],
@@ -300,7 +359,10 @@ export const Guard = defineExtension({
         const label = role?.role ?? '?';
         let block: string | undefined;
         if (call.name === 'bash') {
-          block = bashBlockReason(String(args.command ?? ''));
+          const command = String(args.command ?? '');
+          block = bashBlockReason(command) ?? (role?.role === 'answer' ? readOnlyBashBlockReason(command) : undefined);
+        } else if (call.name === 'read') {
+          block = await readBlockReason(String(args.path ?? ''), role?.workspace ?? null);
         } else if (call.name === 'write' || call.name === 'edit') {
           if (role?.role !== 'implement' || role.workspace === null) {
             block = 'Blocked: only the implementer may change files.';
@@ -317,5 +379,5 @@ export const Guard = defineExtension({
 
 export const Tools: Extension = defineExtension({
   name: 'phat.tools',
-  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportDone, reportPr, reportStandards, reportSpec, reportVerification],
+  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportTriage, reportDone, reportPr, reportStandards, reportSpec, reportVerification],
 });

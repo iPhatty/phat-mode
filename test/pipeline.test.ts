@@ -1,48 +1,24 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { after, describe, test } from 'node:test';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { describe, test } from 'node:test';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import type { ToolResultMessage } from '@earendil-works/pi-ai';
-import { createModels } from '@earendil-works/pi-ai/models';
-import {
-  type FauxResponseFactory,
-  type FauxResponseStep,
-  fauxAssistantMessage,
-  fauxProvider,
-  fauxToolCall,
-} from '@earendil-works/pi-ai/providers/faux';
-import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
+import { type FauxResponseFactory, type FauxResponseStep, fauxAssistantMessage } from '@earendil-works/pi-ai/providers/faux';
 import { setToolLogger } from '../src/agents.ts';
-import { branchFor, type Config, paths } from '../src/config.ts';
+import { paths } from '../src/config.ts';
 import { run } from '../src/exec.ts';
-import { FakeGitHub, testConfig } from './fakes.ts';
-import { openPhatMode, RunsDoc } from '../src/harness.ts';
+import { call, expectLast, fixture, textOf } from './fixture.ts';
+import { type RunResult, RunsDoc } from '../src/harness.ts';
 import { LockedError } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
 import type { SpecFinding, StandardsFinding } from '../src/code-review.ts';
 import type { PipelineResult, Services } from '../src/pipeline.ts';
-import { type CheckResult, type Checks, GitWorkspaces } from '../src/workspace.ts';
 
 const context = BACKGROUND_CONTEXT;
 setToolLogger(silentLogger);
 
-// ─── Fakes ──────────────────────────────────────────────────────────────────
-
-class FakeChecks implements Checks {
-  results: CheckResult[] = [];
-  runs = 0;
-  async run(): Promise<CheckResult> {
-    this.runs++;
-    return this.results.shift() ?? { passed: true, output: 'all good' };
-  }
-}
-
 // ─── Scripted model ─────────────────────────────────────────────────────────
-
-const call = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
-  fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' });
 const plan = (decision = 'proceed', extra: { questions?: string[]; established?: string[]; reason?: string; notes?: string } = {}) =>
   call('report_plan', {
     decision,
@@ -72,17 +48,6 @@ A hello.txt file says hello.
 - Translating the greeting`;
 const write = (path: string, content: string) => call('write', { path, content });
 const done = () => call('report_done', { summary: 'Added hello.txt.', testing: 'Ran the checks.' });
-
-/** A response that first checks what the agent just saw: the last message of the request. */
-const expectLast = (check: (message: ToolResultMessage | { role: string; content: unknown }) => void, then: FauxResponseStep): FauxResponseFactory =>
-  (request, options, state, model) => {
-    check(request.messages.at(-1) as ToolResultMessage);
-    return typeof then === 'function' ? then(request, options, state, model) : then;
-  };
-const textOf = (message: { content: unknown }) =>
-  typeof message.content === 'string'
-    ? message.content
-    : (message.content as { type: string; text?: string }[]).map((part) => part.text ?? '').join('');
 
 /** The implementer's pull request description, following the pr skill. */
 const describePr = (fields: Partial<Record<string, unknown>> = {}) =>
@@ -153,87 +118,9 @@ const verificationReport = (features: VerifyFeature[], extra: Record<string, unk
     couldNotRun: '',
     ...extra,
   });
-
-// ─── Fixture ────────────────────────────────────────────────────────────────
-
-const temp: string[] = [];
-after(async () => {
-  for (const dir of temp) await rm(dir, { recursive: true, force: true });
-});
-
-/** `files`: extra files committed to the repo's main branch. */
-async function fixture(files: Record<string, string> = {}, repo = 'test/repo') {
-  const dir = await mkdtemp(join(tmpdir(), 'phat-pipeline-'));
-  temp.push(dir);
-  // A local "GitHub" repository with one commit on main.
-  const remote = join(dir, 'remote.git');
-  const seed = join(dir, 'seed');
-  await run('git', ['init', '--bare', '-b', 'main', remote]);
-  await run('git', ['init', '-b', 'main', seed]);
-  await writeFile(join(seed, 'README.md'), '# test\n');
-  for (const [file, content] of Object.entries(files)) {
-    await mkdir(dirname(join(seed, file)), { recursive: true });
-    await writeFile(join(seed, file), content);
-  }
-  const git = (args: string[], cwd = seed) =>
-    run('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd });
-  await git(['add', '.']);
-  await git(['commit', '-m', 'init']);
-  await git(['push', remote, 'main']);
-
-  const config: Config = {
-    ...testConfig(join(dir, 'home'), repo),
-    defaultModel: { provider: 'faux', modelId: 'faux-1', thinkingLevel: 'medium' },
-    models: {},
-  };
-  const github = new FakeGitHub();
-  const checks = new FakeChecks();
-  const services: Services = {
-    config,
-    github,
-    checks,
-    logger: silentLogger,
-    workspaces: new GitWorkspaces({
-      remoteUrl: remote,
-      baseBranch: 'main',
-      cloneDir: paths.repoClone(config),
-      workspaceDir: (issue) => paths.workspace(config, issue),
-      baseWorkspaceDir: paths.baseWorkspace(config),
-    }),
-  };
-  // Commits in the workspace need an identity; the real CLI uses the user's git config.
-  process.env.GIT_AUTHOR_NAME = process.env.GIT_COMMITTER_NAME = 'phat-mode-test';
-  process.env.GIT_AUTHOR_EMAIL = process.env.GIT_COMMITTER_EMAIL = 'test@example.com';
-
-  /** `servicesFor`: for runs on other repos too; by default, every run is on this one. */
-  const open = async (responses: FauxResponseStep[], servicesFor = async (_repo: string) => services) => {
-    const faux = fauxProvider({ models: [{ id: 'faux-1' }] });
-    faux.setResponses(responses);
-    const models = createModels();
-    models.setProvider(faux.provider);
-    const storage = () => openNodeSqliteStorage(join(dir, 'state.sqlite'));
-    const phat = await openPhatMode({ home: config.home, servicesFor }, context, { storage, models });
-    return { phat, faux };
-  };
-
-  const runIssue = async (issue: number, responses: FauxResponseStep[]) => {
-    const { phat, faux } = await open(responses);
-    const { taskId } = await phat.start({ repo: config.repo, issue }, context);
-    phat.harness.resume();
-    const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
-    await phat.close(context);
-    return { outcome, faux };
-  };
-
-  const remoteFile = async (issue: number, file: string) =>
-    (await run('git', ['--git-dir', remote, 'show', `${branchFor(issue)}:${file}`])).stdout;
-
-  return { config, services, github, checks, open, runIssue, remoteFile, remote };
-}
-
-const result = (outcome: { status: string; result?: PipelineResult }) => {
+const result = (outcome: { status: string; result?: RunResult }) => {
   assert.equal(outcome.status, 'completed', JSON.stringify(outcome));
-  return outcome.result!;
+  return outcome.result as PipelineResult;
 };
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

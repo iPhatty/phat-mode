@@ -5,7 +5,16 @@ import { describe, test } from 'node:test';
 import { testConfig } from './fakes.ts';
 import { type Issue, mergeLabels, progressChange, requiredLabels } from '../src/github.ts';
 import { DEFAULT_LABELS } from '../src/config.ts';
-import { blockedBy, eligibility, findAgentBrief, findSpec, listUnder, parentRef } from '../src/spec.ts';
+import {
+  blockedBy,
+  eligibility,
+  findAgentBrief,
+  findSpec,
+  listUnder,
+  parentRef,
+  shapingEligibility,
+  trustedComments,
+} from '../src/spec.ts';
 
 const fixture = (name: string) => readFile(join(import.meta.dirname, 'fixtures', name), 'utf8');
 
@@ -204,6 +213,50 @@ describe('eligibility', () => {
     const custom = { ...config, labels: { ...config.labels, agentMode: 'shape-me' } };
     assert.equal(eligibility(issue({ labels: ['ready-for-agent', 'shape-me'] }), custom).ok, false);
     assert.equal(eligibility(issue({ labels: ['ready-for-agent', 'agent-mode'] }), custom).ok, true);
+  });
+});
+
+describe('shapingEligibility', () => {
+  const shape = (fields: Partial<Issue> = {}) => issue({ labels: ['agent-mode', 'enhancement'], ...fields });
+
+  test('open, agent-mode, by a trusted author, no triage state label, not shaped: yes', () => {
+    assert.deepEqual(shapingEligibility(shape(), config), { ok: true });
+  });
+
+  test('closed, not agent-mode, or untrusted: ignored, without a word', () => {
+    for (const fields of [{ state: 'CLOSED' as const }, { labels: ['enhancement'] }, { author: 'stranger' }]) {
+      const result = shapingEligibility(shape(fields), config);
+      assert.equal(!result.ok && result.kind, 'ignored', JSON.stringify(fields));
+    }
+  });
+
+  test('an untrusted author is ignored even when the labels conflict', () => {
+    const result = shapingEligibility(shape({ author: 'stranger', labels: ['agent-mode', 'ready-for-agent'] }), config);
+    assert.equal(!result.ok && result.kind, 'ignored');
+  });
+
+  test('already shaped, or a triage state label too: refused, naming the conflict', () => {
+    const shaped = shapingEligibility(shape({ labels: ['agent-mode', 'phat-mode:shaped'] }), config);
+    assert.equal(!shaped.ok && shaped.kind, 'refused');
+    assert.match(shaped.ok ? '' : shaped.reason, /already `phat-mode:shaped`/);
+    for (const label of ['needs-triage', 'needs-info', 'ready-for-agent', 'ready-for-human', 'wontfix']) {
+      const result = shapingEligibility(shape({ labels: ['agent-mode', label] }), config);
+      assert.equal(!result.ok && result.kind, 'refused', label);
+      assert.match(result.ok ? '' : result.reason, new RegExp(`\`${label}\``));
+    }
+  });
+
+  test('follows the configured label names', () => {
+    const custom = { ...config, labels: { ...config.labels, agentMode: 'shape-me', readyForAgent: 'agent:ready' } };
+    assert.equal(shapingEligibility(shape({ labels: ['shape-me'] }), custom).ok, true);
+    assert.equal(shapingEligibility(shape({ labels: ['agent-mode'] }), custom).ok, false);
+    assert.equal(shapingEligibility(shape({ labels: ['shape-me', 'ready-for-agent'] }), custom).ok, true);
+    assert.equal(shapingEligibility(shape({ labels: ['shape-me', 'agent:ready'] }), custom).ok, false);
+  });
+
+  test('trustedComments keeps only comments by allowed authors', () => {
+    const comments = trustedComments(issue({ comments: [comment('stranger', 'hi'), comment('iPhatty', 'yo')] }), ['iPhatty']);
+    assert.deepEqual(comments.map((c) => c.author), ['iPhatty']);
   });
 });
 

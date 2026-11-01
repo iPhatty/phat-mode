@@ -1,4 +1,7 @@
-import { isAbsolute, relative, resolve } from 'node:path';
+import { realpath } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import { DEFAULT_HOME } from './config.ts';
 import { isProtectedSkillPath } from './verify.ts';
 
 /**
@@ -78,6 +81,44 @@ export function writeBlockReason(path: string, workspace: string): string | unde
   }
   if (isProtectedSkillPath(inside)) {
     return `Blocked: ${inside} is part of the repo's verification skill, which only humans change (via /maintain-verification-skill). You may update its features/ files when you change behaviour on purpose.`;
+  }
+  return undefined;
+}
+
+/** Commands that change permissions: a read-only agent could use them to make its read-only checkout writable again. */
+const PERMISSION_CHANGE = /(^|[\s;&|(`$/])(chmod|chown|chgrp|chflags|chattr|setfacl|xattr)(\s|$)/;
+
+/** Why a read-only agent (shaping's) may not run a command, beyond what blocks every agent. */
+export function readOnlyBashBlockReason(command: string): string | undefined {
+  if (PERMISSION_CHANGE.test(command)) return 'Blocked: this checkout is read-only; changing permissions is not allowed.';
+  return undefined;
+}
+
+/** Credential folders, by path: the same ones bash commands may not name. */
+const CREDENTIAL_PATH = /(^|\/)\.(ssh|aws|pi\/agent)(\/|$)|(^|\/)\.config\/gh(\/|$)/;
+
+/**
+ * Why reading `path` is not allowed: a credential folder, or phat-mode's home (credentials and state) outside its
+ * workspaces. Checked on the path as given (`~` expanded, relative to `workspace`) and on where it really leads, so a
+ * symlink or `..` cannot get around it. phat-mode's home is the default one, and the one the workspace lives in
+ * (`<home>/workspaces/<repo>/<dir>`).
+ */
+export async function readBlockReason(path: string, workspace: string | null, home = DEFAULT_HOME): Promise<string | undefined> {
+  const expanded = path === '~' || path.startsWith('~/') ? join(homedir(), path.slice(1)) : path;
+  const target = resolve(workspace ?? process.cwd(), expanded);
+  const real = await realpath(target).catch(() => target);
+  const homes = [home, workspace?.match(/^(.*)\/workspaces\/[^/]+\/[^/]+\/?$/)?.[1]].filter((dir): dir is string => !!dir);
+  for (const candidate of new Set([target, real])) {
+    if (CREDENTIAL_PATH.test(candidate)) return 'Blocked: reading credential folders is not allowed.';
+    for (const dir of homes) {
+      for (const root of new Set([resolve(dir), await realpath(dir).catch(() => resolve(dir))])) {
+        const inside = relative(root, candidate);
+        const inHome = inside === '' || !(inside.startsWith('..') || isAbsolute(inside));
+        const inWorkspaces = inside === 'workspaces' || inside.startsWith(`workspaces/`);
+        if (inHome && !inWorkspaces) return 'Blocked: reading credential folders is not allowed.';
+      }
+    }
+    if (phatModeHomeBlocked(candidate)) return 'Blocked: reading credential folders is not allowed.';
   }
   return undefined;
 }
