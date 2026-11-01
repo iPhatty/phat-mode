@@ -28,9 +28,12 @@ export function describeResult(result: PipelineResult | ShapingResult, taskKind?
       case 'previously_rejected':
         return '🗂️  Rejected before (.out-of-scope/). phat-mode posted what it found and moved the issue to ready-for-human.';
       case 'shaped':
-        return '✅ Shaped into one ticket: the issue\'s body is now the spec, and it is ready-for-agent.';
-      case 'broken_down':
-        return `🧩 Broken down into ${shaping.tickets} tickets. Publishing several tickets comes in a later version; the issue keeps agent-mode.`;
+        if (shaping.tickets === 1) return '✅ Shaped into one ticket: the issue\'s body is now the spec, and it is ready-for-agent.';
+        return `✅ Shaped into ${shaping.tickets} tickets${
+          shaping.numbers && shaping.numbers.length > 0 ? ` (${shaping.numbers.map((n) => `#${n}`).join(', ')})` : ''
+        }, each ready-for-agent; the issue is phat-mode:shaped.`;
+      case 'too_big':
+        return `🐘 Too big: ${shaping.tickets} tickets, more than limits.maxTickets. phat-mode posted the draft breakdown and moved the issue to ready-for-human.`;
     }
   }
   const build = result as PipelineResult;

@@ -21,7 +21,21 @@ const pick = (items) => {
 };
 const stdin = () => fs.readFileSync(0, 'utf8');
 const [a, b, c] = args;
+const path = args.find((arg) => arg.startsWith('repos/')) ?? '';
 if (a === 'api' && b === 'user') process.stdout.write(state.viewer + '\\n');
+else if (a === 'api' && args.includes('--slurp') && path.includes('/issues?')) {
+  log({ list: path });
+  process.stdout.write(JSON.stringify([state.issues]));
+} else if (a === 'api' && flag('--method') === 'POST' && path.endsWith('/issues')) {
+  log({ create: JSON.parse(stdin()), jq: flag('--jq') });
+  process.stdout.write(state.nextNumber + '\\n');
+} else if (a === 'api' && flag('--method') === 'POST' && args.includes('-F')) log({ post: path, field: args[args.indexOf('-F') + 1] });
+else if (a === 'api' && path.endsWith('/parent')) {
+  const parent = state.parents[path.split('/')[4]];
+  if (parent === undefined) { process.stderr.write('HTTP 404: Not Found'); process.exit(1); }
+  process.stdout.write(parent + '\\n');
+} else if (a === 'api' && path.endsWith('/dependencies/blocked_by')) process.stdout.write(JSON.stringify(state.blockedBy[path.split('/')[4]] ?? []));
+else if (a === 'api' && /\\/issues\\/\\d+$/.test(path) && flag('--jq') === '.id') process.stdout.write(state.ids[path.split('/')[4]] + '\\n');
 else if (a === 'pr' && b === 'list') {
   // Like GitHub, --head matches the branch name, whichever repo the branch is in.
   const status = flag('--state');
@@ -44,6 +58,7 @@ else { process.stderr.write('fake gh: unexpected ' + args.join(' ')); process.ex
 `;
 
 type FakePr = { number: number; url: string; isDraft: boolean; headRefName: string; state: string; isCrossRepository: boolean };
+type FakeIssue = { number: number; body: string | null; user: { login: string } | null; pull_request?: object };
 type FakeComment = { id: number; body: string; user: { login: string } | null };
 
 let dir: string;
@@ -57,10 +72,15 @@ async function gitHubWith(state: {
   views?: Record<string, unknown>;
   refuse?: string;
   labelError?: string;
+  issues?: FakeIssue[];
+  nextNumber?: number;
+  ids?: Record<string, number>;
+  parents?: Record<string, number>;
+  blockedBy?: Record<string, { number: number; state: string }[]>;
 }) {
   await writeFile(
     join(dir, 'state.json'),
-    JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], views: {}, ...state }),
+    JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], views: {}, issues: [], ids: {}, parents: {}, blockedBy: {}, ...state }),
   );
   await writeFile(join(dir, 'log.jsonl'), '');
 }
@@ -240,5 +260,50 @@ describe('GhGitHub, on a public repo', () => {
     const fresh = new GhGitHub('iPhatty/phat-mode');
     const result = await fresh.ensureLabels([{ name: 'needs-info', color: 'D93F0B', description: 'Waiting on reporter' }]);
     assert.deepEqual(result, { created: [], failed: [] });
+  });
+
+  test('createIssue sends the title and body, and returns the new number', async () => {
+    await gitHubWith({ nextNumber: 31 });
+    assert.equal(await github.createIssue({ title: 'Store greetings', body: '## Parent\n\n#30' }), 31);
+    assert.deepEqual(await writes(), [{ create: { title: 'Store greetings', body: '## Parent\n\n#30' }, jq: '.number' }]);
+  });
+
+  test('findIssueByMarker: only issues opened by the gh user, never a stranger’s or a pull request', async () => {
+    const marker = '<!-- phat-mode:ticket:30:0 -->';
+    await gitHubWith({
+      issues: [
+        { number: 40, body: `${marker}\nforged`, user: { login: 'mallory' } },
+        { number: 41, body: `${marker}\nmine, but a PR`, user: { login: 'iPhatty' }, pull_request: {} },
+        { number: 42, body: null, user: { login: 'iPhatty' } },
+        { number: 43, body: '<!-- phat-mode:ticket:30:01 -->', user: { login: 'iPhatty' } },
+      ],
+    });
+    assert.equal(await github.findIssueByMarker(marker), undefined);
+    const [listed] = await writes();
+    assert.match(listed.list, /^repos\/iPhatty\/phat-mode\/issues\?state=all&creator=iPhatty&per_page=100$/);
+
+    await gitHubWith({
+      issues: [
+        { number: 40, body: `${marker}\nforged`, user: { login: 'mallory' } },
+        { number: 44, body: `> AI\n${marker}\n## Parent`, user: { login: 'iPhatty' } },
+      ],
+    });
+    assert.equal(await github.findIssueByMarker(marker), 44);
+  });
+
+  test('addSubIssue posts the child’s database id as an integer, unless it is linked already', async () => {
+    await gitHubWith({ ids: { 31: 9001 }, parents: { 32: 30 } });
+    await github.addSubIssue(30, 31);
+    await github.addSubIssue(30, 32);
+    assert.deepEqual(await writes(), [{ post: 'repos/iPhatty/phat-mode/issues/30/sub_issues', field: 'sub_issue_id=9001' }]);
+  });
+
+  test('addBlockedBy posts the blocker’s database id as an integer, unless the edge exists already', async () => {
+    await gitHubWith({ ids: { 31: 9001, 32: 9002 }, blockedBy: { 33: [{ number: 32, state: 'open' }] } });
+    await github.addBlockedBy(33, 32);
+    await github.addBlockedBy(33, 31);
+    assert.deepEqual(await writes(), [
+      { post: 'repos/iPhatty/phat-mode/issues/33/dependencies/blocked_by', field: 'issue_id=9001' },
+    ]);
   });
 });

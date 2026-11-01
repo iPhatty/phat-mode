@@ -384,36 +384,54 @@ const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&
 /** The answerer gave no answer to a question, so the questioner's recommendation was taken. */
 export const NO_ANSWER_NOTE = 'no answer given, so the recommendation was taken';
 
+type Ticket = TicketsReport['tickets'][number];
+
 /**
  * The criteria to meet: the ticket's own, plus one for each proposed glossary term and ADR it does not mention yet,
  * so the domain docs are written by the ticket that introduces them.
  */
-export function shapedCriteria(spec: ShapeSpecReport, ticket: TicketsReport['tickets'][number]): string[] {
-  const own = ticket.acceptanceCriteria.map(item).filter((criterion) => criterion !== '');
+export function shapedCriteria(spec: ShapeSpecReport, ticket: Ticket): string[] {
+  return breakdownCriteria(spec, [ticket], [0])[0]!;
+}
+
+/** `name` as a whole word in `text`, ignoring case; `plural`: its plural counts too. */
+const mentions = (text: string, name: string, plural = false) =>
+  new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(item(name))}${plural ? '(?:e?s)?' : ''}($|[^\\p{L}\\p{N}])`, 'iu').test(text);
+
+/**
+ * Each ticket's criteria, by its index in the breakdown: its own, plus one for each proposed glossary term and ADR that
+ * no ticket asks to write yet. Each such entry is written once, by the ticket that introduces it: the first in
+ * dependency order (`order`) that mentions it, or else the first ticket in dependency order.
+ */
+export function breakdownCriteria(spec: ShapeSpecReport, tickets: readonly Ticket[], order: readonly number[]): string[][] {
+  const own = tickets.map((ticket) => ticket.acceptanceCriteria.map(item).filter((criterion) => criterion !== ''));
   // Only a criterion that asks for that very entry to be written counts; one that merely uses the term does not.
-  const requires = (name: string, kind: RegExp) => {
-    const word = new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(item(name))}($|[^\\p{L}\\p{N}])`, 'iu');
-    return own.some((criterion) => word.test(criterion) && kind.test(criterion) && WRITE.test(criterion));
-  };
-  const added: string[] = [];
+  const requires = (name: string, kind: RegExp) =>
+    own.some((criteria) => criteria.some((criterion) => mentions(criterion, name) && kind.test(criterion) && WRITE.test(criterion)));
+  const text = tickets.map((ticket, index) => [ticket.title, ticket.whatToBuild, ...own[index]!].join('\n'));
+  const introducing = (name: string) => order.find((index) => mentions(text[index]!, name, true)) ?? order[0] ?? 0;
+  const added = tickets.map((): string[] => []);
   for (const { term, definition } of spec.domain.terms) {
-    if (!requires(term, /glossary/i)) added.push(`Write the glossary term "${item(term)}" (${item(definition)}) into the domain glossary`);
+    if (!requires(term, /glossary/i)) {
+      added[introducing(term)]!.push(`Write the glossary term "${item(term)}" (${item(definition)}) into the domain glossary`);
+    }
   }
   for (const { title } of spec.domain.adrs) {
-    if (!requires(title, /\bADR\b|decision record/i)) added.push(`Write the ADR "${item(title)}"`);
+    if (!requires(title, /\bADR\b|decision record/i)) added[introducing(title)]!.push(`Write the ADR "${item(title)}"`);
   }
-  return [...own, ...added];
+  return own.map((criteria, index) => [...criteria, ...added[index]!]);
 }
 
 /**
- * A one-ticket issue's new body: the AI line, the spec in the `to-spec` sections, Assumptions (one-way doors first),
- * Domain, the Acceptance criteria `spec.ts` reads, and last the author's text, verbatim. `shapedAt`: when, in a hidden
- * marker, so Agent Briefs from before shaping no longer override the new body.
+ * The issue's new body: the AI line, the spec in the `to-spec` sections, Assumptions (one-way doors first), Domain,
+ * and last the author's text, verbatim. `criteria`: for one ticket, the Acceptance criteria `spec.ts` reads; none when
+ * the spec was broken into several tickets, as the issue is then a Parent, never built itself. `shapedAt`: when, in a
+ * hidden marker, so Agent Briefs from before shaping no longer override the new body.
  */
 export function shapedBody(
   issue: number,
   spec: ShapeSpecReport,
-  ticket: TicketsReport['tickets'][number],
+  criteria: readonly string[] | undefined,
   originalBody: string,
   shapedAt: string,
 ): string {
@@ -444,11 +462,66 @@ export function shapedBody(
       'None.'
     }`,
     `## Domain\n\n${domain.length > 0 ? domain.join('\n\n') : 'No new glossary terms or ADRs.'}`,
-    `## Acceptance criteria\n\n${shapedCriteria(spec, ticket)
-      .map((criterion) => `- [ ] ${criterion}`)
-      .join('\n')}`,
+    ...(criteria === undefined ? [] : [`## Acceptance criteria\n\n${criteria.map((criterion) => `- [ ] ${criterion}`).join('\n')}`]),
     `## Original request\n\n${originalBody}`,
   ].join('\n\n');
+}
+
+/** A ticket's issue title: one line of the model's title. */
+export const ticketTitle = (parent: number, index: number, ticket: Ticket) =>
+  item(ticket.title) || `Ticket ${index + 1} of #${parent}`;
+
+/** Hidden marker on a ticket, so publishing again after a crash finds it instead of opening it twice. `index`: in the breakdown. */
+export const ticketMarker = (parent: number, index: number) => `<!-- phat-mode:ticket:${parent}:${index} -->`;
+
+/**
+ * A ticket's body, following the `to-tickets` issue template: Parent, What to build, Acceptance criteria, and Blocked
+ * by (a fallback for the native edges). `blockers`: the issue numbers of the tickets that gate it.
+ */
+export function ticketBody(
+  parent: number,
+  index: number,
+  ticket: Ticket,
+  criteria: readonly string[],
+  blockers: readonly number[],
+): string {
+  return [
+    shapedByLine(parent),
+    ticketMarker(parent, index),
+    `## Parent\n\n#${parent}`,
+    `## What to build\n\n${prose(ticket.whatToBuild) || item(ticket.title)}`,
+    `## Acceptance criteria\n\n${criteria.map((criterion) => `- [ ] ${criterion}`).join('\n') || '- [ ] It works as described above'}`,
+    `## Blocked by\n\n${blockers.length > 0 ? blockers.map((number) => `- #${number}`).join('\n') : 'None (can start immediately)'}`,
+  ].join('\n\n');
+}
+
+/** More tickets than `maxTickets`: handed to a human with the draft breakdown, for them to split. Model text is quoted. */
+export function shapeTooBigComment(
+  issue: number,
+  tickets: readonly Ticket[],
+  maxTickets: number,
+  labels: ShapeLabels & { readyForHuman: string },
+): string {
+  const draft = tickets.map((ticket, index) => {
+    const blockers = ticket.blockedBy.map((blocker) => `ticket ${blocker + 1}`).join(', ') || 'none';
+    const criteria = ticket.acceptanceCriteria.map((criterion) => `- [ ] ${item(criterion)}`).join('\n');
+    return [
+      `**Ticket ${index + 1}: ${item(ticket.title)}** (blocked by: ${blockers})`,
+      quoted(ticket.whatToBuild || ticket.title),
+      quoted(criteria || 'No acceptance criteria.'),
+    ].join('\n\n');
+  });
+  return `${shapedByLine(issue)}
+
+## Too big to shape on its own
+
+phat-mode broke this into ${tickets.length} tickets, more than the ${maxTickets} it may publish (\`limits.maxTickets\`), so it moved this to \`${labels.readyForHuman}\` and opened no tickets. Split it into smaller issues, or raise the limit, remove \`${labels.readyForHuman}\` and label it \`${labels.agentMode}\` again.
+
+<details><summary>Draft breakdown (${tickets.length} tickets)</summary>
+
+${draft.join('\n\n---\n\n')}
+
+</details>`;
 }
 
 /** The full grilling Q&A, collapsed, in one comment updated in place. Model text is quoted. */

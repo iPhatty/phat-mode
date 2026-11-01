@@ -57,6 +57,37 @@ export class FakeGitHub implements GitHub {
     this.prComments.push({ pr, body });
   }
 
+  /** The `gh` user: who phat-mode posts and opens issues as. */
+  viewer = 'iPhatty';
+  /** Native "blocked by" edges added, in order. */
+  blockedByEdges: { issue: number; blocker: number }[] = [];
+  /** Issues phat-mode opened, in order. */
+  created: number[] = [];
+  async createIssue(options: { title: string; body: string }) {
+    this.writes++;
+    const number = Math.max(0, ...this.issues.keys(), ...this.prs.map((pr) => pr.number)) + 1;
+    this.addIssue(number, { ...options, author: this.viewer, labels: [] });
+    this.created.push(number);
+    return number;
+  }
+  async findIssueByMarker(marker: string) {
+    return [...this.issues.values()]
+      .filter((issue) => issue.author === this.viewer && issue.body.includes(marker))
+      .map((issue) => issue.number)
+      .sort((a, b) => a - b)[0];
+  }
+  async addSubIssue(parent: number, child: number) {
+    this.writes++;
+    this.parents.set(child, parent);
+  }
+  async addBlockedBy(issue: number, blocker: number) {
+    this.writes++;
+    const native = this.native.get(issue) ?? [];
+    if (native.includes(blocker)) return;
+    this.native.set(issue, [...native, blocker]);
+    this.blockedByEdges.push({ issue, blocker });
+  }
+
   addIssue(number: number, fields: Partial<Issue> = {}) {
     this.issues.set(number, {
       number,
