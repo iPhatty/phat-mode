@@ -131,5 +131,17 @@ export async function fixture(files: Record<string, string> = {}, repo = 'test/r
   const remoteFile = async (issue: number, file: string) =>
     (await run('git', ['--git-dir', remote, 'show', `${branchFor(issue)}:${file}`])).stdout;
 
-  return { config, services, github, checks, open, runIssue, remoteFile, remote };
+  /** Someone else pushes to main, e.g. while a run is going. */
+  const advanceMain = async (changes: Record<string, string>, message = 'main moves on') => {
+    for (const [file, content] of Object.entries(changes)) {
+      await mkdir(dirname(join(seed, file)), { recursive: true });
+      await writeFile(join(seed, file), content);
+    }
+    await git(['add', '.']);
+    await git(['commit', '-m', message]);
+    await git(['push', remote, 'main']);
+    return (await git(['rev-parse', 'HEAD'])).stdout.trim();
+  };
+
+  return { config, services, github, checks, open, runIssue, remoteFile, remote, advanceMain };
 }

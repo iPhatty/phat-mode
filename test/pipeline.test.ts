@@ -278,7 +278,7 @@ describe('pipeline', () => {
           const text = textOf(message);
           assert.match(text, /^Verify this change in the real app, following the repo's verification skill\./);
           assert.ok(text.includes(`- The change: ${workspace} (your working directory)`));
-          assert.ok(text.includes(`- The base branch, origin/main, before the change: ${base}.`));
+          assert.match(text, new RegExp(`- The base branch, origin/main, before the change: ${base}, at [0-9a-f]{40}, the commit the change is based on\\.`));
           assert.match(text, /only where there genuinely is a before/);
           assert.match(text, /re-run that same check in the base checkout/);
           assert.match(text, /<skill name="verify-app">\n# Verify App\n\nRun `scripts\/launch\.sh`\./);
@@ -638,7 +638,8 @@ describe('pipeline', () => {
     assert.match(standards, /\*\*Refused Bequest\*\*/, 'the smell baseline, pasted in full');
     assert.match(standards, /- README\.md|\(none found\)/);
     assert.match(standards, /\+hello/, 'the diff');
-    assert.match(standards, /git diff origin\/main/);
+    assert.match(standards, /differs from `[0-9a-f]{40}`, the commit of the base branch it is based on/);
+    assert.match(standards, /git diff [0-9a-f]{40}/);
     assert.doesNotMatch(standards, /leftover debugging code/);
     assert.match(spec, /Review this change on the Spec axis/);
     assert.match(spec, /> Report: \(a\) requirements the spec asked for/, 'the Spec brief, verbatim');
@@ -942,6 +943,118 @@ describe('pipeline', () => {
     assert.equal(github.comments.filter((comment) => comment.marker.includes('plan')).length, 1);
     assert.equal(github.prs.length, 1);
     assert.equal(await remoteFile(9, 'hello.txt'), 'hello\n');
+  });
+
+  describe('main moves on during a run', () => {
+    /** Run `effect` first, e.g. push to main while the agent works, then answer with `step`. */
+    const after = (effect: () => Promise<unknown>, step: FauxResponseStep): FauxResponseFactory => async (...args) => {
+      await effect();
+      return typeof step === 'function' ? step(...args) : step;
+    };
+    const isAncestor = async (remote: string, commit: string, issue: number) =>
+      (await run('git', ['--git-dir', remote, 'merge-base', '--is-ancestor', commit, branchFor(issue)], { allowFailure: true })).code === 0;
+
+    test('merged into the branch before the PR, then checked, reviewed and verified again', async () => {
+      const { github, checks, runIssue, remote, remoteFile, advanceMain } = await fixture();
+      github.addIssue(60);
+      let main = '';
+      const { outcome, faux } = await runIssue(60, [
+        plan(),
+        write('hello.txt', 'hello\n'),
+        after(async () => (main = await advanceMain({ 'other.txt': 'from main\n' })), done()),
+        ...approve(),
+        describePr({ summary: 'first' }),
+        // Main's change is part of the base now, never of this change.
+        ...review({}, (_axis, text) => {
+          assert.match(text, /^This is review round 2\./);
+          assert.match(text, /\+hello/);
+          assert.doesNotMatch(text, /other\.txt/);
+        }),
+        describePr({ summary: 'second' }),
+      ]);
+      assert.equal(result(outcome).status, 'pr_opened');
+      assert.equal(faux.getPendingResponseCount(), 0);
+      assert.equal(checks.runs, 2, 'checked again after merging');
+      assert.ok(await isAncestor(remote, main, 60), 'the branch has main in it');
+      assert.equal(await remoteFile(60, 'other.txt'), 'from main\n');
+      assert.equal(await remoteFile(60, 'hello.txt'), 'hello\n');
+      assert.match(github.prs[0]!.body, /^## Summary\n\nsecond/);
+      assert.deepEqual(readYoloMarker(github.prs[0]!.body), { verdict: 'clean', sha: await pushedCommit(remote, 60) });
+    });
+
+    test('reviewers and the verifier see only this change, against the commit it is based on, never main’s newer commits as reverts', async () => {
+      const { github, runIssue, advanceMain } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(61);
+      const notMain = (text: string) => assert.doesNotMatch(text, /other\.txt/);
+      const { outcome, faux } = await runIssue(61, [
+        plan(),
+        write('hello.txt', 'helo\n'),
+        after(() => advanceMain({ 'other.txt': 'from main\n' }), done()),
+        ...approve(),
+        // Verification fetches main, so from here on origin/main is ahead of the commit the work is based on.
+        verificationReport([{ status: 'failed', detail: 'Shows "helo".' }]),
+        write('hello.txt', 'hello\n'),
+        done(),
+        ...review({}, (_axis, text) => notMain(text)),
+        expectLast((message) => notMain(textOf(message)), verificationReport([{}])),
+        describePr(),
+        // Merged: another round, against main as it is now.
+        ...review({}, (_axis, text) => notMain(text)),
+        expectLast((message) => notMain(textOf(message)), verificationReport([{}])),
+        describePr(),
+      ]);
+      assert.equal(result(outcome).status, 'pr_opened');
+      assert.equal(faux.getPendingResponseCount(), 0);
+    });
+
+    test('conflicts: the implementer resolves them, and the merge is only committed once no conflict markers are left', async () => {
+      const { github, runIssue, remote, remoteFile, advanceMain } = await fixture();
+      github.addIssue(62);
+      let main = '';
+      const { outcome, faux } = await runIssue(62, [
+        plan(),
+        write('hello.txt', 'hello\n'),
+        after(async () => (main = await advanceMain({ 'hello.txt': 'hi\n' })), done()),
+        ...approve(),
+        describePr(),
+        expectLast((message) => {
+          const text = textOf(message);
+          assert.match(text, /^origin\/main moved on while you worked/);
+          assert.match(text, /- hello\.txt/);
+        }, done()),
+        // Markers still there: back to the implementer, the merge not committed.
+        expectLast((message) => assert.match(textOf(message), /- hello\.txt/), write('hello.txt', 'hello\nhi\n')),
+        done(),
+        ...review({}, (_axis, text) => assert.doesNotMatch(text, /<<<<<<<|>>>>>>>/)),
+        describePr(),
+      ]);
+      assert.equal(result(outcome).status, 'pr_opened');
+      assert.equal(faux.getPendingResponseCount(), 0);
+      assert.equal(await remoteFile(62, 'hello.txt'), 'hello\nhi\n');
+      assert.ok(await isAncestor(remote, main, 62), 'the branch has main in it');
+    });
+
+    test('main keeps moving: after maxBranchUpdates merges the PR opens as it is', async () => {
+      const { config, github, checks, runIssue, remote, advanceMain } = await fixture();
+      config.limits.maxBranchUpdates = 1;
+      github.addIssue(63);
+      let first = '';
+      let second = '';
+      const { outcome, faux } = await runIssue(63, [
+        plan(),
+        write('hello.txt', 'hello\n'),
+        after(async () => (first = await advanceMain({ 'one.txt': '1\n' })), done()),
+        ...approve(),
+        describePr(),
+        ...approve(),
+        after(async () => (second = await advanceMain({ 'two.txt': '2\n' })), describePr()),
+      ]);
+      assert.equal(result(outcome).status, 'pr_opened');
+      assert.equal(faux.getPendingResponseCount(), 0);
+      assert.equal(checks.runs, 2);
+      assert.ok(await isAncestor(remote, first, 63));
+      assert.ok(!(await isAncestor(remote, second, 63)), 'not merged again');
+    });
   });
 
   test('only one process can open the state: a second open is refused until the first closes', async () => {
