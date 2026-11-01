@@ -23,15 +23,21 @@ import {
 import { modelFor } from './config.ts';
 import { commentMarker, type Issue, mergeLabels, PROGRESS_LABELS, progressChange } from './github.ts';
 import {
+  breakdownCriteria,
   grillComment,
   LIMIT_NOTE,
   NO_ANSWER_NOTE,
   shapedBody,
+  shapedCriteria,
   shapeFailedComment,
   shapeFoundComment,
   shapeNeedsHumanComment,
   shapeNeedsInfoComment,
   shapeRefusedComment,
+  shapeTooBigComment,
+  ticketBody,
+  ticketMarker,
+  ticketTitle,
 } from './messages.ts';
 import type { PipelineInput, Services } from './pipeline.ts';
 import {
@@ -82,10 +88,13 @@ export type ShapingResult =
   | { status: 'needs_human' }
   | { status: 'already_implemented' }
   | { status: 'previously_rejected' }
-  /** One ticket: the issue's body is the spec, and it is ready-for-agent. */
-  | { status: 'shaped'; tickets: 1 }
-  /** Several tickets. A placeholder until publishing them is built: only the Q&A comment is written. */
-  | { status: 'broken_down'; tickets: number };
+  /**
+   * One ticket: the issue's body is the spec, and it is ready-for-agent. Several: the issue's body is the spec, and
+   * `numbers` are its tickets (sub-issues, each ready-for-agent), in dependency order.
+   */
+  | { status: 'shaped'; tickets: number; numbers?: number[] }
+  /** More tickets than `maxTickets`: handed to a human with the draft breakdown, and no tickets opened. */
+  | { status: 'too_big'; tickets: number };
 
 /** The name runs of this task are recorded under; `status` tells shaping from building by it. */
 export const SHAPING_TASK = 'phat.shape';
@@ -118,6 +127,33 @@ export function withRoundAssumptions(spec: ShapeSpecReport, rounds: readonly Gri
     }),
   );
   return { ...spec, assumptions: [...spec.assumptions, ...decided] };
+}
+
+/**
+ * The order to publish tickets in: every ticket after the ones that block it, otherwise as listed. A reason instead
+ * when `blockedBy` is not usable: an index out of range, a ticket blocking itself, or a cycle.
+ */
+export function dependencyOrder(tickets: TicketsReport['tickets']): number[] | { invalid: string } {
+  for (const [index, ticket] of tickets.entries()) {
+    for (const blocker of ticket.blockedBy) {
+      if (!Number.isInteger(blocker) || blocker < 0 || blocker >= tickets.length) {
+        return { invalid: `Ticket ${index + 1} ("${ticket.title}") is blocked by ticket index ${blocker}, which is not in the breakdown.` };
+      }
+      if (blocker === index) return { invalid: `Ticket ${index + 1} ("${ticket.title}") is blocked by itself.` };
+    }
+  }
+  const order: number[] = [];
+  while (order.length < tickets.length) {
+    const next = tickets.findIndex(
+      (ticket, index) => !order.includes(index) && ticket.blockedBy.every((blocker) => order.includes(blocker)),
+    );
+    if (next === -1) {
+      const stuck = tickets.flatMap((ticket, index) => (order.includes(index) ? [] : [`${index + 1} ("${ticket.title}")`]));
+      return { invalid: `The tickets' blocking edges form a cycle, among tickets ${stuck.join(', ')}.` };
+    }
+    order.push(next);
+  }
+  return order;
 }
 
 /** Shaping, for every repo: each run uses the services of its own repo, as the build pipeline does. */
@@ -396,31 +432,84 @@ function repoPhases(services: Services) {
       );
       if (report === undefined) throw new StepFailure('The answering agent did not report the ticket breakdown.');
       if (report.tickets.length === 0) throw new StepFailure('The answering agent broke the spec into no tickets at all.');
+      const order = dependencyOrder(report.tickets);
+      if ('invalid' in order) throw new StepFailure(`The answering agent's ticket breakdown is not usable: ${order.invalid}`);
       logger.step(issue.number, `Tickets: ${report.tickets.length}`);
+      const max = config.limits.maxTickets;
+      if (report.tickets.length > max) {
+        logger.step(issue.number, `More than ${max} tickets: handing it to a human with the draft breakdown`);
+        await github.upsertComment(issue.number, MARKERS.qa, grillComment(issue.number, state.rounds));
+        await handBack(issue.number, labels.readyForHuman, shapeTooBigComment(issue.number, report.tickets, max, labels));
+        await finish(runtime, { status: 'too_big', tickets: report.tickets.length }, context);
+        return;
+      }
       await go(runtime, { ...setupOf(state), phase: 'publish', rounds: state.rounds, spec: state.spec, tickets: report.tickets, shapedAt: new Date().toISOString() }, context);
     }),
 
     publish: guarded<Phase<'publish'>>(async (task, runtime, context) => {
       const { issue, rounds, spec, tickets, shapedAt } = task.state.checkpoint;
       const [ticket] = tickets;
-      if (ticket === undefined || tickets.length > 1) {
-        // A placeholder until publishing several tickets is built: nothing but the Q&A comment, and agent-mode stays.
-        await finish(runtime, { status: 'broken_down', tickets: tickets.length }, context);
+      if (ticket === undefined) throw new StepFailure('The answering agent broke the spec into no tickets at all.');
+      if (tickets.length === 1) {
+        // The body as it was when shaping began (never refetched), so a rerun after a crash still keeps the original.
+        await github.editIssueBody(issue.number, shapedBody(issue.number, spec, shapedCriteria(spec, ticket), issue.body, shapedAt));
+        await github.upsertComment(issue.number, MARKERS.qa, grillComment(issue.number, rounds));
+        // Labels last: ready-for-agent lets a build start.
+        await github.editLabels(
+          issue.number,
+          mergeLabels(progressChange(null), {
+            add: [labels.readyForAgent, PROGRESS_LABELS.shaped.name],
+            remove: [labels.agentMode],
+          }),
+        );
+        logger.step(issue.number, `Shaped into one ticket: now ${labels.readyForAgent}`);
+        await finish(runtime, { status: 'shaped', tickets: 1 }, context);
         return;
       }
-      // The body as it was when shaping began (never refetched), so a rerun after a crash still keeps the original.
-      await github.editIssueBody(issue.number, shapedBody(issue.number, spec, ticket, issue.body, shapedAt));
+
+      // Several tickets. Every step can be repeated after a crash: tickets are found again by their marker.
+      const order = dependencyOrder(tickets);
+      if ('invalid' in order) throw new StepFailure(`The ticket breakdown is not usable: ${order.invalid}`);
+      const criteria = breakdownCriteria(spec, tickets, order);
+      await github.editIssueBody(issue.number, shapedBody(issue.number, spec, undefined, issue.body, shapedAt));
+      const issueNumberByTicketIndex = new Map<number, number>();
+      const numberOf = (index: number) => {
+        const number = issueNumberByTicketIndex.get(index);
+        if (number === undefined) throw new Error(`Ticket ${index + 1} is not published yet`);
+        return number;
+      };
+      for (const index of order) {
+        const current = tickets[index]!;
+        // Blockers come first in dependency order, so they are published already.
+        const blockers = current.blockedBy.map(numberOf);
+        const found = await github.findIssueByMarker(ticketMarker(issue.number, index));
+        const number =
+          (found !== issue.number ? found : undefined) ??
+          (await github.createIssue({
+            title: ticketTitle(issue.number, index, current),
+            body: ticketBody(issue.number, index, current, criteria[index]!, blockers),
+          }));
+        logger.step(issue.number, `Ticket ${index + 1}: #${number}`);
+        issueNumberByTicketIndex.set(index, number);
+      }
+      /** The tickets' issue numbers, in dependency order. */
+      const numbers = order.map(numberOf);
+      for (const number of numbers) await github.addSubIssue(issue.number, number);
+      for (const index of order) {
+        for (const blocker of tickets[index]!.blockedBy) await github.addBlockedBy(numberOf(index), numberOf(blocker));
+      }
       await github.upsertComment(issue.number, MARKERS.qa, grillComment(issue.number, rounds));
-      // Labels last: ready-for-agent lets a build start.
+      for (const number of numbers) await github.editLabels(number, { add: [labels.readyForAgent] });
+      // The Parent last: it is never built itself, so never ready-for-agent, and it has no triage state label.
       await github.editLabels(
         issue.number,
         mergeLabels(progressChange(null), {
-          add: [labels.readyForAgent, PROGRESS_LABELS.shaped.name],
-          remove: [labels.agentMode],
+          add: [PROGRESS_LABELS.shaped.name],
+          remove: [labels.agentMode, labels.readyForAgent, labels.needsTriage, labels.needsInfo, labels.readyForHuman],
         }),
       );
-      logger.step(issue.number, `Shaped into one ticket: now ${labels.readyForAgent}`);
-      await finish(runtime, { status: 'shaped', tickets: 1 }, context);
+      logger.step(issue.number, `Shaped into ${numbers.length} tickets: ${numbers.map((n) => `#${n}`).join(', ')}`);
+      await finish(runtime, { status: 'shaped', tickets: numbers.length, numbers }, context);
     }),
 
     fail: async (task: Phase<'fail'>, runtime: Runtime, context: Context) => {

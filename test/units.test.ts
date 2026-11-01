@@ -5,9 +5,10 @@ import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { FileCredentialStore, importPiCredential } from '../src/credentials.ts';
 import { agentEnv } from '../src/exec.ts';
-import { evidence, pullRequestBody, shapedCriteria } from '../src/messages.ts';
+import { breakdownCriteria, evidence, pullRequestBody, shapedCriteria } from '../src/messages.ts';
 import { roleInstructions } from '../src/prompts.ts';
 import { describeResult, runStatus } from '../src/runs.ts';
+import { dependencyOrder } from '../src/shaping.ts';
 
 const ROLE_INSTRUCTIONS = roleInstructions('npm run check');
 
@@ -182,7 +183,11 @@ describe('run status', () => {
     assert.match(runStatus(done('phat.shape', { status: 'needs_info' })), /^shaping: ❓ The request is unclear/);
     assert.match(runStatus(done('phat.pipeline', { status: 'needs_info' })), /^building: ❓ The spec has gaps/);
     assert.match(runStatus(done('phat.shape', { status: 'shaped', tickets: 1 })), /^shaping: ✅ Shaped into one ticket[^]*ready-for-agent/);
-    assert.match(runStatus(done('phat.shape', { status: 'broken_down', tickets: 3 })), /^shaping: 🧩 Broken down into 3 tickets/);
+    assert.equal(
+      runStatus(done('phat.shape', { status: 'shaped', tickets: 3, numbers: [31, 32, 33] })),
+      'shaping: ✅ Shaped into 3 tickets (#31, #32, #33), each ready-for-agent; the issue is phat-mode:shaped.',
+    );
+    assert.match(runStatus(done('phat.shape', { status: 'too_big', tickets: 9 })), /^shaping: 🐘 Too big: 9 tickets[^]*ready-for-human/);
     assert.match(runStatus(done('phat.shape', { status: 'refused', reason: '#3 is already shaped.' })), /^shaping: 🚫 Not shaped: #3 is already shaped\./);
     const failed = { kind: 'phat.shape', state: { status: 'terminal', outcome: { status: 'failed', error: { message: 'No report.\nmore' } } } };
     assert.equal(runStatus(failed), 'shaping: failed: No report.');
@@ -230,5 +235,63 @@ describe('shapedCriteria', () => {
   test('a criterion that already asks to write that entry is not doubled', () => {
     const own = ['Add "Greeting" to GLOSSARY.md (glossary)', 'Write ADR 0003: Greetings are constants'];
     assert.deepEqual(shapedCriteria(spec(['Greeting'], ['Greetings are constants']), ticket(own)), own);
+  });
+});
+
+describe('dependencyOrder', () => {
+  const t = (blockedBy: number[]) => ({ title: 'T', whatToBuild: '', acceptanceCriteria: [], blockedBy });
+
+  test('blockers first, otherwise as listed', () => {
+    assert.deepEqual(dependencyOrder([t([2]), t([]), t([]), t([0, 1])]), [1, 2, 0, 3]);
+  });
+
+  test('an index out of range, a ticket blocking itself, or a cycle is not usable', () => {
+    assert.match((dependencyOrder([t([]), t([2])]) as { invalid: string }).invalid, /index 2, which is not in the breakdown/);
+    assert.match((dependencyOrder([t([0.5])]) as { invalid: string }).invalid, /not in the breakdown/);
+    assert.match((dependencyOrder([t([]), t([1])]) as { invalid: string }).invalid, /blocked by itself/);
+    assert.match((dependencyOrder([t([]), t([2]), t([1])]) as { invalid: string }).invalid, /cycle, among tickets 2 \("T"\), 3/);
+  });
+});
+
+describe('breakdownCriteria', () => {
+  const spec = {
+    domain: {
+      terms: [
+        { term: 'Greeting', definition: 'What learners see.', avoid: '' },
+        { term: 'Tone', definition: 'How it sounds.', avoid: '' },
+      ],
+      adrs: [
+        { title: 'Tones are optional', decision: 'Off by default.' },
+        { title: 'Greetings are constants', decision: 'No table.' },
+      ],
+    },
+  } as Parameters<typeof breakdownCriteria>[0];
+  const ticket = (title: string, whatToBuild: string, acceptanceCriteria: string[], blockedBy: number[] = []) => ({
+    title,
+    whatToBuild,
+    acceptanceCriteria,
+    blockedBy,
+  });
+
+  test('each missing entry goes once, to the first ticket in dependency order that introduces it', () => {
+    const tickets = [
+      ticket('Play a tone', 'Tones are optional: a learner may turn one on.', ['A tone plays'], [1]),
+      ticket('Show greetings', 'Learners see one on launch.', ['It shows'], []),
+      ticket('Pick a tone', 'Choose which tone plays.', ['It is chosen'], [0]),
+    ];
+    assert.deepEqual(breakdownCriteria(spec, tickets, [1, 0, 2]), [
+      ['A tone plays', 'Write the glossary term "Tone" (How it sounds.) into the domain glossary', 'Write the ADR "Tones are optional"'],
+      // Mentioned by no ticket: the first in dependency order writes it.
+      ['It shows', 'Write the glossary term "Greeting" (What learners see.) into the domain glossary', 'Write the ADR "Greetings are constants"'],
+      ['It is chosen'],
+    ]);
+  });
+
+  test('an entry a ticket already asks to write is not added anywhere', () => {
+    const tickets = [ticket('A', '', ['Write ADR: Greetings are constants']), ticket('B Greeting tone', '', ['Add Greeting and Tone to the glossary'], [0])];
+    assert.deepEqual(breakdownCriteria(spec, tickets, [0, 1]), [
+      ['Write ADR: Greetings are constants', 'Write the ADR "Tones are optional"'],
+      ['Add Greeting and Tone to the glossary'],
+    ]);
   });
 });

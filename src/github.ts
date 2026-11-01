@@ -127,6 +127,17 @@ export interface GitHub {
    */
   mergePullRequest(pr: number, sha: string): Promise<void>;
   commentOnPullRequest(pr: number, body: string): Promise<void>;
+  /** Open an issue; returns its number. */
+  createIssue(options: { title: string; body: string }): Promise<number>;
+  /**
+   * An issue (never a pull request) whose body carries `marker`, among the issues opened by the `gh` user only: on a
+   * public repo anyone can open one carrying the marker.
+   */
+  findIssueByMarker(marker: string): Promise<number | undefined>;
+  /** Make `child` a native sub-issue of `parent`. Nothing happens if it already is. */
+  addSubIssue(parent: number, child: number): Promise<void>;
+  /** Add a native "blocked by" dependency: `issue` is blocked by `blocker`. Nothing happens if it already is. */
+  addBlockedBy(issue: number, blocker: number): Promise<void>;
 }
 
 /** Hidden marker that identifies a phat-mode comment. */
@@ -331,6 +342,55 @@ export class GhGitHub implements GitHub {
 
   async commentOnPullRequest(pr: number, body: string): Promise<void> {
     await this.#gh(['pr', 'comment', String(pr), '-R', this.#repo, '--body-file', '-'], body);
+  }
+
+  async createIssue(options: { title: string; body: string }): Promise<number> {
+    const output = await this.#gh(
+      ['api', '--method', 'POST', `repos/${this.#repo}/issues`, '--input', '-', '--jq', '.number'],
+      JSON.stringify({ title: options.title, body: options.body }),
+    );
+    const number = Number(output.trim());
+    if (!Number.isInteger(number) || number <= 0) throw new Error(`Created the issue "${options.title}" but GitHub gave no number`);
+    return number;
+  }
+
+  async findIssueByMarker(marker: string): Promise<number | undefined> {
+    const me = await this.#me();
+    const pages = JSON.parse(
+      await this.#gh([
+        'api', '--paginate', '--slurp',
+        `repos/${this.#repo}/issues?state=all&creator=${encodeURIComponent(me)}&per_page=100`,
+      ]),
+    ) as { number: number; body: string | null; user: { login: string } | null; pull_request?: unknown }[][];
+    // The creator is checked here too: only an issue the gh user opened is ever phat-mode's.
+    return pages
+      .flat()
+      .filter((issue) => issue.pull_request === undefined && issue.user?.login === me && (issue.body ?? '').includes(marker))
+      .map((issue) => issue.number)
+      .sort((a, b) => a - b)[0];
+  }
+
+  /** An issue's database id, which the sub-issue and dependency APIs take (not its number or node id). */
+  async #databaseId(issue: number): Promise<number> {
+    const id = Number((await this.#gh(['api', `repos/${this.#repo}/issues/${issue}`, '--jq', '.id'])).trim());
+    if (!Number.isInteger(id) || id <= 0) throw new Error(`No database id for issue #${issue}`);
+    return id;
+  }
+
+  async addSubIssue(parent: number, child: number): Promise<void> {
+    // GitHub refuses to link a sub-issue twice.
+    if ((await this.parentIssue(child)) === parent) return;
+    const id = await this.#databaseId(child);
+    // -F: the id is sent as an integer.
+    await this.#gh(['api', '--method', 'POST', `repos/${this.#repo}/issues/${parent}/sub_issues`, '-F', `sub_issue_id=${id}`]);
+  }
+
+  async addBlockedBy(issue: number, blocker: number): Promise<void> {
+    const path = `repos/${this.#repo}/issues/${issue}/dependencies/blocked_by`;
+    const existing = JSON.parse(await this.#gh(['api', path])) as { number: number }[];
+    if (existing.some((candidate) => candidate.number === blocker)) return;
+    const id = await this.#databaseId(blocker);
+    await this.#gh(['api', '--method', 'POST', path, '-F', `issue_id=${id}`]);
   }
 
   /** Create the labels that are missing (never edit existing ones). Says which it created and which it could not. */
