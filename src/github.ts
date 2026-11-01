@@ -26,6 +26,18 @@ export type PullRequest = {
 
 export type PullRequestState = 'OPEN' | 'CLOSED' | 'MERGED';
 
+/** A check on a commit, as one of three: skipped and neutral count as passed. */
+export type CheckState = 'passed' | 'running' | 'failed';
+
+/** What decides whether a pull request can merge: its description, its head commit, and the checks on that commit. */
+export type PullRequestStatus = {
+  body: string;
+  /** `committedAt`: when the head commit was made (phat-mode commits just before it pushes). */
+  head: { sha: string; committedAt: string };
+  /** Check runs (GitHub Actions and other apps) and commit statuses, by name. */
+  checks: { name: string; state: CheckState }[];
+};
+
 /** An open issue as listed: labels only, no body or comments. */
 export type ListedIssue = { number: number; title: string; labels: string[] };
 
@@ -80,6 +92,14 @@ export interface GitHub {
   openBlockers(issue: number, mentioned: readonly number[]): Promise<number[]>;
   /** The issue's native parent (sub-issues), if it has one. */
   parentIssue(issue: number): Promise<number | undefined>;
+  /** A pull request's description, head commit and the checks on it. */
+  pullRequestStatus(pr: number): Promise<PullRequestStatus>;
+  /**
+   * Squash-merge the pull request and delete its branch, only if its head is still `sha`. Never bypasses branch
+   * protection. Throws with GitHub's reason when it refuses.
+   */
+  mergePullRequest(pr: number, sha: string): Promise<void>;
+  commentOnPullRequest(pr: number, body: string): Promise<void>;
 }
 
 /** Hidden marker that identifies a phat-mode comment. */
@@ -101,6 +121,22 @@ export function mergeLabels(...changes: LabelChange[]): Required<LabelChange> {
 
 /** Fields asked for on pull requests: what `PullRequest` needs, and whether the branch comes from a fork. */
 const PR_FIELDS = 'number,url,isDraft,isCrossRepository';
+
+/** One entry of a pull request's `statusCheckRollup`: a check run, or a commit status. */
+type RolledUpCheck =
+  | { __typename: 'CheckRun'; name: string; status: string; conclusion: string }
+  | { __typename: 'StatusContext'; context: string; state: string };
+
+const PASSED_CONCLUSIONS = ['SUCCESS', 'NEUTRAL', 'SKIPPED'];
+
+function checkState(check: RolledUpCheck): { name: string; state: CheckState } {
+  if (check.__typename === 'CheckRun') {
+    const state = check.status !== 'COMPLETED' ? 'running' : PASSED_CONCLUSIONS.includes(check.conclusion) ? 'passed' : 'failed';
+    return { name: check.name, state };
+  }
+  const state = check.state === 'SUCCESS' ? 'passed' : ['PENDING', 'EXPECTED'].includes(check.state) ? 'running' : 'failed';
+  return { name: check.context, state };
+}
 
 /**
  * The pull requests whose branch is in the repo itself. On a public repo anyone can open one from a fork, and name its
@@ -238,6 +274,32 @@ export class GhGitHub implements GitHub {
 
   async updatePullRequestBody(pr: number, body: string): Promise<void> {
     await this.#gh(['pr', 'edit', String(pr), '-R', this.#repo, '--body-file', '-'], body);
+  }
+
+  async pullRequestStatus(pr: number): Promise<PullRequestStatus> {
+    const raw = JSON.parse(
+      await this.#gh(['pr', 'view', String(pr), '-R', this.#repo, '--json', 'body,headRefOid,commits,statusCheckRollup']),
+    ) as {
+      body: string;
+      headRefOid: string;
+      commits: { oid: string; committedDate: string }[];
+      statusCheckRollup: RolledUpCheck[] | null;
+    };
+    const head = raw.commits.find((commit) => commit.oid === raw.headRefOid) ?? raw.commits.at(-1);
+    if (head === undefined) throw new Error(`Pull request #${pr} has no commits`);
+    return {
+      body: raw.body,
+      head: { sha: raw.headRefOid, committedAt: head.committedDate },
+      checks: (raw.statusCheckRollup ?? []).map(checkState),
+    };
+  }
+
+  async mergePullRequest(pr: number, sha: string): Promise<void> {
+    await this.#gh(['pr', 'merge', String(pr), '-R', this.#repo, '--squash', '--delete-branch', '--match-head-commit', sha]);
+  }
+
+  async commentOnPullRequest(pr: number, body: string): Promise<void> {
+    await this.#gh(['pr', 'comment', String(pr), '-R', this.#repo, '--body-file', '-'], body);
   }
 
   /** Create the labels that are missing (never edit existing ones). Returns the ones it created. */

@@ -33,6 +33,10 @@ else if (a === 'issue' && b === 'comment') log({ comment: c, body: stdin() });
 else if (a === 'pr' && b === 'edit') log({ edit: c, body: stdin() });
 else if (a === 'pr' && b === 'ready') log({ ready: c });
 else if (a === 'label' && b === 'list') process.stdout.write(JSON.stringify(state.labels.map((name) => ({ name }))));
+else if (a === 'pr' && b === 'view') process.stdout.write(JSON.stringify(pick([state.views[c]])[0]));
+else if (a === 'pr' && b === 'merge' && state.refuse) { process.stderr.write(state.refuse); process.exit(1); }
+else if (a === 'pr' && b === 'merge') log({ merge: args.slice(2) });
+else if (a === 'pr' && b === 'comment') log({ prComment: c, body: stdin() });
 else { process.stderr.write('fake gh: unexpected ' + args.join(' ')); process.exit(1); }
 `;
 
@@ -43,8 +47,17 @@ let dir: string;
 let path: string | undefined;
 const github = new GhGitHub('iPhatty/phat-mode');
 
-async function gitHubWith(state: { prs?: FakePr[]; comments?: FakeComment[]; labels?: string[] }) {
-  await writeFile(join(dir, 'state.json'), JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], ...state }));
+async function gitHubWith(state: {
+  prs?: FakePr[];
+  comments?: FakeComment[];
+  labels?: string[];
+  views?: Record<string, unknown>;
+  refuse?: string;
+}) {
+  await writeFile(
+    join(dir, 'state.json'),
+    JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], views: {}, ...state }),
+  );
   await writeFile(join(dir, 'log.jsonl'), '');
 }
 const writes = async () =>
@@ -104,6 +117,69 @@ describe('GhGitHub, on a public repo', () => {
     await gitHubWith({ comments: [{ id: 5, body: '<!-- phat-mode:plan -->\nhijack', user: { login: 'stranger' } }] });
     await github.upsertComment(1, '<!-- phat-mode:plan -->', 'The plan.');
     assert.deepEqual(await writes(), [{ comment: '1', body: '<!-- phat-mode:plan -->\nThe plan.' }]);
+  });
+
+  test('a pull request’s head commit, when it was made, and every check on it: passed, running or failed', async () => {
+    const run = (name: string, status: string, conclusion = '') => ({ __typename: 'CheckRun', name, status, conclusion });
+    const status = (context: string, state: string) => ({ __typename: 'StatusContext', context, state });
+    await gitHubWith({
+      views: {
+        40: {
+          body: 'The description',
+          headRefOid: 'bbb',
+          commits: [
+            { oid: 'aaa', committedDate: '2026-10-31T10:00:00Z' },
+            { oid: 'bbb', committedDate: '2026-10-31T12:00:00Z' },
+          ],
+          statusCheckRollup: [
+            run('test', 'COMPLETED', 'SUCCESS'),
+            run('lint', 'COMPLETED', 'SKIPPED'),
+            run('docs', 'COMPLETED', 'NEUTRAL'),
+            run('build', 'IN_PROGRESS'),
+            run('e2e', 'QUEUED'),
+            run('deploy', 'COMPLETED', 'FAILURE'),
+            run('slow', 'COMPLETED', 'TIMED_OUT'),
+            run('stop', 'COMPLETED', 'CANCELLED'),
+            status('ci/legacy', 'SUCCESS'),
+            status('ci/pending', 'PENDING'),
+            status('ci/broken', 'ERROR'),
+            status('ci/red', 'FAILURE'),
+          ],
+        },
+      },
+    });
+    assert.deepEqual(await github.pullRequestStatus(40), {
+      body: 'The description',
+      head: { sha: 'bbb', committedAt: '2026-10-31T12:00:00Z' },
+      checks: [
+        { name: 'test', state: 'passed' },
+        { name: 'lint', state: 'passed' },
+        { name: 'docs', state: 'passed' },
+        { name: 'build', state: 'running' },
+        { name: 'e2e', state: 'running' },
+        { name: 'deploy', state: 'failed' },
+        { name: 'slow', state: 'failed' },
+        { name: 'stop', state: 'failed' },
+        { name: 'ci/legacy', state: 'passed' },
+        { name: 'ci/pending', state: 'running' },
+        { name: 'ci/broken', state: 'failed' },
+        { name: 'ci/red', state: 'failed' },
+      ],
+    });
+  });
+
+  test('merges by squashing exactly the given commit, deletes the branch, and never bypasses protection', async () => {
+    await github.mergePullRequest(40, 'bbb');
+    await github.commentOnPullRequest(40, 'Merged.');
+    assert.deepEqual(await writes(), [
+      { merge: ['40', '-R', 'iPhatty/phat-mode', '--squash', '--delete-branch', '--match-head-commit', 'bbb'] },
+      { prComment: '40', body: 'Merged.' },
+    ]);
+  });
+
+  test('a merge GitHub refuses fails with GitHub’s reason', async () => {
+    await gitHubWith({ refuse: 'Pull request #40 is not mergeable: the base branch policy prohibits the merge.' });
+    await assert.rejects(github.mergePullRequest(40, 'bbb'), /base branch policy prohibits the merge/);
   });
 
   test('phat-mode’s own marked comment is updated in place', async () => {

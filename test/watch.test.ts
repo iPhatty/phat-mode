@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import type { Config } from '../src/config.ts';
+import type { CheckState } from '../src/github.ts';
 import { silentLogger } from '../src/log.ts';
 import { describeStep, MARKER_HANDED_BACK, nextStep } from '../src/watch.ts';
+import { yoloMarker, type YoloVerdict } from '../src/yolo.ts';
 import { FakeGitHub, testConfig } from './fakes.ts';
 
 const config: Config = testConfig('/nonexistent');
 const step = (github: FakeGitHub) => nextStep(github, config, silentLogger);
+const NOW = new Date('2026-10-31T12:00:00Z');
+const yoloStep = (github: FakeGitHub) => nextStep(github, config, silentLogger, { yolo: true, now: NOW });
 
 /** Open issues, each blocked by the issues listed (GitHub's native dependencies). */
 function repo(issues: Record<number, { blockedBy?: number[]; labels?: string[]; author?: string }>) {
@@ -36,6 +40,60 @@ function opened(github: FakeGitHub, issue: number) {
   github.issues.get(issue)!.labels.push('phat-mode:done');
   github.addPullRequest({ branch: `phat-mode/issue-${issue}` });
 }
+
+/** A finished run's pull request with phat-mode's verdict on it; settled, with its checks passed, unless told otherwise. */
+function judged(
+  github: FakeGitHub,
+  issue: number,
+  verdict: 'clean' | YoloVerdict = 'clean',
+  checks: { name: string; state: CheckState }[] = [{ name: 'test', state: 'passed' }],
+) {
+  opened(github, issue);
+  const pr = github.prs.at(-1)!;
+  const sha = `cafe${issue}`;
+  pr.body = `Adds it.\n\n${yoloMarker(verdict === 'clean' ? { verdict: 'clean', sha } : verdict)}`;
+  github.statuses.set(pr.number, { head: { sha, committedAt: '2026-10-31T11:00:00Z' }, checks });
+  return pr;
+}
+
+describe('watch --yolo', () => {
+  test('merges a clean pull request, then starts the next ready issue in the same look', async () => {
+    const github = repo({ 2: {}, 3: {} });
+    const pr = judged(github, 2);
+    assert.deepEqual(await yoloStep(github), { kind: 'start', issue: 3, title: 'Issue 3' });
+    assert.deepEqual(github.merges, [{ pr: pr.number, sha: 'cafe2' }]);
+  });
+
+  test('merges every clean one, lowest issue first; the others wait, each saying why', async () => {
+    const github = repo({ 2: {}, 3: {}, 4: {}, 5: {} });
+    const findings = judged(github, 2, { verdict: 'not-clean', sha: 'cafe2', reason: 'code review has open findings' });
+    const second = judged(github, 4);
+    const running = judged(github, 3, 'clean', [{ name: 'build', state: 'running' }]);
+    const first = judged(github, 5);
+    // Opened in another order: still merged lowest issue first.
+    const step = await yoloStep(github);
+    assert.deepEqual(github.merges.map((merge) => merge.pr), [second.number, first.number]);
+    assert.deepEqual(step, {
+      kind: 'wait_for_merge',
+      prs: [
+        { issue: 2, url: findings.url, notMerging: { needsYou: true, reason: 'code review has open findings' } },
+        { issue: 3, url: running.url, notMerging: { needsYou: false, reason: 'checks running: build' } },
+      ],
+    });
+    assert.equal(
+      describeStep(step),
+      `Waiting for you to merge #2: ${findings.url} (not merging: code review has open findings); ` +
+        `waiting to merge #3: ${running.url} (checks running: build)`,
+    );
+  });
+
+  test('without --yolo, nothing is ever merged, even a clean pull request', async () => {
+    const github = repo({ 2: {} });
+    const pr = judged(github, 2);
+    assert.deepEqual(await step(github), { kind: 'wait_for_merge', prs: [{ issue: 2, url: pr.url }] });
+    assert.equal(github.writes, 0);
+  });
+});
 
 describe('watch', () => {
   test('starts the lowest-numbered ready issue', async () => {
