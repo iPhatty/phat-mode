@@ -130,7 +130,7 @@ const PARENT_MAX_CHARS = 20_000;
 export const scratchFor = (workspace: string) => `${workspace}-scratch`;
 
 const NO_VERIFY_SKILL =
-  'This repo has no verification skill (a `verify-*` skill in `.agents/skills`, `.claude/skills` or `.cursor/skills`). Create one with `/create-verification-skill`.';
+  'This repo has no verification skill (a `verify-*` skill in `.agents/skills`, `.claude/skills` or `.cursor/skills`). Create one with `/create-verification-skill` (`phat-mode init` installs it).';
 
 const axisCount = (report: AxisReport<unknown> | null) =>
   report === null ? 'no report' : `${report.findings.length} finding${report.findings.length === 1 ? '' : 's'}`;
