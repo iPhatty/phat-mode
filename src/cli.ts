@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile, writeFile } from 'node:fs/promises';
+import { access, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
@@ -25,10 +25,11 @@ import { detectCommands, installProjectSkills, readiness, settingsFile } from '.
 import { LockedError } from './lock.ts';
 import { consoleLogger, consoleLoggerFor } from './log.ts';
 import type { Services } from './pipeline.ts';
-import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef } from './repos.ts';
+import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef, watchScope } from './repos.ts';
 import { describeResult, type RunRecord, runStatus } from './runs.ts';
 import { MATTPOCOCK_SKILLS } from './skills.ts';
 import { describeStep, nextStep } from './watch.ts';
+import { runOrWait, SETTLE_MS, waitToMerge } from './yolo.ts';
 import { CommandChecks, GitWorkspaces, tail } from './workspace.ts';
 
 const context = BACKGROUND_CONTEXT;
@@ -44,8 +45,11 @@ Usage:
   phat-mode doctor [repo]       Check that everything phat-mode needs is set up
   phat-mode run <issue>         Work on a ready-for-agent issue until a PR is open, or shape an agent-mode
                                 issue (resumes if interrupted)
+                                --yolo: then merge the PR once it is clean and every check passed
   phat-mode resume              Continue every run that was interrupted
-  phat-mode watch [repo...]     Keep going: work on the next ready issue each time you merge a PR (Ctrl-C to stop)
+  phat-mode watch [repo...]     Keep going: work on the next ready issue each time you merge a PR (Ctrl-C to stop).
+                                In a set-up repo, asks whether to watch it alone or all your repos.
+                                --yolo: merge phat-mode's PRs itself once they are clean and every check passed
   phat-mode status              List runs and where they are
   phat-mode abort <issue>       Stop the run for an issue
 
@@ -140,12 +144,17 @@ const firstLine = (error: unknown) => (error instanceof Error ? error.message.sp
  * the first ready issue, in the order the repos are listed. Within a repo, nothing new starts while a phat-mode pull
  * request is open; other repos carry on. See src/watch.ts.
  */
-async function watch(machine: MachineConfig, repos: string[]): Promise<number> {
+const YOLO_WARNING =
+  '⚠ --yolo: phat-mode merges its own pull requests (squash) when it found them clean, every check passed and the ' +
+  `commit is ${SETTLE_MS / 60_000} minutes old. It never bypasses branch protection.`;
+
+async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Promise<number> {
   const configFor = repoConfigs(machine);
   const phat = await open(machine, configFor);
   phat.harness.resume();
   const minutes = Math.round(machine.watchIntervalMs / 60_000) || 1;
   consoleLogger.info(`Watching ${repos.join(', ')}: one issue at a time, looking every ${minutes} min. Ctrl-C to stop.`);
+  if (yolo) consoleLogger.info(YOLO_WARNING);
   // What was last said about each repo: say it once, not on every look.
   const last = new Map<string, string>();
   const say = (repo: string, text: string, log = consoleLogger.info) => {
@@ -163,7 +172,7 @@ async function watch(machine: MachineConfig, repos: string[]): Promise<number> {
       if (ran) break;
       try {
         const config = await configFor(repo);
-        const step = await nextStep(new GhGitHub(repo), config, consoleLoggerFor(repo));
+        const step = await nextStep(new GhGitHub(repo), config, consoleLoggerFor(repo), { yolo });
         say(repo, describeStep(step));
         if (step.kind === 'start') {
           const { taskId } = await phat.start({ repo, issue: step.issue }, context);
@@ -181,6 +190,24 @@ async function watch(machine: MachineConfig, repos: string[]): Promise<number> {
     }
     await new Promise((resolve) => setTimeout(resolve, machine.watchIntervalMs));
   }
+}
+
+/** `run --yolo`, once the pull request is open: wait until it merges (0) or only you can move it on (1). */
+async function yoloWait(github: GhGitHub, issue: number, intervalMs: number): Promise<number> {
+  const minutes = Math.round(intervalMs / 60_000) || 1;
+  consoleLogger.step(issue, `Waiting to merge, looking every ${minutes} min. Ctrl-C to stop; \`phat-mode run --yolo ${issue}\` waits again.`);
+  const outcome = await waitToMerge(github, issue, {
+    intervalMs,
+    now: () => new Date(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    say: (reason) => consoleLogger.step(issue, `Not merged yet: ${reason}`),
+  });
+  if (outcome.merged) {
+    console.log(`\n✓ Merged ${outcome.url}`);
+    return 0;
+  }
+  console.log(`\n✖ Not merging${outcome.url ? ` ${outcome.url}` : ''}: ${outcome.reason}. It is yours to look at.`);
+  return 1;
 }
 
 async function login(machine: MachineConfig, fromPi: boolean): Promise<number> {
@@ -427,6 +454,44 @@ const repoServices = (machine: MachineConfig) => {
   return async (repo: string) => servicesFor(await configFor(repo));
 };
 
+/** The repo of this folder, and whether it is set up: has a .phat-mode.json, from `phat-mode init`. */
+async function repoHere(): Promise<{ repo: string; setUp: boolean } | undefined> {
+  const top = await run('git', ['rev-parse', '--show-toplevel'], { allowFailure: true });
+  if (top.code !== 0) return undefined;
+  const root = top.stdout.trim();
+  const repo = await currentRepo(root);
+  if (repo === undefined) return undefined;
+  const setUp = await access(join(root, REPO_SETTINGS_FILE)).then(
+    () => true,
+    () => false,
+  );
+  return { repo, setUp };
+}
+
+/** Ask whether to watch only `here` or `all` repos. Not at a terminal, nobody can answer: all, as before. */
+async function chooseWatchRepos(here: string, all: string[]): Promise<string[]> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(`${here} is set up for phat-mode; watching all ${all.length} repos. Run \`phat-mode watch ${here}\` to watch it alone.`);
+    return all;
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  // Ctrl-C at the question stops, as it does everywhere else.
+  rl.on('SIGINT', () => {
+    rl.close();
+    process.exit(130);
+  });
+  try {
+    console.log(`This folder is ${here}, set up for phat-mode. Watch:\n  1) ${here} only\n  2) all ${all.length} repos: ${all.join(', ')}`);
+    for (;;) {
+      const answer = (await rl.question('Choice [1]: ')).trim();
+      if (answer === '' || answer === '1') return [here];
+      if (answer === '2') return all;
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 /** Repos named on the command line, else the ones in config.json, else this folder's. */
 async function reposFrom(args: string[], machine: MachineConfig): Promise<string[]> {
   const bad = args.filter((arg) => !isRepoName(arg));
@@ -454,22 +519,35 @@ async function main(argv: string[]): Promise<number> {
     case 'status':
       return status(machine);
     case 'run': {
-      if (args[0] === undefined) {
-        console.error('Usage: phat-mode run <issue>   (12, owner/name#12 or the issue URL)');
+      const yolo = args.includes('--yolo');
+      const ref = args.find((arg) => arg !== '--yolo');
+      if (ref === undefined) {
+        console.error('Usage: phat-mode run [--yolo] <issue>   (12, owner/name#12 or the issue URL)');
         return 2;
       }
-      const { repo, issue } = parseIssueRef(args[0], await currentRepo());
+      const { repo, issue } = parseIssueRef(ref, await currentRepo());
       const configFor = repoConfigs(machine);
       // Fail before starting if the repo is not set up, rather than inside the run.
       await configFor(repo);
       // An agent-mode issue is shaped, not built. A run still going is resumed whatever its kind.
       const agentMode = (await configFor(repo)).labels.agentMode;
-      const kind: RunKind = (await new GhGitHub(repo).getIssue(issue)).labels.includes(agentMode) ? 'shape' : 'build';
+      const github = new GhGitHub(repo);
+      const kind: RunKind = (await github.getIssue(issue)).labels.includes(agentMode) ? 'shape' : 'build';
       const phat = await open(machine, configFor);
-      const { taskId, resumed } = await phat.start({ repo, issue }, context, kind);
-      consoleLogger.info(`${resumed ? 'Resuming' : kind === 'shape' ? 'Shaping' : 'Starting'} ${repo}#${issue}`);
-      phat.harness.resume();
-      const code = await waitAndReport(phat, taskId);
+      if (yolo) consoleLogger.info(YOLO_WARNING);
+      const runGoing = (await liveRuns(phat)).some((run) => run.key === `${repo}#${issue}`);
+      if (!yolo || (await runOrWait(github, issue, { runGoing })) === 'run') {
+        const { taskId, resumed } = await phat.start({ repo, issue }, context, kind);
+        consoleLogger.info(`${resumed ? 'Resuming' : kind === 'shape' ? 'Shaping' : 'Starting'} ${repo}#${issue}`);
+        phat.harness.resume();
+        const code = await waitAndReport(phat, taskId);
+        const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
+        if (!yolo || code !== 0 || outcome.status !== 'completed' || outcome.result.status !== 'pr_opened') {
+          await phat.close(context);
+          return code;
+        }
+      }
+      const code = await yoloWait(github, issue, machine.watchIntervalMs);
       await phat.close(context);
       return code;
     }
@@ -487,12 +565,19 @@ async function main(argv: string[]): Promise<number> {
       return code;
     }
     case 'watch': {
-      const repos = await reposFrom(args, machine);
+      const yolo = args.includes('--yolo');
+      const named = args.filter((arg) => arg !== '--yolo');
+      let repos: string[];
+      if (named.length > 0) repos = await reposFrom(named, machine);
+      else {
+        const scope = watchScope(machine.repos, await repoHere());
+        repos = 'repos' in scope ? scope.repos : await chooseWatchRepos(scope.choose.here, scope.choose.all);
+      }
       if (repos.length === 0) {
         console.error('✖ Which repos? Run it in a clone, name them (phat-mode watch owner/name), or list them under "repos" in ~/.phat-mode/config.json.');
         return 2;
       }
-      return watch(machine, repos);
+      return watch(machine, repos, yolo);
     }
     case 'abort': {
       if (args[0] === undefined) {

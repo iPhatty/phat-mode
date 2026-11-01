@@ -62,7 +62,7 @@ One process owns the database, runs the work, and serves clients.
   - [ ] `GET /api/events`: Server-Sent Events from `watchTaskGraph()` and run changes
   - [ ] `GET /api/runs/:repo/:issue/agents/:role/events`: SSE of that conversation's `watchEvents()`, snapshot first
   - [ ] `GET /api/usage`: cost per run, per role, per model, and totals for today
-- [ ] Shared API types in one module (`src/api-types.ts`) that the TanStack Start app imports, so both sides stay in step
+- [ ] Shared API types in one module (`src/api-types.ts`) that the dashboard (`web/`) imports, so both sides stay in step
 - [ ] Security: bind to loopback only, random token in `~/.phat-mode/serve.json` (owner-only). The CLI sends it as
       a header; the browser exchanges the one-time URL token for an `HttpOnly`, `SameSite=Strict` cookie. Check
       `Origin`/`Host` on every request (no CSRF, no DNS rebinding)
@@ -88,20 +88,18 @@ One process owns the database, runs the work, and serves clients.
 
 Served by the daemon at `http://127.0.0.1:<port>/`. First version only shows things; no controls.
 
-- [ ] Set up the TanStack Start app (React, TypeScript, Vite) in `web/`, with its own `package.json` so the CLI's
-      dependencies stay small
-  - [ ] **SPA mode** (`spa: { enabled: true }` in the Start Vite plugin): the build writes static client files plus
-        a prerendered shell (`_shell.html`). `phat-mode serve` serves `web/dist/client` from the same origin as the
-        API and sends any other non-`/api` path to the shell. One process, one port, no Start server at runtime
-        (see Decisions)
-  - [ ] No server functions or server routes: the daemon's `/api/*` is the only backend
+- [ ] Set up a Vite + React + TypeScript app in `web/` with TanStack Router, with its own `package.json` so the
+      CLI's dependencies stay small
+  - [ ] Plain single-page app: `vite build` writes static files to `web/dist`. `phat-mode serve` serves them from the
+        same origin as the API and sends any other non-`/api` path to `index.html`, so deep links work. One
+        process, one port, no frontend server at runtime (see Decisions)
+  - [ ] The daemon's `/api/*` is the only backend
   - [ ] Data in the browser with TanStack Query against `/api/*`; SSE (`EventSource`) updates the query cache
-  - [ ] File-based routes with TanStack Router: `/` (runs) and `/runs/$owner/$repo/$issue` (run page), typed params;
-        filters (repo, status) as typed search params
+  - [ ] File-based routes with the TanStack Router Vite plugin: `/` (runs) and `/runs/$owner/$repo/$issue` (run
+        page), typed params; filters (repo, status) as typed search params
   - [ ] Dev loop: `vite dev` with `server.proxy` sending `/api/*` to a running `phat-mode serve`
   - [ ] Root scripts: `npm run web:build`, `npm run web:dev`; `npm run check` also type-checks and builds `web/`
-  - [ ] `phat-mode serve` explains how to build the dashboard if `web/dist/client` is missing
-  - [ ] Check the SPA-mode option names and output paths against the current TanStack Start docs while setting up
+  - [ ] `phat-mode serve` explains how to build the dashboard if `web/dist` is missing
   - [ ] Pick a styling approach (e.g. Tailwind) and record it under Decisions
 - [ ] **Runs page**
   - [ ] One row per issue: repo, title, phase, status badge (working, PR opened, needs info, needs human, failed, ignored,
@@ -145,10 +143,15 @@ Served by the daemon at `http://127.0.0.1:<port>/`. First version only shows thi
 Record decisions here with a date.
 
 - 2026-10-18: No terminal `watch` view; the local web dashboard is the main UI.
-- 2026-10-18: Frontend is **TanStack Start** (replaces the earlier Next.js choice), in `web/`. Proposed: SPA mode,
-  built to static files served by the daemon, so there is one process and one port and the daemon keeps sole
-  ownership of the database. Start's server functions are not used. Revisit if a feature needs a Start server
-  (none planned).
+- 2026-10-18: Frontend is a **single-page app with Vite, React, TanStack Router and TanStack Query**, in `web/`,
+  built to static files served by the daemon. History: Next.js, then TanStack Start, then this. A server-backed
+  frontend was rejected: (B) a separate frontend server would need a second process and could only forward calls to
+  the daemon because of the database lock; (C) a frontend server embedded in the daemon needs fragile wiring to
+  share the harness, still needs a separate API for the CLI, and couples the daemon to the frontend build. With a
+  plain single-page app, TanStack Start's extras (server functions, SSR) would go unused, so plain Router + Vite has
+  fewer moving parts. Result: one process, one port, the daemon as sole owner of the database, and one API shared
+  by the dashboard and the CLI. If the hand-written API gets tedious, add a typed RPC layer (e.g. tRPC or Hono RPC)
+  in the daemon.
 - 2026-10-18: The daemon starts **only by hand** (`phat-mode serve`); no `launchd` or auto-start.
 - 2026-10-18: Cost is shown in **both** the dashboard and the GitHub status comment.
 - 2026-10-18: **One repo for now, several later.** Not built yet, but nothing should assume one repo: API routes,
@@ -157,7 +160,6 @@ Record decisions here with a date.
 ## Open questions
 
 - Merge `MARKERS.plan` / `MARKERS.result` into the status comment, or keep them separate? (Phase 1)
-- SPA mode vs. a Start server: confirm SPA mode when setting up `web/`. (Phase 4)
 
 ## Later: several repos
 
@@ -173,4 +175,4 @@ Not scheduled. Notes so the earlier phases do not block it:
 
 | Date | Done | Next |
 |---|---|---|
-| 2026-10-18 | Wrote this plan. Decided: TanStack Start (was Next.js), manual start, cost in dashboard and comment, multi-repo later. | Phase 1: status comment. |
+| 2026-10-18 | Wrote this plan. Decided: Vite + TanStack Router single-page app (was Next.js, then TanStack Start), manual start, cost in dashboard and comment, multi-repo later. | Phase 1: status comment. |

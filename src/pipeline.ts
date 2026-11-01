@@ -66,6 +66,7 @@ import {
 } from './prompts.ts';
 import { askForReport, failureGuard, perRepo, StepFailure } from './task-kit.ts';
 import { type Checks, EVIDENCE_BRANCH, tail, type Workspaces } from './workspace.ts';
+import { verdictFor, yoloMarker } from './yolo.ts';
 
 export type Services = {
   config: Config;
@@ -635,10 +636,10 @@ function repoPhases(services: Services) {
         if ((await workspaces.commitsAhead(workspace)) === 0) {
           throw new StepFailure('There are no changes to open a pull request with.');
         }
-        await workspaces.push(workspace, issue.number);
+        const pushed = await workspaces.push(workspace, issue.number);
 
         const evidenceUrls = await publishEvidence(issue.number, state.verification);
-        const body = pullRequestBody({
+        const described = pullRequestBody({
           issue,
           spec: state.spec,
           plan: state.plan,
@@ -650,6 +651,7 @@ function repoPhases(services: Services) {
           unresolved: state.unresolved,
           checkCommand: config.checkCommand,
         });
+        const body = `${described}\n\n${yoloMarker(verdictFor(pushed, state))}`;
         let pr = await github.findPullRequest(branch);
         if (pr === undefined) {
           pr = await github.createPullRequest({ branch, base: config.baseBranch, title: pullRequestTitle(issue), body });

@@ -6,7 +6,7 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import type { ToolResultMessage } from '@earendil-works/pi-ai';
 import { type FauxResponseFactory, type FauxResponseStep, fauxAssistantMessage } from '@earendil-works/pi-ai/providers/faux';
 import { setToolLogger } from '../src/agents.ts';
-import { paths } from '../src/config.ts';
+import { branchFor, paths } from '../src/config.ts';
 import { run } from '../src/exec.ts';
 import { call, expectLast, fixture, textOf } from './fixture.ts';
 import { type RunResult, RunsDoc } from '../src/harness.ts';
@@ -14,6 +14,7 @@ import { LockedError } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
 import type { SpecFinding, StandardsFinding } from '../src/code-review.ts';
 import type { PipelineResult, Services } from '../src/pipeline.ts';
+import { readYoloMarker } from '../src/yolo.ts';
 
 const context = BACKGROUND_CONTEXT;
 setToolLogger(silentLogger);
@@ -123,6 +124,16 @@ const result = (outcome: { status: string; result?: RunResult }) => {
   return outcome.result as PipelineResult;
 };
 
+/** The commit on the issue's branch in the local "GitHub" repository. */
+const pushedCommit = async (remote: string, issue: number) =>
+  (await run('git', ['--git-dir', remote, 'rev-parse', branchFor(issue)])).stdout.trim();
+
+/** Why phat-mode marked the PR not clean; 'clean' when it did not, undefined when there is no marker. */
+const yoloReason = (body: string) => {
+  const marker = readYoloMarker(body);
+  return marker?.verdict === 'not-clean' ? marker.reason : marker?.verdict;
+};
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe('pipeline', () => {
@@ -154,6 +165,13 @@ describe('pipeline', () => {
     assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:done', 'ready-for-agent']);
     // On the PR, ready-for-human means: ready for a human to review and merge.
     assert.deepEqual(github.labels(pr!.number), ['ready-for-human']);
+  });
+
+  test('a clean run marks the PR clean for yolo, with the exact commit it pushed; no verify skill is the repo’s choice', async () => {
+    const { github, runIssue, remote } = await fixture();
+    github.addIssue(1);
+    await runIssue(1, [plan(), write('hello.txt', 'hello\n'), done(), ...approve(), describePr()]);
+    assert.deepEqual(readYoloMarker(github.prs[0]!.body), { verdict: 'clean', sha: await pushedCommit(remote, 1) });
   });
 
   test('a draft pull request left from an earlier run is updated and made ready for review', async () => {
@@ -370,6 +388,17 @@ describe('pipeline', () => {
       assert.match(body, /- ❌ \*\*hello\*\* \(`hello-shown`\): Still "helo"\. Caused by this change\./);
     });
 
+    test('a failure this change caused, still open: not clean for yolo', async () => {
+      const { github, runIssue } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(54);
+      const failing = () => verificationReport([{ status: 'failed', detail: 'Still "helo".' }]);
+      await runIssue(54, [
+        plan(), write('hello.txt', 'helo\n'), done(), ...approve(), failing(),
+        write('hello.txt', 'helo!\n'), done(), ...approve(), failing(), describePr(),
+      ]);
+      assert.equal(yoloReason(github.prs[0]!.body), 'verification found failures this change caused');
+    });
+
     test('the implementer cannot change the verification skill; feature map edits are allowed and flagged', async () => {
       const { github, runIssue, remoteFile } = await fixture(VERIFY_SKILL_FILES);
       github.addIssue(55);
@@ -392,6 +421,56 @@ describe('pipeline', () => {
       const body = github.prs[0]!.body;
       assert.match(body, /ℹ️ \*\*This change edits the feature map\*\* \(`\.agents\/skills\/verify-app\/features\/hello\.md`\)/);
       assert.match(body, /⚠️ \*\*The implementer changed the verification skill\*\* \(`\.agents\/skills\/verify-app\/scripts\/launch\.sh`\)\. Those changes were reverted/);
+    });
+
+    test('verification could not run: not clean for yolo', async () => {
+      const { github, runIssue } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(57);
+      await runIssue(57, [
+        plan(), write('hello.txt', 'hello\n'), done(), ...approve(),
+        verificationReport([], { couldNotRun: 'No simulator on this Mac.' }), describePr(),
+      ]);
+      assert.equal(yoloReason(github.prs[0]!.body), 'verification could not run');
+    });
+
+    test('the verifier never reports: not clean for yolo', async () => {
+      const { github, runIssue } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(58);
+      await runIssue(58, [
+        plan(), write('hello.txt', 'hello\n'), done(), ...approve(),
+        fauxAssistantMessage('It works.'), fauxAssistantMessage('Really, it works.'), describePr(),
+      ]);
+      assert.equal(yoloReason(github.prs[0]!.body), 'the verifier did not report');
+    });
+
+    test('the implementer changed the verification skill, even though it was reverted: not clean for yolo', async () => {
+      const { github, runIssue } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(59);
+      await runIssue(59, [
+        plan(),
+        call('bash', { command: "echo 'exit 0' > .agents/skills/verify-app/scripts/launch.sh" }),
+        write('hello.txt', 'hello\n'),
+        done(),
+        ...approve(),
+        verificationReport([{}]),
+        describePr(),
+      ]);
+      assert.equal(yoloReason(github.prs[0]!.body), 'the implementer changed the verification skill');
+    });
+
+    test('feature map edits and failures that also happen on the base branch: still clean for yolo', async () => {
+      const { github, runIssue } = await fixture(VERIFY_SKILL_FILES);
+      github.addIssue(60);
+      await runIssue(60, [
+        plan(),
+        write('.agents/skills/verify-app/features/hello.md', '# Hello\n\nSays hello.\n'),
+        write('hello.txt', 'hello\n'),
+        done(),
+        ...approve(),
+        verificationReport([{ status: 'failed', preExisting: true, detail: 'The footer overlaps.' }]),
+        describePr(),
+      ]);
+      assert.equal(yoloReason(github.prs[0]!.body), 'clean');
     });
 
     test('no verification skill: skipped, and the PR says how to add one', async () => {
@@ -650,6 +729,46 @@ describe('pipeline', () => {
     assert.match(body, /### Spec\n\nspec has problems\.\n\n- \*\*Looks wrong\*\* in `hello\.txt`: still a problem\n  > A hello\.txt file says hello\.\n- \*\*Bug\*\* in `hello\.txt`: console\.log left in/);
     assert.doesNotMatch(body, /first problem/);
     assert.match(body, /Spec: 2 findings \(worst: still a problem\)/);
+  });
+
+  test('must-fix findings still open: not clean for yolo', async () => {
+    const { github, runIssue, remote } = await fixture();
+    github.addIssue(4);
+    await runIssue(4, [
+      plan(),
+      write('hello.txt', 'a\n'),
+      done(),
+      ...review({ standards: [violation('no tests')] }),
+      write('hello.txt', 'b\n'),
+      done(),
+      ...review({ standards: [violation('still no tests'), smell('odd name')] }),
+      describePr(),
+    ]);
+    assert.deepEqual(readYoloMarker(github.prs[0]!.body), {
+      verdict: 'not-clean',
+      sha: await pushedCommit(remote, 4),
+      reason: 'code review has open findings',
+    });
+  });
+
+  test('only smells left: still clean for yolo, as smells never block', async () => {
+    const { github, runIssue } = await fixture();
+    github.addIssue(4);
+    await runIssue(4, [plan(), write('hello.txt', 'a\n'), done(), ...review({ standards: [smell('odd name')] }), describePr()]);
+    assert.equal(yoloReason(github.prs[0]!.body), 'clean');
+  });
+
+  test('a reviewer that never reports: not clean for yolo', async () => {
+    const { github, runIssue } = await fixture();
+    github.addIssue(4);
+    // The Standards reviewer only ever answers in prose, also when nudged; the Spec reviewer approves.
+    const answer: FauxResponseFactory = (request) => {
+      const text = textOf(request.messages.at(-1) as { content: unknown });
+      if (text.includes('Standards axis') || text.includes('report_standards')) return fauxAssistantMessage('Looks fine to me.');
+      return call('report_spec', { summary: 'spec looks good.', worst: '', findings: [] });
+    };
+    await runIssue(4, [plan(), write('hello.txt', 'a\n'), done(), answer, answer, answer, describePr()]);
+    assert.equal(yoloReason(github.prs[0]!.body), 'a code reviewer did not report');
   });
 
   test('uses the Agent Brief as the spec, and lists its acceptance criteria on the PR', async () => {

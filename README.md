@@ -21,7 +21,7 @@ phat-mode is the **AFK agent** in a [mattpocock/skills](https://github.com/mattp
 7. **Describe** (AI, the implementer): writes the PR description following Matt Pocock's [pr](https://github.com/mattpocock/skills/blob/main/skills/engineering/pr/SKILL.md) skill: **Summary** (the smallest diagram that makes the point), **Evidence** (before and after) and **Merge Danger** (one- or two-way door, blast radius). It must not change files; if it does, the change is checked and reviewed again.
 8. **Publish** (code): commits, pushes, and opens a PR, ready for review, labelled `ready-for-human`. (A draft left by an earlier version is updated and made ready for review.) The description is the pr skill's three sections, then what phat-mode adds: its own verified check result under Evidence, the acceptance criteria to tick off, the code review, and `Closes #N`.
 
-It never merges and never pushes to `main`. You review and merge every PR.
+It never pushes to `main`, and it never merges unless you run it with [`--yolo`](#yolo). Otherwise you review and merge every PR.
 
 ### The spec
 
@@ -73,18 +73,31 @@ Every way out removes `agent-mode`. Everything shaping writes starts with `> *Sh
 
 ## Watch
 
-`phat-mode watch` keeps going on its own: after you merge a PR, it starts the next issue. It works on the repos named on the command line (`phat-mode watch owner/a owner/b`), else the `repos` in your config.json (`phat-mode init` adds each repo it sets up), else the repo of the current folder. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes).
+`phat-mode watch` keeps going on its own: after you merge a PR, it starts the next issue. It works on the repos named on the command line (`phat-mode watch owner/a owner/b`), else the `repos` in your config.json (`phat-mode init` adds each repo it sets up), else the repo of the current folder. Run inside a set-up repo (one with `.phat-mode.json`) while other repos are listed, it asks whether to watch that repo alone (the default) or all of them; when it cannot ask (not a terminal), it watches all. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes).
 
 One run at a time across all repos, in the order they are listed. The rules below apply per repo: a PR waiting for you in one repo does not hold up the others. Each time, for each repo, it:
 
 1. finishes any run that is still going;
-2. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge;
+2. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge (with [`--yolo`](#yolo), it merges the ones it can first, lowest issue first, and says why it does not merge the others);
 3. hands an issue to a human if its PR was closed without merging (`ready-for-human`, with a comment; label it `ready-for-agent` again to retry);
 4. starts the **lowest-numbered issue that is ready and not blocked**: open, `ready-for-agent`, specified by a trusted author, no open blockers, and not `phat-mode:working` or `phat-mode:done`. `phat-mode:failed` with `ready-for-agent` again means: try again.
 
 Merging a PR closes its issue (`Closes #N`), which unblocks the issues that wait for it, so blockers set up as GitHub issue dependencies or `Blocked by` lines give the order. When nothing can start, it says why, once: e.g. `#9 is blocked by #18 (ready-for-human)`.
 
 It polls rather than using GitHub webhooks: a webhook needs a public address for your Mac, and anything sent while the Mac sleeps would be lost. Polling works out everything from GitHub on each look, so it catches up after sleep, Ctrl-C or a crash. While `watch` runs, it holds the lock: `status`, `run` and `abort` say phat-mode is already running.
+
+### Yolo
+
+`phat-mode watch --yolo` and `phat-mode run --yolo <issue>` also merge phat-mode's pull requests, so a queue of issues can go all the way to `main` without you. It prints a warning when it starts; the flag is never saved. It squash-merges a PR (and deletes its branch) only when:
+
+1. **phat-mode found it clean**: both reviewers reported and no must-fix findings are open, and verification either was skipped (no verify skill in the repo) or ran, reported, and left no failure this change caused. Every PR description carries phat-mode's verdict in a hidden marker, with the commit it pushed; no marker, no merge.
+2. **nobody pushed since**: the head is still the commit phat-mode judged (and the merge is pinned to it);
+3. **it has settled**: that commit is at least 5 minutes old, so checks still being queued show up;
+4. **every check passed**: every check run and commit status on it, required or not (skipped and neutral count). A PR with no checks merges: phat-mode's own checks, review and verification passed it.
+
+Checks running or settling: it waits. Anything else is yours, with one line saying why: `not merging: checks failed: ci/test`, `code review has open findings`, `commits added after phat-mode`, `GitHub refused: …`. It never bypasses branch protection (no `--admin`) and only squash-merges. Each merge gets a comment on the PR.
+
+`run --yolo` opens the PR as `run` does, then looks every `watchIntervalMs` until it merges (exit 0) or something needs you (exit 1, with the reason). Ctrl-C is safe: `run --yolo <issue>` again goes straight back to waiting when the PR is open and no run is going. Why it works this way: [ADR 0002](docs/adr/0002-yolo-merges.md).
 
 ## Code review
 
@@ -159,8 +172,8 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 | Command | |
 |---|---|
 | `phat-mode init` | Set up the repo in this folder. See [Setup](#setup). |
-| `phat-mode watch [repo…]` | Work through the ready issues one at a time, until Ctrl-C. See [Watch](#watch). |
-| `phat-mode run <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. |
+| `phat-mode watch [--yolo] [repo…]` | Work through the ready issues one at a time, until Ctrl-C. In a set-up repo, asks: this repo or all. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
+| `phat-mode run [--yolo] <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. `--yolo` then waits and merges the PR. See [Yolo](#yolo). |
 | `phat-mode resume` | Continue every interrupted run, building or shaping. |
 | `phat-mode status` | List runs (every repo): shaping or building, and where they are. |
 | `phat-mode abort <issue>` | Stop a run. |
@@ -211,7 +224,7 @@ Optional; anything left out uses the defaults in [`src/config.ts`](src/config.ts
 ```
 
 - `limits`: also `maxGrillRounds` (6) and `maxTickets` (8), for agent mode's shaping.
-- `repos`: what `watch` works on when no repos are named. `init` adds to it.
+- `repos`: what `watch` works on when no repos are named (inside a set-up repo, it asks: that one or all). `init` adds to it.
 - `allowedAuthors`: trusted on every repo that does not list its own. Default: you, the `gh` user.
 - Repo settings (`checkCommand`, `repo`, …) here are an error, pointing to `.phat-mode.json`.
 
@@ -243,6 +256,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 - Issue and brief text is treated as untrusted input in every prompt.
 - Public repos: only pull requests from branches in the repo itself count as phat-mode's (a fork's `phat-mode/issue-N` branch is ignored), and only comments posted by the `gh` user are updated as phat-mode's own.
 - Agents never touch git history or GitHub: `git push/commit/checkout/...` and `gh` are blocked. The pipeline does those itself.
+- phat-mode only merges with `--yolo`, only the exact commit it judged clean, after every check passed, and never past branch protection. See [Yolo](#yolo).
 - Only the implementer can write files, and only inside its workspace (never `.git`). Shaping's checkout is read-only on disk too (its files and folders, `node_modules` aside), and its agent may not change permissions, so commands it runs cannot change it.
 - Agent commands run without your tokens in their environment, and credential folders are blocked, for commands and for the read tool (checked where a path really leads, so symlinks and `..` do not get around it).
 - **Not a sandbox yet.** Agents run shell commands as you, on your Mac. Use it on repos and issues you trust. Containers come in a later stage.
@@ -256,6 +270,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 - `src/verify.ts`: finds the repo's verify skill, protects it, collects evidence, and decides what blocks.
 - `src/skills.ts`: the pinned mattpocock/skills version, and which skills `init` installs. `src/pr.ts`: the pr skill and evidence sources.
 - `src/code-review.ts`: reads phat-mode's pinned code-review skill, finds standards sources, and decides what must be fixed.
+- `src/yolo.ts`: `--yolo`: the verdict a run writes on its PR, and whether and when to merge it. `src/watch.ts`: what `watch` does next.
 - `src/agents.ts`: the build agents (planner, implementer, Standards and Spec reviewers, verifier) and shaping's answerer, their tools, the report tools agents finish with, and the guard hook.
 - `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code.
 - Issue comments carry hidden markers, so a rerun updates its comment instead of posting again.

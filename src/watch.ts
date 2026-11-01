@@ -3,6 +3,7 @@ import { commentMarker, type GitHub, type ListedIssue, mergeLabels, PROGRESS_LAB
 import type { Logger } from './log.ts';
 import { handedBackComment } from './messages.ts';
 import { eligibility } from './spec.ts';
+import { yoloMerge } from './yolo.ts';
 
 /**
  * What `phat-mode watch` does next, worked out from GitHub alone each time, so nothing needs saving between looks:
@@ -13,12 +14,17 @@ import { eligibility } from './spec.ts';
  * (`Closes #N`), which also unblocks the issues that wait for it.
  */
 export type WatchStep =
-  /** phat-mode's pull requests waiting for a human to merge (or close) them. */
-  | { kind: 'wait_for_merge'; prs: { issue: number; url: string }[] }
+  /**
+   * phat-mode's pull requests waiting for a human to merge (or close) them. With yolo, `notMerging` says why each was
+   * not merged, and whether only a human can move it on.
+   */
+  | { kind: 'wait_for_merge'; prs: WaitingPullRequest[] }
   /** The lowest-numbered issue that is ready and not blocked. */
   | { kind: 'start'; issue: number; title: string }
   /** Nothing can start. `waiting`: why each ready issue cannot, one line each. */
   | { kind: 'idle'; waiting: string[] };
+
+export type WaitingPullRequest = { issue: number; url: string; notMerging?: { needsYou: boolean; reason: string } };
 
 const PR_BRANCH = /^phat-mode\/issue-(\d+)$/;
 
@@ -27,15 +33,35 @@ export const MARKER_HANDED_BACK = commentMarker('handed-back');
 const progressOf = (issue: Pick<ListedIssue, 'labels'>) =>
   RUN_PROGRESS.find((key) => issue.labels.includes(PROGRESS_LABELS[key].name));
 
-export async function nextStep(github: GitHub, config: Config, logger: Logger): Promise<WatchStep> {
+/** `yolo`: merge phat-mode's pull requests that nothing is left for a human to look at (see src/yolo.ts). */
+export type WatchOptions = { yolo?: boolean; now?: Date };
+
+export async function nextStep(
+  github: GitHub,
+  config: Config,
+  logger: Logger,
+  { yolo = false, now = new Date() }: WatchOptions = {},
+): Promise<WatchStep> {
   const { labels } = config;
 
-  // 1. A phat-mode pull request is open: wait for the human to merge it.
-  const open = (await github.openPullRequests()).flatMap((pr) => {
-    const match = PR_BRANCH.exec(pr.branch);
-    return match ? [{ issue: Number(match[1]), url: pr.url }] : [];
-  });
-  if (open.length > 0) return { kind: 'wait_for_merge', prs: open.sort((a, b) => a.issue - b.issue) };
+  // 1. A phat-mode pull request is open: wait for the human to merge it. With yolo, merge the ones that can go first.
+  const open = (await github.openPullRequests())
+    .flatMap((pr) => {
+      const match = PR_BRANCH.exec(pr.branch);
+      return match ? [{ number: pr.number, issue: Number(match[1]), url: pr.url }] : [];
+    })
+    .sort((a, b) => a.issue - b.issue);
+  const unmerged: WaitingPullRequest[] = [];
+  for (const pr of open) {
+    if (!yolo) {
+      unmerged.push({ issue: pr.issue, url: pr.url });
+      continue;
+    }
+    const outcome = await yoloMerge(github, pr, { command: 'watch', now });
+    if (outcome.merged) logger.step(pr.issue, `Merged ${pr.url}`);
+    else unmerged.push({ issue: pr.issue, url: pr.url, notMerging: { needsYou: outcome.needsYou, reason: outcome.reason } });
+  }
+  if (unmerged.length > 0) return { kind: 'wait_for_merge', prs: unmerged };
 
   const ready = await github.listOpenIssues(labels.readyForAgent);
 
@@ -108,8 +134,18 @@ export async function nextStep(github: GitHub, config: Config, logger: Logger): 
 /** One line (or a few) for the console. */
 export function describeStep(step: WatchStep): string {
   switch (step.kind) {
-    case 'wait_for_merge':
-      return `Waiting for you to merge ${step.prs.map((pr) => `#${pr.issue}: ${pr.url}`).join(', ')}`;
+    case 'wait_for_merge': {
+      if (step.prs.every((pr) => pr.notMerging === undefined)) {
+        return `Waiting for you to merge ${step.prs.map((pr) => `#${pr.issue}: ${pr.url}`).join(', ')}`;
+      }
+      const lines = step.prs.map(({ issue, url, notMerging }) =>
+        notMerging === undefined || notMerging.needsYou
+          ? `waiting for you to merge #${issue}: ${url}${notMerging ? ` (not merging: ${notMerging.reason})` : ''}`
+          : `waiting to merge #${issue}: ${url} (${notMerging.reason})`,
+      );
+      const text = lines.join('; ');
+      return text.charAt(0).toUpperCase() + text.slice(1);
+    }
     case 'start':
       return `Next: #${step.issue} ${step.title}`;
     case 'idle':

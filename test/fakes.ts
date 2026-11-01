@@ -1,5 +1,5 @@
 import { type Config, defaultMachineConfig, repoConfig } from '../src/config.ts';
-import type { GitHub, Issue, LabelChange, PullRequest, PullRequestState } from '../src/github.ts';
+import type { GitHub, Issue, LabelChange, PullRequest, PullRequestState, PullRequestStatus } from '../src/github.ts';
 
 /** A repo's full settings, as phat-mode would build them from a .phat-mode.json with npm commands. */
 export const testConfig = (home: string, repo = 'test/repo', settings: Partial<Config> = {}): Config => ({
@@ -31,6 +31,30 @@ export class FakeGitHub implements GitHub {
   parents = new Map<number, number>();
   async parentIssue(issue: number) {
     return this.parents.get(issue);
+  }
+  /** Head commit and checks, by pull request number. */
+  statuses = new Map<number, Omit<PullRequestStatus, 'body'>>();
+  async pullRequestStatus(number: number) {
+    const pr = this.prs.find((candidate) => candidate.number === number)!;
+    const status = this.statuses.get(number) ?? { head: { sha: 'unknown', committedAt: '1970-01-01T00:00:00Z' }, checks: [] };
+    return structuredClone({ body: pr.body, ...status });
+  }
+  /** Merges done, and pull requests GitHub refuses to merge, with its reason. */
+  merges: { pr: number; sha: string }[] = [];
+  refuseMerge = new Map<number, string>();
+  async mergePullRequest(number: number, sha: string) {
+    const refused = this.refuseMerge.get(number);
+    if (refused !== undefined) throw new Error(`gh pr merge exited with 1: ${refused}`);
+    const head = this.statuses.get(number)?.head.sha;
+    if (head !== sha) throw new Error(`gh pr merge exited with 1: head is ${head}, not ${sha}`);
+    this.writes++;
+    this.merges.push({ pr: number, sha });
+    this.prs.find((pr) => pr.number === number)!.state = 'MERGED';
+  }
+  prComments: { pr: number; body: string }[] = [];
+  async commentOnPullRequest(pr: number, body: string) {
+    this.writes++;
+    this.prComments.push({ pr, body });
   }
 
   addIssue(number: number, fields: Partial<Issue> = {}) {

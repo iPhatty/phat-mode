@@ -17,7 +17,8 @@ export interface Workspaces {
   commitAll(workspace: string, message: string): Promise<boolean>;
   /** Commits on the issue branch that are not on the base branch. */
   commitsAhead(workspace: string): Promise<number>;
-  push(workspace: string, issue: number): Promise<void>;
+  /** Push the issue branch. Returns the commit pushed. */
+  push(workspace: string, issue: number): Promise<string>;
   /** A clean checkout of the base branch, for "before" evidence. One per repository, reset on every call. */
   prepareBase(): Promise<string>;
   /**
@@ -262,9 +263,11 @@ export class GitWorkspaces implements Workspaces {
     return Number(count.stdout.trim());
   }
 
-  async push(workspace: string, issue: number): Promise<void> {
+  async push(workspace: string, issue: number): Promise<string> {
     const branch = branchFor(issue);
-    await this.#git(workspace, ['push', '--force-with-lease', '--set-upstream', 'origin', `HEAD:refs/heads/${branch}`]);
+    const head = (await this.#git(workspace, ['rev-parse', 'HEAD'])).stdout.trim();
+    await this.#git(workspace, ['push', '--force-with-lease', '--set-upstream', 'origin', `${head}:refs/heads/${branch}`]);
+    return head;
   }
 }
 
