@@ -1,8 +1,8 @@
-import { access, cp, lstat, mkdir, readFile, symlink } from 'node:fs/promises';
+import { access, cp, lstat, mkdir, readdir, readFile, symlink } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { RepoSettings } from './config.ts';
-import { PROJECT_SKILLS, skillDir } from './skills.ts';
+import { PROJECT_SKILLS, skillDir, VERIFICATION_SKILLS } from './skills.ts';
 import { findVerifySkills, SKILL_ROOTS } from './verify.ts';
 
 const exists = (path: string) =>
@@ -93,15 +93,28 @@ const present = (path: string) =>
     () => false,
   );
 
+/** Whether the checkout has a `verify-*` skill in any skills folder, committed or not. */
+async function hasVerifySkill(root: string): Promise<boolean> {
+  for (const dir of SKILL_ROOTS) {
+    const names = await readdir(join(root, dir)).catch(() => [] as string[]);
+    for (const name of names) if (name.startsWith('verify-') && (await exists(join(root, dir, name, 'SKILL.md')))) return true;
+  }
+  return false;
+}
+
 /**
- * Copy phat-mode's pinned `PROJECT_SKILLS` into the repo's `.agents/skills/`, the folder most agents read. Never
- * replaces a skill the repo already has, in any skills folder: once there, the repo owns it. Claude Code reads only
- * `.claude/skills/`, so a repo that uses it (a `.claude/` folder or `CLAUDE.md`) also gets a link there.
+ * Copy phat-mode's pinned `PROJECT_SKILLS` and `VERIFICATION_SKILLS` into the repo's `.agents/skills/`, the folder most
+ * agents read; `create-verification-skill` only while the repo has no verify skill. Never replaces a skill the repo
+ * already has, in any skills folder: once there, the repo owns it. Claude Code reads only `.claude/skills/`, so a repo
+ * that uses it (a `.claude/` folder or `CLAUDE.md`) also gets a link there.
  */
 export async function installProjectSkills(root: string): Promise<InstalledSkills> {
   const result: InstalledSkills = { installed: [], kept: [], linked: [] };
   const claude = (await present(join(root, '.claude'))) || (await present(join(root, 'CLAUDE.md')));
-  for (const skill of PROJECT_SKILLS) {
+  const verification = (await hasVerifySkill(root))
+    ? VERIFICATION_SKILLS.filter((skill) => skill !== 'create-verification-skill')
+    : VERIFICATION_SKILLS;
+  for (const skill of [...PROJECT_SKILLS, ...verification]) {
     const existing = [];
     for (const dir of SKILL_ROOTS) if (await present(join(root, dir, skill))) existing.push(dir);
     if (existing.length > 0) {

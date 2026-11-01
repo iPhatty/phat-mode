@@ -26,7 +26,7 @@ import { LockedError } from './lock.ts';
 import { consoleLogger, consoleLoggerFor } from './log.ts';
 import type { PipelineResult, Services } from './pipeline.ts';
 import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef, watchScope } from './repos.ts';
-import { MATTPOCOCK_SKILLS } from './skills.ts';
+import { MATTPOCOCK_SKILLS, PSTACK_SKILLS, VERIFICATION_SKILLS } from './skills.ts';
 import { describeStep, nextStep } from './watch.ts';
 import { runOrWait, SETTLE_MS, waitToMerge } from './yolo.ts';
 import { CommandChecks, GitWorkspaces, tail } from './workspace.ts';
@@ -53,7 +53,8 @@ Usage:
 
 <issue> is 12 (in the repo of this folder), owner/name#12, or the issue's URL. [repo] is owner/name.
 init options: --check "<command>"  --install "<command>"  --yes (accept what it detects)  --no-check (do not run it)
-              --no-skills (do not copy mattpocock/skills' triage, to-tickets, to-spec and tdd, and the skills they use, into the repo)
+              --no-skills (do not copy mattpocock/skills' triage, to-tickets, to-spec and tdd, and the skills they use, or pstack's
+                verification skills, into the repo)
 
 Settings: each repo's .phat-mode.json (from \`phat-mode init\`), and yours in ~/.phat-mode/config.json (see README).`;
 
@@ -393,12 +394,17 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
   const created = await new GhGitHub(repo).ensureLabels(requiredLabels({ ...DEFAULT_LABELS, ...settings.labels }));
   console.log(`✓ Labels: ${created.length > 0 ? `created ${created.join(', ')}` : 'all there'}`);
 
-  // The skills that make issues ready-for-agent, for the people who prepare them.
+  // The skills that make issues ready-for-agent, for the people who prepare them, and the ones that make a verify skill.
   let skillsAdded = false;
   if (options.skills) {
     const skills = await installProjectSkills(root);
     skillsAdded = skills.installed.length > 0;
-    if (skillsAdded) console.log(`✓ Added mattpocock/skills (${MATTPOCOCK_SKILLS.label}): ${[...skills.installed, ...skills.linked].join(', ')}`);
+    const fromPstack = (path: string) => VERIFICATION_SKILLS.some((skill) => path.endsWith(`/${skill}`));
+    const added = [...skills.installed, ...skills.linked];
+    const matt = added.filter((path) => !fromPstack(path));
+    const pstack = added.filter(fromPstack);
+    if (matt.length > 0) console.log(`✓ Added mattpocock/skills (${MATTPOCOCK_SKILLS.label}): ${matt.join(', ')}`);
+    if (pstack.length > 0) console.log(`✓ Added pstack's verification skills (${PSTACK_SKILLS.label}): ${pstack.join(', ')}`);
     if (skills.kept.length > 0) console.log(`✓ Kept the repo's own skills: ${skills.kept.join(', ')}`);
   }
 
@@ -411,7 +417,9 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
   console.log(
     ready.verifySkills.length > 0
       ? `✓ Verification skill: ${ready.verifySkills.join(', ')}`
-      : '– No verification skill: changes are not tried in the real app. Create one with /create-verification-skill (pstack).',
+      : options.skills
+        ? '– No verification skill: changes are not tried in the real app. Run /create-verification-skill once in your agent, and commit the verify-<app> skill it writes.'
+        : '– No verification skill: changes are not tried in the real app. Create one with /create-verification-skill (pstack).',
   );
   console.log(
     ready.triageLabels
@@ -436,7 +444,7 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
   );
   console.log('\nNext:');
   if (!published) console.log(`  - Commit ${REPO_SETTINGS_FILE} and push it to the default branch: phat-mode reads it from GitHub, not from this folder.`);
-  if (skillsAdded) console.log('  - Commit the added skills, so everyone preparing issues for phat-mode has them.');
+  if (skillsAdded) console.log('  - Commit the added skills, so everyone preparing issues and verification skills for phat-mode has them.');
   console.log('  - Label an issue ready-for-agent, then `phat-mode run <issue>` (or `phat-mode watch`).');
   return checkOk ? 0 : 1;
 }

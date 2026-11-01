@@ -43,6 +43,29 @@ export const PROJECT_SKILLS = [
   'code-review',
 ] as const;
 
+/**
+ * pstack's verification skills, pinned in skills/ like Matt's: phat-mode's verifier follows the repo's own `verify-<app>`
+ * skill (see verify.ts), and these are how a repo makes one and keeps it current. To upgrade: copy the new upstream
+ * files into skills/, update `commit` here and in skills/<name>/README.md, and run `npm test`.
+ */
+export const PSTACK_SKILLS = {
+  commit: 'ae5650febf4320793844c12c4adaa937f417f8da',
+  get short() {
+    return this.commit.slice(0, 7);
+  },
+  /** e.g. `pstack@ae5650f`. */
+  get label() {
+    return `pstack@${this.short}`;
+  },
+};
+
+/**
+ * What `phat-mode init` copies into the repo for verification: `create-verification-skill` writes the `verify-<app>`
+ * skill, so it is only installed while the repo has none; `maintain-verification-skill` keeps it current (the PR points
+ * at it when the verifier finds the feature map drifting), so it is always installed.
+ */
+export const VERIFICATION_SKILLS = ['create-verification-skill', 'maintain-verification-skill'] as const;
+
 /** A pinned skill's folder. */
 export const skillDir = (skill: string) => new URL(`../skills/${skill}/`, import.meta.url);
 
