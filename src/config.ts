@@ -40,10 +40,6 @@ export type Limits = {
   maxBranchUpdates: number;
   checkTimeoutMs: number;
   installTimeoutMs: number;
-  /** Grilling rounds when shaping; questions still open after the last one are decided with the recommended answers. */
-  maxGrillRounds: number;
-  /** Most tickets shaping may break a request into; a bigger request is handed to a human. */
-  maxTickets: number;
 };
 
 /** Your settings, the same for every repo: `~/.phat-mode/config.json`. */
@@ -128,8 +124,6 @@ export function defaultMachineConfig(home = DEFAULT_HOME): MachineConfig {
       maxBranchUpdates: 3,
       checkTimeoutMs: 10 * 60_000,
       installTimeoutMs: 15 * 60_000,
-      maxGrillRounds: 6,
-      maxTickets: 8,
     },
     watchIntervalMs: 2 * 60_000,
     repos: [],

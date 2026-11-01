@@ -187,7 +187,6 @@ describe('run status', () => {
       runStatus(done('phat.shape', { status: 'shaped', tickets: 3, numbers: [31, 32, 33] })),
       'shaping: ✅ Shaped into 3 tickets (#31, #32, #33), each ready-for-agent; the issue is phat-mode:shaped.',
     );
-    assert.match(runStatus(done('phat.shape', { status: 'too_big', tickets: 9 })), /^shaping: 🐘 Too big: 9 tickets[^]*ready-for-human/);
     assert.match(runStatus(done('phat.shape', { status: 'refused', reason: '#3 is already shaped.' })), /^shaping: 🚫 Not shaped: #3 is already shaped\./);
     const failed = { kind: 'phat.shape', state: { status: 'terminal', outcome: { status: 'failed', error: { message: 'No report.\nmore' } } } };
     assert.equal(runStatus(failed), 'shaping: failed: No report.');

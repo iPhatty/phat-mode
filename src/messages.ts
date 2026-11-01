@@ -388,9 +388,6 @@ const item = (text: string) => text.trim().replace(/\s*\n\s*/g, ' ');
 
 const doorTag = (door: 'one-way' | 'two-way') => (door === 'one-way' ? '**One-way door**' : 'Two-way door');
 
-/** What the answerer decided at the round limit, using the questioner's recommendation. */
-export const LIMIT_NOTE = 'decided at the round limit with the recommendation';
-
 const WRITE = /\b(write|add|record|document|create)s?\b/i;
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -508,48 +505,19 @@ export function ticketBody(
   ].join('\n\n');
 }
 
-/** More tickets than `maxTickets`: handed to a human with the draft breakdown, for them to split. Model text is quoted. */
-export function shapeTooBigComment(
-  issue: number,
-  tickets: readonly Ticket[],
-  maxTickets: number,
-  labels: ShapeLabels & { readyForHuman: string },
-): string {
-  const draft = tickets.map((ticket, index) => {
-    const blockers = ticket.blockedBy.map((blocker) => `ticket ${blocker + 1}`).join(', ') || 'none';
-    const criteria = ticket.acceptanceCriteria.map((criterion) => `- [ ] ${item(criterion)}`).join('\n');
-    return [
-      `**Ticket ${index + 1}: ${item(ticket.title)}** (blocked by: ${blockers})`,
-      quoted(ticket.whatToBuild || ticket.title),
-      quoted(criteria || 'No acceptance criteria.'),
-    ].join('\n\n');
-  });
-  return `${shapedByLine(issue)}
-
-## Too big to shape on its own
-
-phat-mode broke this into ${tickets.length} tickets, more than the ${maxTickets} it may publish (\`limits.maxTickets\`), so it moved this to \`${labels.readyForHuman}\` and opened no tickets. Split it into smaller issues, or raise the limit, remove \`${labels.readyForHuman}\` and label it \`${labels.agentMode}\` again.
-
-<details><summary>Draft breakdown (${tickets.length} tickets)</summary>
-
-${draft.join('\n\n---\n\n')}
-
-</details>`;
-}
-
 /** The full grilling Q&A, collapsed, in one comment updated in place. Model text is quoted. */
 export function grillComment(issue: number, rounds: readonly GrillRound[]): string {
   const sections = rounds.map((round, index) => {
     const questions = round.questions.map((question, number) => {
       const answer = round.answers[number];
-      const note = round.atLimit ? ` _(${LIMIT_NOTE})_` : answer?.recommended ? ` _(${NO_ANSWER_NOTE})_` : '';
+      const note = answer?.recommended ? ` _(${NO_ANSWER_NOTE})_` : '';
       return [
         quoted(`❓ **Q${number + 1}** - **${item(question.title)}**: ${question.question}`),
         quoted(`➡️ ${question.recommendation}`),
         `💬 **Answer** (${answer?.door ?? question.door} door)${note}:\n\n${quoted(answer?.answer ?? question.recommendation)}`,
       ].join('\n\n');
     });
-    return `**Round ${index + 1}**${round.atLimit ? ' (the round limit)' : ''}\n\n${questions.join('\n\n---\n\n')}`;
+    return `**Round ${index + 1}**\n\n${questions.join('\n\n---\n\n')}`;
   });
   const count = `${rounds.length} round${rounds.length === 1 ? '' : 's'}`;
   return `${shapedByLine(issue)}

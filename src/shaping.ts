@@ -25,7 +25,6 @@ import { commentMarker, type Issue, mergeLabels, PROGRESS_LABELS, progressChange
 import {
   breakdownCriteria,
   grillComment,
-  LIMIT_NOTE,
   NO_ANSWER_NOTE,
   shapedBody,
   shapedCriteria,
@@ -34,7 +33,6 @@ import {
   shapeNeedsHumanComment,
   shapeNeedsInfoComment,
   shapeRefusedComment,
-  shapeTooBigComment,
   ticketBody,
   ticketMarker,
   ticketTitle,
@@ -92,9 +90,7 @@ export type ShapingResult =
    * One ticket: the issue's body is the spec, and it is ready-for-agent. Several: the issue's body is the spec, and
    * `numbers` are its tickets (sub-issues, each ready-for-agent), in dependency order.
    */
-  | { status: 'shaped'; tickets: number; numbers?: number[] }
-  /** More tickets than `maxTickets`: handed to a human with the draft breakdown, and no tickets opened. */
-  | { status: 'too_big'; tickets: number };
+  | { status: 'shaped'; tickets: number; numbers?: number[] };
 
 /** The name runs of this task are recorded under; `status` tells shaping from building by it. */
 export const SHAPING_TASK = 'phat.shape';
@@ -109,18 +105,17 @@ const MARKERS = {
 };
 
 /**
- * Every decision taken with no answer from the answerer (at the round limit, or left unanswered) is an assumption,
- * whatever the answerer wrote in the spec.
+ * Every decision taken with no answer from the answerer is an assumption, whatever the answerer wrote in the spec.
  */
 export function withRoundAssumptions(spec: ShapeSpecReport, rounds: readonly GrillRound[]): ShapeSpecReport {
   const decided = rounds.flatMap((round, index) =>
     round.questions.flatMap((question, number) => {
       const answer = round.answers[number];
-      if (answer === undefined || !(round.atLimit || answer.recommended)) return [];
+      if (answer === undefined || !answer.recommended) return [];
       return [
         {
           decision: `${question.title}: ${answer.answer}`,
-          why: `Round ${index + 1}, Q${number + 1}: ${round.atLimit ? LIMIT_NOTE : NO_ANSWER_NOTE}.`,
+          why: `Round ${index + 1}, Q${number + 1}: ${NO_ANSWER_NOTE}.`,
           door: answer.door,
         },
       ];
@@ -305,15 +300,14 @@ function repoPhases(services: Services) {
     }),
 
     /**
-     * The questioner asks a round (the whole frontier), the answerer answers it, until the frontier is empty or
-     * `maxGrillRounds` rounds were asked. The last round allowed is decided with the questioner's recommendations.
+     * The questioner asks a round (the whole frontier), the answerer answers it, until the questioner reports an empty
+     * frontier. There is no round limit.
      */
     grill: guarded<Phase<'grill'>>(async (task, runtime, context) => {
       const state = task.state.checkpoint;
       const { issue, conversations, rounds, round } = state;
-      const maxRounds = config.limits.maxGrillRounds;
       if (state.step === 'ask') {
-        logger.step(issue.number, `Grilling, round ${round} of at most ${maxRounds} (${modelFor(config, 'grill').modelId})`);
+        logger.step(issue.number, `Grilling, round ${round} (${modelFor(config, 'grill').modelId})`);
         const report = await askForReport(
           runtime,
           {
@@ -324,7 +318,6 @@ function repoPhases(services: Services) {
               comments: issue.comments,
               skill: await pinnedSkill('grilling'),
               round,
-              maxRounds,
               previous: rounds.at(-1),
             }),
             baseline: state.baseline,
@@ -348,14 +341,13 @@ function repoPhases(services: Services) {
         return;
       }
 
-      const atLimit = round >= maxRounds;
-      logger.step(issue.number, `Answering round ${round}${atLimit ? ', the last one allowed' : ''} (${modelFor(config, 'shape').modelId})`);
+      logger.step(issue.number, `Answering round ${round} (${modelFor(config, 'shape').modelId})`);
       const report = await askForReport(
         runtime,
         {
           conversation: conversations.answer,
           requestId: `answer-${round}`,
-          prompt: answerPrompt(round, state.questions, atLimit),
+          prompt: answerPrompt(round, state.questions),
           baseline: state.baseline,
           type: 'answers',
           tool: 'report_answers',
@@ -369,13 +361,9 @@ function repoPhases(services: Services) {
           ? { answer: answer.answer, door: answer.door, recommended: false }
           : { answer: question.recommendation, door: question.door, recommended: true };
       });
-      const grilled = [...rounds, { questions: state.questions, answers, atLimit }];
+      const grilled = [...rounds, { questions: state.questions, answers }];
       // Before moving on, so a crash here only repeats this (harmless) update.
       await github.upsertComment(issue.number, MARKERS.qa, grillComment(issue.number, grilled));
-      if (atLimit) {
-        await toSpec(runtime, state, grilled, context);
-        return;
-      }
       await goWithBaseline(
         runtime,
         conversations.question,
@@ -435,14 +423,6 @@ function repoPhases(services: Services) {
       const order = dependencyOrder(report.tickets);
       if ('invalid' in order) throw new StepFailure(`The answering agent's ticket breakdown is not usable: ${order.invalid}`);
       logger.step(issue.number, `Tickets: ${report.tickets.length}`);
-      const max = config.limits.maxTickets;
-      if (report.tickets.length > max) {
-        logger.step(issue.number, `More than ${max} tickets: handing it to a human with the draft breakdown`);
-        await github.upsertComment(issue.number, MARKERS.qa, grillComment(issue.number, state.rounds));
-        await handBack(issue.number, labels.readyForHuman, shapeTooBigComment(issue.number, report.tickets, max, labels));
-        await finish(runtime, { status: 'too_big', tickets: report.tickets.length }, context);
-        return;
-      }
       await go(runtime, { ...setupOf(state), phase: 'publish', rounds: state.rounds, spec: state.spec, tickets: report.tickets, shapedAt: new Date().toISOString() }, context);
     }),
 

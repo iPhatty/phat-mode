@@ -538,9 +538,8 @@ describe('shaping', () => {
       assert.match(seen[2]!.text, /Run triage's checks[^]*The questioner asks round 1/, 'the answerer keeps its own conversation');
     });
 
-    test('maxGrillRounds reached: the open questions are decided with the recommendations and listed as assumptions', async () => {
-      const { github, runIssue, config } = await fixture();
-      config.limits = { ...config.limits, maxGrillRounds: 2 };
+    test('no round limit: grilling goes on until the frontier is empty; questions left unanswered are assumptions', async () => {
+      const { github, runIssue } = await fixture();
       github.addIssue(23, { labels: ['agent-mode'] });
       const qaBodies: string[] = [];
       const upsert = github.upsertComment.bind(github);
@@ -553,17 +552,22 @@ describe('shaping', () => {
         if (model.id === 'faux-grill') asked.push(textOf(request.messages.at(-1) as { content: unknown }));
         return then;
       };
+      // More rounds than the old limit of 6.
+      const earlyRounds = Array.from({ length: 7 }, (_, index) => [
+        grill(questions([{ title: `Detail ${index + 1}` }])),
+        answers([{ question: 1, answer: `Answer ${index + 1}.` }]),
+      ]).flat();
       const { outcome, faux } = await runIssue(
         23,
         [
           triage(),
-          grill(questions([{ title: 'Wording' }])),
-          answers([{ question: 1, answer: 'Hello.' }]),
+          ...earlyRounds,
           grill(questions([{ title: 'Colour', recommendation: 'Brand blue', door: 'one-way' }, { title: 'Timing' }])),
           expectLast(
-            (message) => assert.match(textOf(message), /This is the last round grilling allows\. Decide each question using the questioner's recommendation/),
+            (message) => assert.doesNotMatch(textOf(message), /last round/),
             answers([{ question: 2, answer: 'On every launch.' }]),
           ),
+          grill(frontierEmpty()),
           shapeSpec({ assumptions: [{ decision: 'Plain text', why: 'Simple.', door: 'two-way' }] }),
           tickets([ticket('Greet')]),
         ],
@@ -571,19 +575,22 @@ describe('shaping', () => {
       );
       assert.equal(result(outcome).status, 'shaped');
       assert.equal(faux.getPendingResponseCount(), 0);
-      assert.equal(asked.length, 2, 'the questioner is asked maxGrillRounds times, no more');
-      assert.match(asked[1]!, /ask round 2, the last round/);
+      assert.equal(asked.length, 9, 'asked until it reports an empty frontier');
+      for (const prompt of asked) assert.doesNotMatch(prompt, /at most|last round/);
 
       const assumptions = github.issues.get(23)!.body.split('## Assumptions')[1]!.split('## Domain')[0]!;
-      assert.match(assumptions, /- \*\*One-way door\*\*: Colour: Brand blue _Why:_ Round 2, Q1: decided at the round limit with the recommendation\./);
-      assert.match(assumptions, /Timing: On every launch\. _Why:_ Round 2, Q2: decided at the round limit/);
+      assert.match(
+        assumptions,
+        /- \*\*One-way door\*\*: Colour: Brand blue _Why:_ Round 8, Q1: no answer given, so the recommendation was taken\./,
+      );
       assert.ok(assumptions.indexOf('Colour') < assumptions.indexOf('Plain text'), 'one-way doors first');
-      assert.doesNotMatch(assumptions, /Wording/, 'answered before the limit: not an assumption');
+      assert.doesNotMatch(assumptions, /Timing|Detail/, 'answered: not an assumption');
 
-      assert.equal(qaBodies.length, 3, 'after each round, and when publishing');
+      assert.equal(qaBodies.length, 9, 'after each round, and when publishing');
       assert.match(qaBodies[0]!, /Grilling Q&A \(1 round\)/);
       assert.equal(github.comments.length, 1, 'one comment, updated in place');
-      assert.match(github.comments[0]!.body, /Grilling Q&A \(2 rounds\)[^]*\*\*Round 2\*\* \(the round limit\)[^]*Colour[^]*decided at the round limit with the recommendation/);
+      assert.match(github.comments[0]!.body, /Grilling Q&A \(8 rounds\)[^]*\*\*Round 8\*\*\n\n[^]*Colour[^]*no answer given, so the recommendation was taken/);
+      assert.doesNotMatch(github.comments[0]!.body, /round limit/);
     });
 
     test('a following build gets the rewritten body as its spec, not an Agent Brief from before shaping', async () => {
@@ -771,24 +778,6 @@ describe('shaping', () => {
       assert.equal(github.comments.length, 1, 'only the Q&A comment');
       assert.equal(github.comments[0]!.marker, QA);
       assert.match(github.comments[0]!.body, /Grilling Q&A \(1 round\)[^]*Wording/);
-    });
-
-    test('more than maxTickets: handed to a human with the draft breakdown, and no tickets opened', async () => {
-      const { github, runIssue, config } = await fixture();
-      config.limits = { ...config.limits, maxTickets: 2 };
-      github.addIssue(40, { labels: ['agent-mode', 'enhancement'], body: ORIGINAL });
-      const { outcome } = await runIssue(40, flow(), 'shape');
-      assert.deepEqual(result(outcome), { status: 'too_big', tickets: 3 });
-      assert.deepEqual(github.created, []);
-      assert.deepEqual([...github.issues.keys()], [40]);
-      assert.equal(github.issues.get(40)!.body, ORIGINAL, 'the body is left alone');
-      assert.deepEqual(github.labels(40), ['enhancement', 'ready-for-human']);
-      const comment = github.comments.find((candidate) => candidate.marker === RESULT)!.body;
-      assert.ok(comment.startsWith(aiLine(40)));
-      assert.match(comment, /3 tickets, more than the 2/);
-      assert.match(comment, /\*\*Ticket 1: Show the greeting\*\* \(blocked by: ticket 2\)\n\n> Build Show the greeting\.\n\n> - \[ \] Learners see the greeting on launch/);
-      assert.match(comment, /\*\*Ticket 3: Choose a greeting\*\* \(blocked by: ticket 1, ticket 2\)/);
-      assert.ok(github.comments.some((candidate) => candidate.marker === QA), 'the Q&A comment too');
     });
 
     test('blocking edges that form a cycle: ready-for-human + phat-mode:failed, and no tickets opened', async () => {

@@ -418,10 +418,9 @@ export function grillPrompt(options: {
   comments: readonly Comment[];
   skill: PinnedSkill;
   round: number;
-  maxRounds: number;
   previous?: GrillRound;
 }): string {
-  const { issue, comments, skill, round, maxRounds, previous } = options;
+  const { issue, comments, skill, round, previous } = options;
   const report = `Report the round with report_questions: every question of the frontier, in order (they are numbered Q1, Q2, … by their place), each with your recommended answer and whether the decision is a one-way door (hard to reverse) or a two-way door. When the frontier is empty, report frontierEmpty: true and no questions.`;
   if (previous === undefined || round === 1) {
     return `Grill the answering agent about this request, following the \`grilling\` skill below. This is round ${round}.
@@ -434,7 +433,7 @@ ${overlayBlock}
 
 How the skill applies here, in shaping:
 - The answering agent decides from the codebase, the glossary and the ADRs. It has already checked that the request is not implemented yet, not rejected before, and makes sense.
-- Ask one round per request; phat-mode passes it to the answering agent and brings you its answers. There are at most ${maxRounds} rounds: ask what matters most first. Questions still open after the last round are decided using your recommendations.
+- Ask one round per request; phat-mode passes it to the answering agent and brings you its answers. Rounds go on until you report an empty frontier.
 - Look up facts yourself (read files, run commands); never ask for something you could find.
 
 ${report}`;
@@ -448,14 +447,12 @@ ${previous.questions
   })
   .join('\n\n')}
 
-Recompute the frontier and ask round ${round}${round === maxRounds ? ', the last round: questions still open after it are decided using your recommendations' : ''}. ${report}`;
+Recompute the frontier and ask round ${round}. ${report}`;
 }
 
-/** The answerer's request for one round of the questioner's. At the round limit, it decides with the recommendations. */
-export function answerPrompt(round: number, questions: readonly GrillQuestion[], atLimit: boolean): string {
-  const how = atLimit
-    ? `This is the last round grilling allows. Decide each question using the questioner's recommendation, unless the code, the glossary or the ADRs clearly rule it out; then decide what they point to. Each of these decisions is listed as an assumption for a human to check.`
-    : `Decide each question from the codebase, the glossary and the ADRs (read files and run commands as you need). Take the recommendation when it fits; when it does not, decide otherwise and say why. Never wait for a human: you are the user the grilling skill asks.`;
+/** The answerer's request for one round of the questioner's. */
+export function answerPrompt(round: number, questions: readonly GrillQuestion[]): string {
+  const how = `Decide each question from the codebase, the glossary and the ADRs (read files and run commands as you need). Take the recommendation when it fits; when it does not, decide otherwise and say why. Never wait for a human: you are the user the grilling skill asks.`;
   return `The questioner asks round ${round} of grilling this request.
 
 ${roundBlock(questions)}

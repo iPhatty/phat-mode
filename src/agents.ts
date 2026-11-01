@@ -107,13 +107,11 @@ export type AnswersReport = { answers: { question: number; answer: string; door:
 
 /**
  * A grilling round, as the pipeline keeps it: the questions, and one answer per question, in order. `recommended`: the
- * answerer gave none, so the questioner's recommendation was taken. `atLimit`: the last round `maxGrillRounds` allows,
- * decided with the recommendations; its decisions are assumptions.
+ * answerer gave none, so the questioner's recommendation was taken; that decision is an assumption.
  */
 export type GrillRound = {
   questions: GrillQuestion[];
   answers: { answer: string; door: Door; recommended: boolean }[];
-  atLimit: boolean;
 };
 
 /** The spec, in the `to-spec` sections, plus what the agents decided for the human and the domain docs it proposes. */

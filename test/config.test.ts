@@ -79,16 +79,9 @@ describe('models', () => {
 });
 
 describe('limits', () => {
-  test('agent mode: 6 grilling rounds and 8 tickets by default', () => {
-    const { limits } = defaultMachineConfig('/tmp/unused');
-    assert.equal(limits.maxGrillRounds, 6);
-    assert.equal(limits.maxTickets, 8);
-  });
-
   test('an override keeps the other limits', async () => {
-    const config = await withConfig({ limits: { maxGrillRounds: 3, maxTickets: 12 } });
-    assert.equal(config.limits.maxGrillRounds, 3);
-    assert.equal(config.limits.maxTickets, 12);
+    const config = await withConfig({ limits: { maxReviewRounds: 3 } });
+    assert.equal(config.limits.maxReviewRounds, 3);
     assert.equal(config.limits.maxCheckFixes, 3);
   });
 });

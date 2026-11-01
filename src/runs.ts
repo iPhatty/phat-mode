@@ -32,8 +32,6 @@ export function describeResult(result: PipelineResult | ShapingResult, taskKind?
         return `✅ Shaped into ${shaping.tickets} tickets${
           shaping.numbers && shaping.numbers.length > 0 ? ` (${shaping.numbers.map((n) => `#${n}`).join(', ')})` : ''
         }, each ready-for-agent; the issue is phat-mode:shaped.`;
-      case 'too_big':
-        return `🐘 Too big: ${shaping.tickets} tickets, more than limits.maxTickets. phat-mode posted the draft breakdown and moved the issue to ready-for-human.`;
     }
   }
   const build = result as PipelineResult;
