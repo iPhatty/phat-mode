@@ -33,6 +33,11 @@ export type Limits = {
   maxVerifyRounds: number;
   /** Hard cap on implementer runs per issue. */
   maxImplementRuns: number;
+  /**
+   * Times a run merges the base branch into its branch when the base branch moved on meanwhile, each followed by checks,
+   * review and verification again. After that, the pull request opens behind the base branch.
+   */
+  maxBranchUpdates: number;
   checkTimeoutMs: number;
   installTimeoutMs: number;
   /** Grilling rounds when shaping; questions still open after the last one are decided with the recommended answers. */
@@ -120,6 +125,7 @@ export function defaultMachineConfig(home = DEFAULT_HOME): MachineConfig {
       maxReviewRounds: 2,
       maxVerifyRounds: 2,
       maxImplementRuns: 8,
+      maxBranchUpdates: 3,
       checkTimeoutMs: 10 * 60_000,
       installTimeoutMs: 15 * 60_000,
       maxGrillRounds: 6,

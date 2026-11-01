@@ -149,6 +149,15 @@ ${
 ${scratchNote(scratch)} The planner may have left files there already.`;
 }
 
+/** The base branch moved on and merging it into the branch left conflicts, with markers, in `files`. */
+export function resolveConflictsPrompt(files: readonly string[], baseBranch: string, checkCommand: string): string {
+  return `${baseBranch} moved on while you worked. phat-mode committed your change and merged ${baseBranch} into the branch; these files have conflicts:
+
+${list(files)}
+
+Resolve every one: keep what your change does and what ${baseBranch} changed, and remove every conflict marker line (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`). A file deleted on one side, or a binary file, has no markers: leave it as it should end up. Do not run git commands that change history; phat-mode commits the merge once no markers are left. Run \`${checkCommand}\` until it passes, then call report_done again.`;
+}
+
 export function fixChecksPrompt(output: string, checkCommand: string): string {
   return `The project's checks fail after your changes. Fix the cause (not the tests, unless the tests are wrong), run \`${checkCommand}\` until it passes, then call report_done again.
 
@@ -183,8 +192,8 @@ export function fixReviewPrompt(review: CodeReview, checkCommand: string): strin
 
 /** What both reviewers are shown about the change: how to see it, and the diff itself (skill step 1). */
 function changeBlock(baseRef: string, diff: string): string {
-  return `The change: the uncommitted changes in this checkout, against \`${baseRef}\`. There are no commits yet.
-See it with \`git diff ${baseRef}\` (new files are included).
+  return `The change: everything in this checkout that differs from \`${baseRef}\`, the commit of the base branch it is based on, committed or not.
+See it with \`git diff ${baseRef}\` (new files are included). Commits on the base branch after that one are not part of this change.
 
 \`\`\`diff
 ${diff.length > 60_000 ? `${diff.slice(0, 60_000)}\n… (diff truncated; run the diff command for the rest)` : diff}
@@ -283,17 +292,20 @@ export function verifyPrompt(options: {
   spec: Spec;
   workspace: string;
   baseCheckout: string;
+  /** The base branch, e.g. `origin/main`. */
+  baseBranch: string;
+  /** The commit of the base branch the change is based on. */
   baseRef: string;
   diff: string;
   featureMapChanged: readonly string[];
   round: number;
 }): string {
-  const { skill, issue, spec, workspace, baseCheckout, baseRef, diff, featureMapChanged, round } = options;
+  const { skill, issue, spec, workspace, baseCheckout, baseBranch, baseRef, diff, featureMapChanged, round } = options;
   return `${round > 1 ? `This is verification round ${round}. The implementer has worked on the failures you found; verify the change as it is now.\n\n` : ''}Verify this change in the real app, following the repo's verification skill.
 
 Two checkouts:
 - The change: ${workspace} (your working directory). Verify here.
-- The base branch, ${baseRef}, before the change: ${baseCheckout}. Only for "before" evidence and for checking failures.
+- The base branch, ${baseBranch}, before the change: ${baseCheckout}, at ${baseRef}, the commit the change is based on. Only for "before" evidence and for checking failures.
 
 Steps:
 1. Read the feature map (${skill.dir}/features/ in the change; the index is below) and decide which features this change touches, from the diff and the spec. When unsure whether a feature is affected, include it.

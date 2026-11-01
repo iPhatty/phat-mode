@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { access, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { branchFor } from './config.ts';
@@ -9,7 +9,13 @@ import { CommandError, run, runShell, type RunResult } from './exec.ts';
 export interface Workspaces {
   /** Clone or update the repository and check out the issue's branch in its own directory. Safe to repeat. */
   prepare(issue: number): Promise<string>;
-  /** Changes against the base branch, including new files. */
+  /**
+   * The commit of the base branch the work is based on: where the branch last met it (`git merge-base`). Fixed while
+   * `origin/<base>` moves on, until the base branch is merged in, so reviewers never see newer commits on it as part of
+   * this change.
+   */
+  base(workspace: string): Promise<string>;
+  /** Changes against `base`, committed or not, including new files. */
   diff(workspace: string): Promise<string>;
   /** Changes a fingerprint whenever any file in the workspace changes. */
   fingerprint(workspace: string): Promise<string>;
@@ -19,8 +25,20 @@ export interface Workspaces {
   commitsAhead(workspace: string): Promise<number>;
   /** Push the issue branch. Returns the commit pushed. */
   push(workspace: string, issue: number): Promise<string>;
-  /** A clean checkout of the base branch, for "before" evidence. One per repository, reset on every call. */
-  prepareBase(): Promise<string>;
+  /**
+   * Bring the branch up to date with the base branch, as GitHub's "Update branch" does: commit everything with
+   * `message`, fetch, and merge `origin/<base>` in. Returns the files with conflicts, left with conflict markers and the
+   * merge in progress for `finishMerge`; empty when it merged or was up to date. Resumed with a merge still in
+   * progress, returns its conflicts again without committing anything.
+   */
+  updateBranch(workspace: string, message: string): Promise<string[]>;
+  /**
+   * Commit a merge `updateBranch` left in progress, once no file has conflict markers left. Returns the files that
+   * still do (the merge stays in progress); empty when there was no merge or it is committed.
+   */
+  finishMerge(workspace: string): Promise<string[]>;
+  /** A clean checkout of `ref` (default: the base branch), for "before" evidence. One per repository, reset on every call. */
+  prepareBase(ref?: string): Promise<string>;
   /**
    * A clean, detached checkout of the base branch for shaping an issue: no branch, so it never clashes with a later
    * build of the same issue. Reset on every call; dependencies installed once. Its files and folders are read-only
@@ -50,6 +68,8 @@ export class InstallError extends Error {
 /** Evidence branch: verification evidence lives here, never on the pull request's branch. */
 export const EVIDENCE_BRANCH = 'phat-mode/evidence';
 const SNAPSHOT_MESSAGE = 'phat-mode: snapshot before verification';
+/** A line git writes around a conflict: `<<<<<<< ours` or `>>>>>>> theirs`. (`=======` alone is too common to count.) */
+const CONFLICT_MARKER = /^(<{7}|>{7})( |$)/m;
 
 /** `source`: a local file. `path`: where it goes on the evidence branch. */
 export type EvidenceFile = { source: string; path: string };
@@ -124,8 +144,8 @@ export class GitWorkspaces implements Workspaces {
     return this.#options.baseWorkspaceDir ?? `${this.#options.cloneDir}-base`;
   }
 
-  async prepareBase(): Promise<string> {
-    return this.#detachedCheckout(this.#baseDir);
+  async prepareBase(ref?: string): Promise<string> {
+    return this.#detachedCheckout(this.#baseDir, ref);
   }
 
   async prepareShaping(issue: number): Promise<string> {
@@ -138,17 +158,17 @@ export class GitWorkspaces implements Workspaces {
     return dir;
   }
 
-  /** A clean, detached checkout of the base branch in `baseDir`, reset if it is there; installs when needed. */
-  async #detachedCheckout(baseDir: string): Promise<string> {
+  /** A clean, detached checkout of `ref` (default: the base branch) in `baseDir`, reset if it is there; installs when needed. */
+  async #detachedCheckout(baseDir: string, ref = this.#base): Promise<string> {
     const cloneDir = await this.#ensureClone();
     let reinstall = !(await exists(join(baseDir, 'node_modules')));
     if (!(await exists(join(baseDir, '.git')))) {
       await mkdir(dirname(baseDir), { recursive: true });
       await this.#git(cloneDir, ['worktree', 'prune']);
-      await this.#git(cloneDir, ['worktree', 'add', '--detach', baseDir, this.#base]);
+      await this.#git(cloneDir, ['worktree', 'add', '--detach', baseDir, ref]);
     } else {
       const before = (await this.#git(baseDir, ['rev-parse', 'HEAD'])).stdout.trim();
-      await this.#git(baseDir, ['checkout', '--detach', '--force', this.#base]);
+      await this.#git(baseDir, ['checkout', '--detach', '--force', ref]);
       // Untracked files go; ignored ones (node_modules, evidence) stay.
       await this.#git(baseDir, ['clean', '-fd']);
       const lockfiles = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb'];
@@ -236,10 +256,15 @@ export class GitWorkspaces implements Workspaces {
     return workspace;
   }
 
+  async base(workspace: string): Promise<string> {
+    return (await this.#git(workspace, ['merge-base', 'HEAD', this.#base])).stdout.trim();
+  }
+
   async diff(workspace: string): Promise<string> {
+    const base = await this.base(workspace);
     // Mark new files so the diff includes them, without staging their content.
     await this.#git(workspace, ['add', '--all', '--intent-to-add']);
-    return (await this.#git(workspace, ['diff', this.#base])).stdout;
+    return (await this.#git(workspace, ['diff', base])).stdout;
   }
 
   async fingerprint(workspace: string): Promise<string> {
@@ -268,6 +293,60 @@ export class GitWorkspaces implements Workspaces {
     const head = (await this.#git(workspace, ['rev-parse', 'HEAD'])).stdout.trim();
     await this.#git(workspace, ['push', '--force-with-lease', '--set-upstream', 'origin', `${head}:refs/heads/${branch}`]);
     return head;
+  }
+
+  async #merging(workspace: string): Promise<boolean> {
+    return (await this.#git(workspace, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD'], true)).code === 0;
+  }
+
+  async #lines(workspace: string, args: string[]): Promise<string[]> {
+    const { stdout } = await this.#git(workspace, args);
+    return stdout.split('\n').map((line) => line.trim()).filter((line) => line !== '');
+  }
+
+  async updateBranch(workspace: string, message: string): Promise<string[]> {
+    if (await this.#merging(workspace)) {
+      const unmerged = await this.#lines(workspace, ['diff', '--name-only', '--diff-filter=U']);
+      return [...new Set([...unmerged, ...(await this.#withMarkers(workspace))])].sort();
+    }
+    await this.commitAll(workspace, message);
+    await this.#ensureClone();
+    const upToDate = await this.#git(workspace, ['merge-base', '--is-ancestor', this.#base, 'HEAD'], true);
+    if (upToDate.code === 0) return [];
+    const merged = await this.#git(workspace, ['merge', '--no-edit', '--no-verify', this.#base], true);
+    if (merged.code === 0) return [];
+    const conflicts = await this.#lines(workspace, ['diff', '--name-only', '--diff-filter=U']);
+    if (conflicts.length === 0) {
+      await this.#git(workspace, ['merge', '--abort'], true);
+      throw new Error(`Could not merge ${this.#base}: ${`${merged.stdout}\n${merged.stderr}`.trim()}`);
+    }
+    return conflicts;
+  }
+
+  async finishMerge(workspace: string): Promise<string[]> {
+    if (!(await this.#merging(workspace))) return [];
+    const left = await this.#withMarkers(workspace);
+    if (left.length > 0) return left;
+    await this.#git(workspace, ['add', '--all']);
+    await this.#git(workspace, ['commit', '--no-verify', '--no-edit']);
+    return [];
+  }
+
+  /**
+   * Changed files (against HEAD, or new) that still have a conflict marker line. A conflict git cannot mark (deleted on
+   * one side, or a binary file) is taken as the implementer left it.
+   */
+  async #withMarkers(workspace: string): Promise<string[]> {
+    const changed = [
+      ...(await this.#lines(workspace, ['diff', '--name-only', 'HEAD'])),
+      ...(await this.#lines(workspace, ['ls-files', '--others', '--exclude-standard'])),
+    ];
+    const marked: string[] = [];
+    for (const path of new Set(changed)) {
+      const text = await readFile(join(workspace, path), 'utf8').catch(() => '');
+      if (CONFLICT_MARKER.test(text)) marked.push(path);
+    }
+    return marked.sort();
   }
 }
 

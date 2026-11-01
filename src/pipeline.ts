@@ -59,6 +59,7 @@ import {
   planPrompt,
   describePrompt,
   fixVerificationPrompt,
+  resolveConflictsPrompt,
   roleInstructions,
   specReviewPrompt,
   standardsReviewPrompt,
@@ -92,6 +93,13 @@ type Work = Setup & {
   reviewRounds: number;
   verifyRounds: number;
   done: DoneReport | null;
+  /**
+   * The commit of the base branch the change was last checked against, the code review's fixed point; set when the
+   * checks pass. Absent in runs saved by an older phat-mode.
+   */
+  base?: string;
+  /** Times the base branch was merged into the branch (`limits.maxBranchUpdates`). Absent: none yet. */
+  updates?: number;
 };
 
 /** The outcome of the code review, carried to the pull request. */
@@ -109,6 +117,7 @@ export type PipelineState =
   | (Work & Reviewed & { phase: 'verify'; baseline: number })
   | (Work & Reviewed & { phase: 'describe'; verification: Verification; baseline: number })
   /** `pr`: the description the implementer wrote, following the pr skill; null if it did not report one. */
+  | (Work & Reviewed & { phase: 'update'; verification: Verification; pr: PrReport | null })
   | (Work & Reviewed & { phase: 'publish'; verification: Verification; pr: PrReport | null })
   | { phase: 'fail'; issue: number; reason: string };
 
@@ -153,6 +162,7 @@ export function createPipeline(servicesFor: (repo: string) => Promise<Services>)
       review: async (task, runtime, context) => (await phasesFor(task.input.repo)).review(task, runtime, context),
       verify: async (task, runtime, context) => (await phasesFor(task.input.repo)).verify(task, runtime, context),
       describe: async (task, runtime, context) => (await phasesFor(task.input.repo)).describe(task, runtime, context),
+      update: async (task, runtime, context) => (await phasesFor(task.input.repo)).update(task, runtime, context),
       publish: async (task, runtime, context) => (await phasesFor(task.input.repo)).publish(task, runtime, context),
       fail: async (task, runtime, context) => (await phasesFor(task.input.repo)).fail(task, runtime, context),
     },
@@ -168,8 +178,10 @@ export function createPipeline(servicesFor: (repo: string) => Promise<Services>)
 function repoPhases(services: Services) {
   const { config, github, workspaces, checks, logger } = services;
   const { limits, labels } = config;
-  /** The code review's fixed point. */
-  const baseRef = `origin/${config.baseBranch}`;
+  const baseBranch = `origin/${config.baseBranch}`;
+  /** The code review's fixed point: the commit of the base branch the change is based on. */
+  const baseOf = async (state: Work) => state.base ?? (await workspaces.base(state.workspace));
+  const commitMessage = (issue: Issue) => `${pullRequestTitle(issue)}\n\nCloses #${issue.number}`;
 
   const go = (runtime: Runtime, next: PipelineState, context: Context) =>
     runtime.commit(() => ({ status: 'running', checkpoint: next }), context);
@@ -281,6 +293,8 @@ function repoPhases(services: Services) {
     reviewRounds: state.reviewRounds,
     verifyRounds: state.verifyRounds,
     done: state.done,
+    base: state.base,
+    updates: state.updates,
   });
 
   return {
@@ -398,6 +412,12 @@ function repoPhases(services: Services) {
       check: guarded<Phase<'check'>>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const number = state.issue.number;
+        const conflicts = await workspaces.finishMerge(state.workspace);
+        if (conflicts.length > 0) {
+          logger.step(number, `Conflict markers left in ${conflicts.join(', ')}`);
+          await toImplement(runtime, work(state), resolveConflictsPrompt(conflicts, baseBranch, config.checkCommand), context);
+          return;
+        }
         if ((await workspaces.diff(state.workspace)).trim() === '') {
           throw new StepFailure('The implementer made no changes.');
         }
@@ -405,11 +425,13 @@ function repoPhases(services: Services) {
         const result = await checks.run(state.workspace);
         if (result.passed) {
           logger.step(number, 'Checks pass');
+          const base = await workspaces.base(state.workspace);
           await runtime.commit(
             async (tx) => ({
               status: 'running',
               checkpoint: {
                 ...work(state),
+                base,
                 phase: 'review',
                 reviewRounds: state.reviewRounds + 1,
                 baseline: {
@@ -444,6 +466,7 @@ function repoPhases(services: Services) {
         // The coordinator steps of the code-review skill: fixed point, spec and standards sources.
         const skill = await loadCodeReviewSkill();
         const sources = await standardsSources(state.workspace);
+        const baseRef = await baseOf(state);
         const before = await workspaces.fingerprint(state.workspace);
         const diff = await workspaces.diff(state.workspace);
         // Both axes at once, each in its own conversation, so they do not pollute each other's context.
@@ -508,7 +531,8 @@ function repoPhases(services: Services) {
         const state = task.state.checkpoint;
         const number = state.issue.number;
         const round = state.verifyRounds;
-        const skills = await findVerifySkills(state.workspace);
+        const baseRef = await baseOf(state);
+        const skills = await findVerifySkills(state.workspace, baseRef);
         const skill = skills[0];
         if (skill === undefined) {
           logger.step(number, 'No verification skill in this repo; skipping verification in the app');
@@ -518,11 +542,11 @@ function repoPhases(services: Services) {
         if (skills.length > 1) logger.step(number, `Several verification skills; using ${skill.name}`);
         logger.step(number, `Verifying in the app, round ${round}, with ${skill.name} (${modelFor(config, 'verify').modelId})`);
         // The skill runs as the repo defines it: protected skill files the implementer touched are reverted for good.
-        const reverted = await restoreProtectedSkillFiles(state.workspace);
+        const reverted = await restoreProtectedSkillFiles(state.workspace, baseRef);
         if (reverted.length > 0) logger.step(number, `Reverted changes to the verification skill: ${reverted.join(', ')}`);
-        const featureMapChanged = await changedFeatureMap(state.workspace);
+        const featureMapChanged = await changedFeatureMap(state.workspace, baseRef);
         const diff = await workspaces.diff(state.workspace);
-        const baseCheckout = await workspaces.prepareBase();
+        const baseCheckout = await workspaces.prepareBase(baseRef);
         // Whatever the verifier changes in the change's files is thrown away afterwards.
         await workspaces.snapshot(state.workspace);
         const reported = await askForReport(
@@ -536,6 +560,7 @@ function repoPhases(services: Services) {
               spec: state.spec,
               workspace: state.workspace,
               baseCheckout,
+              baseBranch,
               baseRef,
               diff,
               featureMapChanged,
@@ -593,7 +618,8 @@ function repoPhases(services: Services) {
           runtime,
           {
             conversation: state.conversations.implement,
-            requestId: `describe-${state.runs}`,
+            // A new request after each merge of the base branch, which describes again without a new implementer run.
+            requestId: `describe-${state.runs}${state.updates ? `-${state.updates}` : ''}`,
             prompt: describePrompt(await prSkill(), state.unresolved),
             baseline: state.baseline,
             type: 'pr',
@@ -615,7 +641,7 @@ function repoPhases(services: Services) {
           runtime,
           {
             ...work(state),
-            phase: 'publish',
+            phase: 'update',
             review: state.review,
             unresolved: state.unresolved,
             verification: state.verification,
@@ -625,6 +651,36 @@ function repoPhases(services: Services) {
         );
       }),
 
+      update: guarded<Phase<'update'>>(async (task, runtime, context) => {
+        const state = task.state.checkpoint;
+        const { issue, workspace } = state;
+        const updates = state.updates ?? 0;
+        const toPublish = () => go(runtime, { ...state, phase: 'publish' }, context);
+        if (updates >= limits.maxBranchUpdates) {
+          logger.step(issue.number, `Not merging ${baseBranch} again after ${updates} merges; opening the pull request as it is`);
+          await toPublish();
+          return;
+        }
+        // A crash during verification can leave its local snapshot commit behind.
+        await workspaces.undoSnapshot(workspace);
+        const checkedBase = await baseOf(state);
+        logger.step(issue.number, `Updating ${branchFor(issue.number)} with ${baseBranch}`);
+        const conflicts = await workspaces.updateBranch(workspace, commitMessage(issue));
+        const next: Work = { ...work(state), updates: updates + 1 };
+        if (conflicts.length > 0) {
+          logger.step(issue.number, `${baseBranch} moved on; merging it conflicts in ${conflicts.join(', ')}`);
+          await toImplement(runtime, next, resolveConflictsPrompt(conflicts, baseBranch, config.checkCommand), context);
+          return;
+        }
+        // Compared with the base the change was checked against, so a merge made just before a crash still counts.
+        if ((await workspaces.base(workspace)) !== checkedBase) {
+          logger.step(issue.number, `${baseBranch} moved on; merged it in, checking, reviewing and verifying again`);
+          await go(runtime, { ...next, phase: 'check' }, context);
+          return;
+        }
+        await toPublish();
+      }),
+
       publish: guarded<Phase<'publish'>>(async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const { issue, workspace } = state;
@@ -632,7 +688,7 @@ function repoPhases(services: Services) {
         // A crash during verification can leave its local snapshot commit behind.
         await workspaces.undoSnapshot(workspace);
         logger.step(issue.number, `Committing and pushing ${branch}`);
-        await workspaces.commitAll(workspace, `${pullRequestTitle(issue)}\n\nCloses #${issue.number}`);
+        await workspaces.commitAll(workspace, commitMessage(issue));
         if ((await workspaces.commitsAhead(workspace)) === 0) {
           throw new StepFailure('There are no changes to open a pull request with.');
         }

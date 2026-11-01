@@ -264,6 +264,29 @@ describe('GitWorkspaces for verification', () => {
     assert.equal(await readFile(join(workspace, 'feature.txt'), 'utf8'), 'implementer\n');
   });
 
+  test('updateBranch: resumed with a merge in progress, it reports the conflicts again and never commits the markers', async () => {
+    const { workspaces, seed, remote } = await setup();
+    const workspace = await workspaces.prepare(4);
+    await writeFile(join(workspace, 'README.md'), '# r, implementer\n');
+    await writeFile(join(seed, 'README.md'), '# r, main\n');
+    await git(seed, ['commit', '-q', '-am', 'main moves on']);
+    await git(seed, ['push', '-q', remote, 'main']);
+    const based = await workspaces.base(workspace);
+
+    assert.deepEqual(await workspaces.updateBranch(workspace, 'the change'), ['README.md']);
+    // A crash, then the same step again.
+    assert.deepEqual(await workspaces.updateBranch(workspace, 'the change'), ['README.md']);
+    assert.deepEqual(await workspaces.finishMerge(workspace), ['README.md'], 'markers left: not committed');
+    assert.equal(await workspaces.base(workspace), based);
+
+    await writeFile(join(workspace, 'README.md'), '# r, implementer and main\n');
+    assert.deepEqual(await workspaces.finishMerge(workspace), []);
+    assert.notEqual(await workspaces.base(workspace), based, 'based on main as it is now');
+    assert.deepEqual(await workspaces.updateBranch(workspace, 'the change'), [], 'up to date');
+    assert.equal(await workspaces.diff(workspace), (await run('git', ['diff', 'origin/main'], { cwd: workspace })).stdout);
+    assert.match(await workspaces.diff(workspace), /\+# r, implementer and main/);
+  });
+
   test('prepareBase: a clean checkout of the base branch, reset every time', async () => {
     const { workspaces, seed, remote } = await setup();
     const base = await workspaces.prepareBase();
