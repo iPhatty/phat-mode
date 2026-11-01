@@ -69,15 +69,18 @@ export type OpenPullRequest = { number: number; url: string; issue: number };
 
 /**
  * Merged, or why not. `needsYou`: only a human can move it on; otherwise it may still merge on a later look (checks
- * running, settling).
+ * running, settling). `settlesAt`: when only settling is left, the time it can merge.
  */
-export type MergeOutcome = { merged: true } | { merged: false; needsYou: boolean; reason: string };
+export type MergeOutcome = { merged: true } | { merged: false; needsYou: boolean; reason: string; settlesAt?: Date };
 
 /**
  * How long the head commit must have been on GitHub before yolo merges it. Checks show up a little after a push, so a
  * pull request without any yet may only be waiting for them.
  */
-export const SETTLE_MS = 5 * 60_000;
+export const SETTLE_MS = 60_000;
+
+/** Added to a wait for settling, so the next look is surely past it, even if a timer fires a little early. */
+const SETTLE_SLACK_MS = 1_000;
 
 /** Local time, as HH:MM. */
 const clock = (time: Date) =>
@@ -109,7 +112,8 @@ export async function yoloMerge(
   const running = named('running');
   if (running.length > 0) return notYet(`checks running: ${running.join(', ')}`);
   const settled = new Date(Date.parse(status.head.committedAt) + SETTLE_MS);
-  if (options.now < settled) return notYet(`settling (merges after ${clock(settled)})`);
+  if (options.now < settled)
+    return { merged: false, needsYou: false, reason: `settling (merges after ${clock(settled)})`, settlesAt: settled };
   // Only the commit phat-mode judged: GitHub refuses if anything was pushed since.
   try {
     await github.mergePullRequest(pr.number, verdict.sha);
@@ -127,7 +131,8 @@ export async function yoloMerge(
 
 /**
  * `run --yolo`, once the pull request for `issue` is open: look every `intervalMs` until it merges, or until only a
- * human can move it on. `say`: each new reason it is not merged yet.
+ * human can move it on; when only settling is left, look again as soon as it has settled instead. `say`: each new
+ * reason it is not merged yet.
  */
 export async function waitToMerge(
   github: GitHub,
@@ -143,7 +148,8 @@ export async function waitToMerge(
     if (outcome.needsYou) return { merged: false, reason: outcome.reason, url: pr.url };
     if (outcome.reason !== said) options.say(outcome.reason);
     said = outcome.reason;
-    await options.sleep(options.intervalMs);
+    const untilSettled = outcome.settlesAt && outcome.settlesAt.getTime() - options.now().getTime() + SETTLE_SLACK_MS;
+    await options.sleep(Math.min(options.intervalMs, untilSettled ?? Infinity));
   }
 }
 

@@ -70,9 +70,14 @@ describe('yolo merge', () => {
     assert.equal(github.writes, 0);
   });
 
-  test('pushed under 5 minutes ago: not yet, even all green, so late checks can still show up', async () => {
-    const { github, merge } = pullRequest({ committedAt: '2026-10-31T11:58:30Z' });
-    assert.deepEqual(await merge(), { merged: false, needsYou: false, reason: 'settling (merges after 12:03)' });
+  test('pushed under a minute ago: not yet, even all green, so late checks can still show up', async () => {
+    const { github, merge } = pullRequest({ committedAt: '2026-10-31T12:00:00Z' });
+    assert.deepEqual(await merge(), {
+      merged: false,
+      needsYou: false,
+      reason: 'settling (merges after 12:01)',
+      settlesAt: new Date('2026-10-31T12:01:00Z'),
+    });
     assert.equal(github.writes, 0);
   });
 
@@ -108,30 +113,40 @@ describe('run --yolo: waiting to merge', () => {
   /** A clock that sleeping moves on; `onSleep` changes GitHub meanwhile. */
   function clock(onSleep: (slept: number) => void = () => {}) {
     let now = NOW.getTime();
-    let slept = 0;
+    const sleeps: number[] = [];
     return {
       now: () => new Date(now),
       sleep: async (ms: number) => {
         now += ms;
-        onSleep(++slept);
+        sleeps.push(ms);
+        onSleep(sleeps.length);
       },
-      slept: () => slept,
+      slept: () => sleeps.length,
+      sleeps,
     };
   }
 
   test('keeps looking while checks run and the commit settles, saying each reason once, then merges', async () => {
-    const { github, pr } = pullRequest({ committedAt: '2026-10-31T11:58:00Z', checks: [['build', 'running']] });
+    const { github, pr } = pullRequest({ committedAt: '2026-10-31T11:59:45Z', checks: [['build', 'running']] });
     const time = clock((slept) => {
       if (slept === 1) github.statuses.get(pr.number)!.checks = [{ name: 'build', state: 'passed' }];
     });
     const said: string[] = [];
-    const outcome = await waitToMerge(github, 7, { ...time, intervalMs: 60_000, say: (text) => said.push(text) });
+    const outcome = await waitToMerge(github, 7, { ...time, intervalMs: 30_000, say: (text) => said.push(text) });
     assert.deepEqual(outcome, { merged: true, url: pr.url });
-    // 12:00 running, 12:01 and 12:02 settling, 12:03 merged.
-    assert.equal(time.slept(), 3);
-    assert.deepEqual(said, ['checks running: build', 'settling (merges after 12:03)']);
+    // 12:00:00 running, 12:00:30 settling until 12:00:45, 12:00:46 merged.
+    assert.deepEqual(time.sleeps, [30_000, 16_000]);
+    assert.deepEqual(said, ['checks running: build', 'settling (merges after 12:00)']);
     assert.deepEqual(github.merges, [{ pr: pr.number, sha: SHA }]);
     assert.match(github.prComments[0]!.body, /^Merged by `phat-mode run --yolo`/);
+  });
+
+  test('only settling left: looks again as soon as it has settled, not a whole interval later', async () => {
+    const { github, pr } = pullRequest({ committedAt: '2026-10-31T12:00:00Z' });
+    const time = clock();
+    const outcome = await waitToMerge(github, 7, { ...time, intervalMs: 2 * 60_000, say: () => {} });
+    assert.deepEqual(outcome, { merged: true, url: pr.url });
+    assert.deepEqual(time.sleeps, [61_000]);
   });
 
   test('stops as soon as only you can move it on, e.g. a check fails meanwhile', async () => {

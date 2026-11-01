@@ -147,7 +147,7 @@ const firstLine = (error: unknown) => (error instanceof Error ? error.message.sp
  */
 const YOLO_WARNING =
   '⚠ --yolo: phat-mode merges its own pull requests (squash) when it found them clean, every check passed and the ' +
-  `commit is ${SETTLE_MS / 60_000} minutes old. It never bypasses branch protection.`;
+  `commit is ${SETTLE_MS / 1_000} seconds old. It never bypasses branch protection.`;
 
 async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Promise<number> {
   const configFor = repoConfigs(machine);
