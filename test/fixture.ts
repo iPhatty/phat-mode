@@ -86,7 +86,8 @@ export async function fixture(files: Record<string, string> = {}, repo = 'test/r
   const config: Config = {
     ...testConfig(join(dir, 'home'), repo),
     defaultModel: { provider: 'faux', modelId: 'faux-1', thinkingLevel: 'medium' },
-    models: {},
+    // Shaping's questioner on a model of its own, so tests can tell the two conversations apart.
+    models: { grill: { modelId: 'faux-grill' } },
   };
   const github = new FakeGitHub();
   const checks = new FakeChecks();
@@ -109,7 +110,7 @@ export async function fixture(files: Record<string, string> = {}, repo = 'test/r
 
   /** `servicesFor`: for runs on other repos too; by default, every run is on this one. */
   const open = async (responses: FauxResponseStep[], servicesFor = async (_repo: string) => services) => {
-    const faux = fauxProvider({ models: [{ id: 'faux-1' }] });
+    const faux = fauxProvider({ models: [{ id: 'faux-1' }, { id: 'faux-grill' }] });
     faux.setResponses(responses);
     const models = createModels();
     models.setProvider(faux.provider);

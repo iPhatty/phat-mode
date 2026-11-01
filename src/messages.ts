@@ -1,10 +1,10 @@
-import type { DoneReport, PlanReport, PrReport, TriageReport } from './agents.ts';
+import type { DoneReport, GrillRound, PlanReport, PrReport, ShapeSpecReport, TicketsReport, TriageReport } from './agents.ts';
 import { type AxisReport, type CodeReview, needsFixes, type SpecFinding, type StandardsFinding } from './code-review.ts';
 import type { Evidence } from './pr.ts';
 import { basename, extname } from 'node:path';
 import { MATTPOCOCK_SKILLS } from './skills.ts';
 import { type FeatureResult, IMAGE_TYPES, type Verification } from './verify.ts';
-import type { Spec } from './spec.ts';
+import { type Spec, shapedAtMarker } from './spec.ts';
 import type { Issue } from './github.ts';
 
 const list = (items: readonly string[]) => items.map((item) => `- ${item}`).join('\n');
@@ -357,4 +357,120 @@ phat-mode could not finish shaping this issue, so it moved it to \`${labels.read
 ${reason}
 
 To let phat-mode try again, remove \`${labels.readyForHuman}\` and \`phat-mode:failed\`, and label it \`${labels.agentMode}\`.`;
+}
+
+/** Model-written lines behind `> `: a line of it can then never pass for a section or an Agent Brief of its own. */
+const quoted = (text: string) =>
+  text
+    .trim()
+    .split('\n')
+    .map((line) => (line.trim() === '' ? '>' : `> ${line}`))
+    .join('\n');
+
+/** Model-written prose in the body: a line of it can never start a section (a heading) of its own. */
+const prose = (text: string) => text.trim().replace(/^(\s*)(#{1,6}\s)/gm, '$1\\$2');
+
+/** One list item from model text: a single line. */
+const item = (text: string) => text.trim().replace(/\s*\n\s*/g, ' ');
+
+const doorTag = (door: 'one-way' | 'two-way') => (door === 'one-way' ? '**One-way door**' : 'Two-way door');
+
+/** What the answerer decided at the round limit, using the questioner's recommendation. */
+export const LIMIT_NOTE = 'decided at the round limit with the recommendation';
+
+const WRITE = /\b(write|add|record|document|create)s?\b/i;
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** The answerer gave no answer to a question, so the questioner's recommendation was taken. */
+export const NO_ANSWER_NOTE = 'no answer given, so the recommendation was taken';
+
+/**
+ * The criteria to meet: the ticket's own, plus one for each proposed glossary term and ADR it does not mention yet,
+ * so the domain docs are written by the ticket that introduces them.
+ */
+export function shapedCriteria(spec: ShapeSpecReport, ticket: TicketsReport['tickets'][number]): string[] {
+  const own = ticket.acceptanceCriteria.map(item).filter((criterion) => criterion !== '');
+  // Only a criterion that asks for that very entry to be written counts; one that merely uses the term does not.
+  const requires = (name: string, kind: RegExp) => {
+    const word = new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(item(name))}($|[^\\p{L}\\p{N}])`, 'iu');
+    return own.some((criterion) => word.test(criterion) && kind.test(criterion) && WRITE.test(criterion));
+  };
+  const added: string[] = [];
+  for (const { term, definition } of spec.domain.terms) {
+    if (!requires(term, /glossary/i)) added.push(`Write the glossary term "${item(term)}" (${item(definition)}) into the domain glossary`);
+  }
+  for (const { title } of spec.domain.adrs) {
+    if (!requires(title, /\bADR\b|decision record/i)) added.push(`Write the ADR "${item(title)}"`);
+  }
+  return [...own, ...added];
+}
+
+/**
+ * A one-ticket issue's new body: the AI line, the spec in the `to-spec` sections, Assumptions (one-way doors first),
+ * Domain, the Acceptance criteria `spec.ts` reads, and last the author's text, verbatim. `shapedAt`: when, in a hidden
+ * marker, so Agent Briefs from before shaping no longer override the new body.
+ */
+export function shapedBody(
+  issue: number,
+  spec: ShapeSpecReport,
+  ticket: TicketsReport['tickets'][number],
+  originalBody: string,
+  shapedAt: string,
+): string {
+  const bullets = (items: readonly string[], none: string) =>
+    items.length > 0 ? items.map((entry) => `- ${item(entry)}`).join('\n') : none;
+  const assumptions = [...spec.assumptions].sort((a, b) => (a.door === b.door ? 0 : a.door === 'one-way' ? -1 : 1));
+  const { terms, adrs } = spec.domain;
+  const domain = [
+    terms.length > 0
+      ? `### Glossary terms\n\n${terms
+          .map(({ term, definition, avoid }) => `- **${item(term)}**: ${item(definition)}${avoid.trim() ? ` _Avoid_: ${item(avoid)}` : ''}`)
+          .join('\n')}`
+      : '',
+    adrs.length > 0 ? `### ADRs\n\n${adrs.map(({ title, decision }) => `- **${item(title)}**: ${item(decision)}`).join('\n')}` : '',
+  ].filter((part) => part !== '');
+  return [
+    shapedByLine(issue),
+    shapedAtMarker(shapedAt),
+    `## Problem Statement\n\n${prose(spec.problemStatement)}`,
+    `## Solution\n\n${prose(spec.solution)}`,
+    `## User Stories\n\n${spec.userStories.map((story, index) => `${index + 1}. ${item(story)}`).join('\n') || 'None.'}`,
+    `## Implementation Decisions\n\n${bullets(spec.implementationDecisions, 'None.')}`,
+    `## Testing Decisions\n\n${bullets(spec.testingDecisions, 'None.')}`,
+    `## Out of Scope\n\n${bullets(spec.outOfScope, 'Nothing listed.')}`,
+    `## Further Notes\n\n${prose(spec.furtherNotes) || 'None.'}`,
+    `## Assumptions\n\nDecided by phat-mode's agents, with no human; one-way doors first.\n\n${
+      assumptions.map((a) => `- ${doorTag(a.door)}: ${item(a.decision)}${a.why.trim() ? ` _Why:_ ${item(a.why)}` : ''}`).join('\n') ||
+      'None.'
+    }`,
+    `## Domain\n\n${domain.length > 0 ? domain.join('\n\n') : 'No new glossary terms or ADRs.'}`,
+    `## Acceptance criteria\n\n${shapedCriteria(spec, ticket)
+      .map((criterion) => `- [ ] ${criterion}`)
+      .join('\n')}`,
+    `## Original request\n\n${originalBody}`,
+  ].join('\n\n');
+}
+
+/** The full grilling Q&A, collapsed, in one comment updated in place. Model text is quoted. */
+export function grillComment(issue: number, rounds: readonly GrillRound[]): string {
+  const sections = rounds.map((round, index) => {
+    const questions = round.questions.map((question, number) => {
+      const answer = round.answers[number];
+      const note = round.atLimit ? ` _(${LIMIT_NOTE})_` : answer?.recommended ? ` _(${NO_ANSWER_NOTE})_` : '';
+      return [
+        quoted(`❓ **Q${number + 1}** - **${item(question.title)}**: ${question.question}`),
+        quoted(`➡️ ${question.recommendation}`),
+        `💬 **Answer** (${answer?.door ?? question.door} door)${note}:\n\n${quoted(answer?.answer ?? question.recommendation)}`,
+      ].join('\n\n');
+    });
+    return `**Round ${index + 1}**${round.atLimit ? ' (the round limit)' : ''}\n\n${questions.join('\n\n---\n\n')}`;
+  });
+  const count = `${rounds.length} round${rounds.length === 1 ? '' : 's'}`;
+  return `${shapedByLine(issue)}
+
+<details><summary>Grilling Q&A (${count})</summary>
+
+${sections.join('\n\n') || 'No questions: the questioner found nothing to ask.'}
+
+</details>`;
 }

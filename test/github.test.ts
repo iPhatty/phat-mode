@@ -30,6 +30,7 @@ else if (a === 'pr' && b === 'list') {
 } else if (a === 'api' && args.includes('--slurp')) process.stdout.write(JSON.stringify([state.comments]));
 else if (a === 'api' && flag('--method') === 'PATCH') log({ patch: args.at(-3), body: JSON.parse(stdin()).body });
 else if (a === 'issue' && b === 'comment') log({ comment: c, body: stdin() });
+else if (a === 'issue' && b === 'edit') log({ issueEdit: c, args: args.slice(3), body: stdin() });
 else if (a === 'pr' && b === 'edit') log({ edit: c, body: stdin() });
 else if (a === 'pr' && b === 'ready') log({ ready: c });
 else if (a === 'label' && b === 'list') process.stdout.write(JSON.stringify(state.labels.map((name) => ({ name }))));
@@ -193,6 +194,13 @@ describe('GhGitHub, on a public repo', () => {
     await github.upsertComment(1, '<!-- phat-mode:plan -->', 'New plan.');
     assert.deepEqual(await writes(), [
       { patch: 'repos/iPhatty/phat-mode/issues/comments/6', body: '<!-- phat-mode:plan -->\nNew plan.' },
+    ]);
+  });
+
+  test('editIssueBody replaces the issue’s body, sent on stdin', async () => {
+    await github.editIssueBody(4, '> *Shaped by phat-mode (AI) from #4.*\n\n## Original request\n\nGreet `learners`.');
+    assert.deepEqual(await writes(), [
+      { issueEdit: '4', args: ['-R', 'iPhatty/phat-mode', '--body-file', '-'], body: '> *Shaped by phat-mode (AI) from #4.*\n\n## Original request\n\nGreet `learners`.' },
     ]);
   });
 

@@ -52,12 +52,15 @@ To retry, label the issue `ready-for-agent` again and run it.
 
 ## Agent mode: shaping
 
-> **Being built.** Today shaping runs triage's checks and stops there; grilling, the spec and the tickets come next.
+> **Being built.** Today shaping triages, grills, writes the spec and publishes a request that fits in **one ticket**. Publishing several tickets as sub-issues comes next; until then such a run ends after the breakdown, with only the Q&A comment written and `agent-mode` kept.
 
-Label a vague issue you opened `agent-mode` and run `phat-mode run <issue>`: phat-mode **shapes** it, with no human answering questions. Shaping is its own durable task, next to building: it survives crashes and Ctrl-C like a build, and `status`, `resume` and `abort` cover it (`status` says `shaping: running (triage)` or `building: running (implement)`).
+Label a vague issue you opened `agent-mode` and run `phat-mode run <issue>`: phat-mode **shapes** it, with no human answering questions. Shaping is its own durable task, next to building: it survives crashes and Ctrl-C like a build, and `status`, `resume` and `abort` cover it (`status` says e.g. `shaping: running (grill)` or `building: running (implement)`).
 
 1. **Prepare** (code): shapes only issues that are open, labelled `agent-mode`, and opened by a trusted author (`allowedAuthors`); anything else is ignored without touching GitHub. An issue that is already `phat-mode:shaped`, or also carries a triage state label (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), is refused with a comment, and its labels are left for you to sort out. Then it checks out the base branch, detached and read-only, in `workspaces/<owner>__<name>/shape-<n>`, and runs `installCommand` once.
 2. **Triage** (AI, the answerer, `shape` model): follows **phat-mode's pinned copy** of mattpocock/skills' [`triage`](skills/triage/) skill, verbatim (a copy in the repo is never used), plus phat-mode's autonomy overlay: *"the user is the answering agent. Wherever the skill asks the user to check, choose, approve or answer, ask the answering agent. Never wait for a human."* It runs triage's checks: is it already implemented (and where it looked), was something like it rejected before (`.out-of-scope/`), and for a bug, does it reproduce. It reads files and runs commands, but cannot change the checkout (no write or edit tools, and its files are read-only on disk); git, `gh` and credential folders are blocked, as for every agent.
+3. **Grill** (AI, two agents in separate conversations): the **questioner** (`grill` model) follows phat-mode's pinned [`grilling`](skills/grilling/) skill, verbatim, with the same overlay. Each round it asks the whole frontier, every question numbered with a recommended answer; the **answerer** (`shape` model, the same conversation as triage) decides each one from the codebase, the glossary and the ADRs. Rounds go on until the questioner reports an empty frontier, or `limits.maxGrillRounds` (6) rounds were asked: the last round allowed is decided using the questioner's recommendations, and those decisions are listed as assumptions. Both agents are read-only. The full Q&A goes in one collapsed comment (`Grilling Q&A`), updated in place after every round; the questions and answers are quoted, so model text can never pass for an Agent Brief.
+4. **Spec and tickets** (AI, the answerer): it writes the spec following the pinned [`to-spec`](skills/to-spec/) and [`domain-modeling`](skills/domain-modeling/) skills (Problem Statement, Solution, User Stories, Implementation Decisions, Testing Decisions, Out of Scope, Further Notes, plus Assumptions with one-way doors first, and Domain: proposed glossary terms and ADRs), then breaks it down following [`to-tickets`](skills/to-tickets/). It only reports; phat-mode publishes.
+5. **Publish** (code), for one ticket: the issue's body is rewritten as the AI line, the spec, an `## Acceptance criteria` checklist (the ticket's criteria, plus "write the glossary term X" / "write the ADR Y" for each Domain entry they do not mention yet), and `## Original request` with your text verbatim. The issue gets `ready-for-agent` and `phat-mode:shaped` and loses `agent-mode`, so the next build (or `watch`) builds it from the rewritten body. The body carries a hidden `shaped-at` time: an Agent Brief comment from before shaping no longer counts, while one a trusted author adds afterwards still amends the spec. Shaping itself never commits.
 
 The agents get the issue body and the comments of `allowedAuthors` only; anyone else's comments never reach them.
 
@@ -67,9 +70,10 @@ The agents get the issue body and the comments of `allowedAuthors` only; anyone 
 | Needs a human (design taste, outside access, manual testing) | `ready-for-human` | the reason |
 | Already implemented, or rejected before | `ready-for-human` | the findings; never `wontfix`, only you close an idea for good |
 | Failure | `ready-for-human` + `phat-mode:failed` | the reason |
-| Nothing in the way | unchanged (`agent-mode` stays) | none yet: the run ends here until grilling is built |
+| Shaped into one ticket | `ready-for-agent` + `phat-mode:shaped` | the body is rewritten as the spec; the Grilling Q&A comment |
+| Shaped into several tickets | unchanged (`agent-mode` stays) | the Grilling Q&A comment only, until publishing several tickets is built |
 
-Every way out removes `agent-mode`. Everything shaping writes starts with `> *Shaped by phat-mode (AI) from #N.*`.
+Every way out, and shaping into one ticket, removes `agent-mode`. Everything shaping writes starts with `> *Shaped by phat-mode (AI) from #N.*`.
 
 ## Watch
 
@@ -111,7 +115,7 @@ Each reviewer gets the skill's brief verbatim, from **phat-mode's own pinned cop
 - The **review process** belongs to phat-mode: identical on every repo, and exactly what the tests cover. The code under review cannot change how it is reviewed.
 - **What good code means** belongs to each repo: its `AGENTS.md`, `CONTRIBUTING.md` and similar, which the Standards reviewer reads. A documented repo rule overrides a baseline smell, as the skill says.
 
-Matt's skills are pinned together in `skills/`: the ones phat-mode follows (`code-review`, `pr`, and `triage` when shaping) and the ones `init` installs into each repo (see [Setup](#setup)). To upgrade: copy the new upstream files in, update `MATTPOCOCK_SKILLS` in `src/skills.ts` and the commit in each `skills/*/README.md`, and run `npm test` (it fails if a skill's layout changed).
+Matt's skills are pinned together in `skills/`: the ones phat-mode follows (`code-review`, `pr`, and `triage`, `grilling`, `to-spec`, `domain-modeling` and `to-tickets` when shaping) and the ones `init` installs into each repo (see [Setup](#setup)). To upgrade: copy the new upstream files in, update `MATTPOCOCK_SKILLS` in `src/skills.ts` and the commit in each `skills/*/README.md`, and run `npm test` (it fails if a skill's layout changed).
 
 ### Evidence
 
@@ -263,7 +267,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 
 ## How it works
 
-- `src/shaping.ts`: shaping, a second durable task with the same patterns (prepare, triage, fail). `src/task-kit.ts`: what both tasks share (asking an agent with a fixed request ID, reading its report, per-repo services). `src/runs.ts`: how `run` and `status` describe either kind of run.
+- `src/shaping.ts`: shaping, a second durable task with the same patterns (prepare, triage, grill, spec, tickets, publish, fail). `src/task-kit.ts`: what both tasks share (asking an agent with a fixed request ID, reading its report, per-repo services). `src/runs.ts`: how `run` and `status` describe either kind of run.
 - `src/pipeline.ts`: the build pipeline's durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again. Each run uses the settings and services of its own repo, so one process works on any number of repos.
 - `src/config.ts` / `src/repos.ts`: your settings and each repo's `.phat-mode.json` (read from GitHub), and which repo an issue reference means. `src/init.ts`: what `phat-mode init` detects, installs and reports.
 - `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
@@ -271,7 +275,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 - `src/skills.ts`: the pinned mattpocock/skills and pstack versions, and which skills `init` installs. `src/pr.ts`: the pr skill and evidence sources.
 - `src/code-review.ts`: reads phat-mode's pinned code-review skill, finds standards sources, and decides what must be fixed.
 - `src/yolo.ts`: `--yolo`: the verdict a run writes on its PR, and whether and when to merge it. `src/watch.ts`: what `watch` does next.
-- `src/agents.ts`: the build agents (planner, implementer, Standards and Spec reviewers, verifier) and shaping's answerer, their tools, the report tools agents finish with, and the guard hook.
+- `src/agents.ts`: the build agents (planner, implementer, Standards and Spec reviewers, verifier) and shaping's answerer and questioner, their tools, the report tools agents finish with, and the guard hook.
 - `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code.
 - Issue comments carry hidden markers, so a rerun updates its comment instead of posting again.
 

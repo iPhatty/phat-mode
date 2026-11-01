@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 
 /**
  * phat-mode follows mattpocock/skills' skills, pinned in skills/: `code-review` for its reviewers, `pr` for the pull
- * request description, and `triage` when it shapes an `agent-mode` issue. Pinned, so they are the same on every repo
+ * request description, and `triage`, `grilling`, `to-spec`, `domain-modeling` and `to-tickets` when it shapes an `agent-mode` issue. Pinned, so they are the same on every repo
  * and exactly what the tests cover; a copy installed in the repo under review or being shaped is never used. It also pins the skills people use alongside it
  * (`PROJECT_SKILLS`), which `phat-mode init` installs into the repo. Upgrade all together: copy the new upstream files
  * into skills/, update `commit` here and in skills/<name>/README.md, and run `npm test`.
