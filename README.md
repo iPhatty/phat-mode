@@ -98,12 +98,12 @@ It polls rather than using GitHub webhooks: a webhook needs a public address for
 
 1. **phat-mode found it clean**: both reviewers reported and no must-fix findings are open, and verification either was skipped (no verify skill in the repo) or ran, reported, and left no failure this change caused. Every PR description carries phat-mode's verdict in a hidden marker, with the commit it pushed; no marker, no merge.
 2. **nobody pushed since**: the head is still the commit phat-mode judged (and the merge is pinned to it);
-3. **it has settled**: that commit is at least 5 minutes old, so checks still being queued show up;
+3. **it has settled**: that commit is at least 1 minute old, so checks still being queued show up;
 4. **every check passed**: every check run and commit status on it, required or not (skipped and neutral count). A PR with no checks merges: phat-mode's own checks, review and verification passed it.
 
 Checks running or settling: it waits. Anything else is yours, with one line saying why: `not merging: checks failed: ci/test`, `code review has open findings`, `commits added after phat-mode`, `GitHub refused: …`. It never bypasses branch protection (no `--admin`) and only squash-merges. Each merge gets a comment on the PR.
 
-`run --yolo` opens the PR as `run` does, then looks every `watchIntervalMs` until it merges (exit 0) or something needs you (exit 1, with the reason). Ctrl-C is safe: `run --yolo <issue>` again goes straight back to waiting when the PR is open and no run is going. Why it works this way: [ADR 0002](docs/adr/0002-yolo-merges.md).
+`run --yolo` opens the PR as `run` does, then looks every `watchIntervalMs` (or as soon as the commit has settled, if that is all it waits for) until it merges (exit 0) or something needs you (exit 1, with the reason). Ctrl-C is safe: `run --yolo <issue>` again goes straight back to waiting when the PR is open and no run is going. Why it works this way: [ADR 0002](docs/adr/0002-yolo-merges.md).
 
 ## Code review
 

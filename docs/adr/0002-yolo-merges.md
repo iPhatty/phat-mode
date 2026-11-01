@@ -4,7 +4,7 @@ phat-mode used to never merge. `phat-mode watch --yolo` and `phat-mode run --yol
 
 1. **phat-mode found it clean.** At publish, the run writes a hidden marker in the PR description, `<!-- phat-mode:yolo clean|not-clean sha=<pushed commit> reason="…" -->`, on every PR, with or without `--yolo`. Not clean: a code reviewer did not report, must-fix review findings are still open, verification found failures this change caused, the verifier did not report, verification could not run, or the implementer changed the verification skill (even though it was reverted). Skipped verification (the repo has no verify skill), smells, pre-existing failures and feature map edits stay clean, as they never block a PR either. No marker (e.g. a PR from an older phat-mode, or a human removed it) means: do not merge.
 2. **The head is still the commit phat-mode judged**, and the merge is pinned to it with `--match-head-commit`, so nothing pushed in between slips in.
-3. **That commit is at least 5 minutes old** (`SETTLE_MS`, fixed), so checks GitHub has not queued yet can still show up.
+3. **That commit is at least 1 minute old** (`SETTLE_MS`, fixed), so checks GitHub has not queued yet can still show up.
 4. **Every check run and commit status on it passed** (skipped and neutral count as passed); required or not. A PR with no checks at all merges: phat-mode's own check command, code review and verification already passed it.
 
 Checks running or settling: wait. Anything else (a failed check, not clean, new commits, GitHub refusing because of branch protection, conflicts or a disabled squash merge) leaves the PR to the human, with one line saying why. phat-mode never uses `--admin` and never falls back to another merge method. Each merge gets a PR comment naming the command.
