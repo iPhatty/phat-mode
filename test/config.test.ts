@@ -103,6 +103,18 @@ describe('config.json (yours, for every repo)', () => {
     await assert.rejects(withConfig({ repos: ['phatty-lingo'] }), /"repos" must be a list of "owner\/name"/);
     await assert.rejects(withConfig({ allowedAuthors: 'iPhatty' }), /"allowedAuthors" must be a non-empty list/);
   });
+
+  test('maxParallelRuns: one run at a time unless config.json says more', async () => {
+    assert.equal((await withConfig(undefined)).maxParallelRuns, 1);
+    assert.equal((await withConfig({ repos: ['a/b'] })).maxParallelRuns, 1);
+    assert.equal((await withConfig({ maxParallelRuns: 3 })).maxParallelRuns, 3);
+  });
+
+  test('maxParallelRuns must be a whole number of 1 or more', async () => {
+    for (const bad of [0, -1, 1.5, '2', null]) {
+      await assert.rejects(withConfig({ maxParallelRuns: bad }), /"maxParallelRuns" must be a whole number of 1 or more/, String(bad));
+    }
+  });
 });
 
 describe('.phat-mode.json (each repo\'s)', () => {

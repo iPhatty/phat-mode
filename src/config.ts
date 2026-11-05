@@ -53,6 +53,11 @@ export type MachineConfig = {
   limits: Limits;
   /** How often `phat-mode watch` looks at GitHub when it has nothing to do. */
   watchIntervalMs: number;
+  /**
+   * How many runs (builds and shapings) one `phat-mode watch` does at once, at most one per project. Waiting for a pull
+   * request to be merged is not a run. Per process: two watches each have their own.
+   */
+  maxParallelRuns: number;
   /** Repos `phat-mode watch` works on ("owner/name"), when none are named on the command line. */
   repos: string[];
   /** GitHub users trusted on every repo, unless the repo's own settings list them. Default: the `gh` user. */
@@ -130,13 +135,14 @@ export function defaultMachineConfig(home = DEFAULT_HOME): MachineConfig {
       installTimeoutMs: 15 * 60_000,
     },
     watchIntervalMs: 2 * 60_000,
+    maxParallelRuns: 1,
     repos: [],
   };
 }
 
 /** Settings that belong in each repo's .phat-mode.json, not in config.json. */
 const REPO_KEYS = ['repo', 'baseBranch', 'installCommand', 'checkCommand', 'labels'];
-const MACHINE_KEYS = ['defaultModel', 'models', 'limits', 'watchIntervalMs', 'repos', 'allowedAuthors'];
+const MACHINE_KEYS = ['defaultModel', 'models', 'limits', 'watchIntervalMs', 'maxParallelRuns', 'repos', 'allowedAuthors'];
 
 /** Defaults, overridden by `<home>/config.json` when it exists. */
 export async function loadMachineConfig(home = DEFAULT_HOME): Promise<MachineConfig> {
@@ -162,6 +168,9 @@ export async function loadMachineConfig(home = DEFAULT_HOME): Promise<MachineCon
   if (unknown.length > 0) throw new Error(`${file}: unknown setting(s) ${unknown.join(', ')}`);
   if (overrides.repos !== undefined && !(Array.isArray(overrides.repos) && overrides.repos.every(isRepoName))) {
     throw new Error(`${file}: "repos" must be a list of "owner/name"`);
+  }
+  if ('maxParallelRuns' in overrides && !(Number.isInteger(overrides.maxParallelRuns) && overrides.maxParallelRuns! >= 1)) {
+    throw new Error(`${file}: "maxParallelRuns" must be a whole number of 1 or more`);
   }
   if (overrides.allowedAuthors !== undefined && !isStringList(overrides.allowedAuthors)) {
     throw new Error(`${file}: "allowedAuthors" must be a non-empty list of GitHub user names`);

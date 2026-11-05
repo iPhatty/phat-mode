@@ -86,7 +86,7 @@ describe('standing skills', () => {
     try {
       const root = await harness.root(context, { agent: { model: { provider: 'faux', modelId: 'faux-1' } } });
       await root.commit(async (tx) => {
-        Object.assign(await tx.doc(RoleDoc, root.id), { role: 'question', issue: 1, workspace: null });
+        Object.assign(await tx.doc(RoleDoc, root.id), { role: 'question', repo: null, issue: 1, workspace: null });
       }, context);
       const submit = async (content: string) => {
         const settled = await (await root.submit({ type: 'input', content }, context)).wait(context);

@@ -10,7 +10,7 @@ import {
 } from '@earendil-works/pi-durable';
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from '@earendil-works/pi-durable/tools';
 import { bashBlockReason, readBlockReason, readOnlyBashBlockReason, writeBlockReason } from './guards.ts';
-import { consoleLogger, type Logger, oneLine } from './log.ts';
+import { consoleLogger, type Logger, oneLine, runName } from './log.ts';
 
 import type { SpecReport, StandardsReport } from './code-review.ts';
 import type { VerificationReport } from './verify.ts';
@@ -38,14 +38,17 @@ export const modelRole = (agent: Agent): Role =>
         ? 'grill'
         : agent;
 
-/** Who a conversation is: stored with it, so hooks know its role and workspace, also after a restart. */
-export const RoleDoc = defineDoc<{ role: Agent | null; issue: number | null; workspace: string | null }>({
+/**
+ * Who a conversation is: stored with it, so hooks know its role, run and workspace, also after a restart. `repo` is null
+ * in conversations from before it was recorded.
+ */
+export const RoleDoc = defineDoc<{ role: Agent | null; repo: string | null; issue: number | null; workspace: string | null }>({
   kind: 'phat.role',
   version: 1,
   scope: 'conversation',
   history: 'latest',
   fork: 'initial',
-  initial: () => ({ role: null, issue: null, workspace: null }),
+  initial: () => ({ role: null, repo: null, issue: null, workspace: null }),
 });
 
 /**
@@ -559,34 +562,38 @@ function describeCall(name: string, args: Record<string, unknown>): string {
 
 const isShapeAgent = (role: Agent | null | undefined) => SHAPE_AGENTS.some((agent) => agent === role);
 
-/** Blocks unsafe commands and writes outside the workspace, and logs every tool call. */
-export const Guard = defineExtension({
-  name: 'phat.guard',
-  hooks: [
-    hook(ToolTask, {
-      beforeTool: async (call, api, context) => {
-        const role = await api.snapshot(RoleDoc, api.conversationId, context);
-        const args = (call.arguments ?? {}) as Record<string, unknown>;
-        const label = role?.role ?? '?';
-        let block: string | undefined;
-        if (call.name === 'bash') {
-          const command = String(args.command ?? '');
-          block = bashBlockReason(command, role?.workspace ?? null) ?? (isShapeAgent(role?.role) ? readOnlyBashBlockReason(command) : undefined);
-        } else if (call.name === 'read') {
-          block = await readBlockReason(String(args.path ?? ''), role?.workspace ?? null);
-        } else if (call.name === 'write' || call.name === 'edit') {
-          if (role?.role !== 'implement' || role.workspace === null) {
-            block = 'Blocked: only the implementer may change files.';
-          } else {
-            block = writeBlockReason(String(args.path ?? ''), role.workspace);
+/**
+ * Blocks unsafe commands and writes outside the workspace, and logs every tool call, naming its run (`name#12`). `repo`:
+ * the project whose database the guard serves, for conversations stored before their RoleDoc recorded the repo.
+ */
+export const guardFor = (repo?: string) =>
+  defineExtension({
+    name: 'phat.guard',
+    hooks: [
+      hook(ToolTask, {
+        beforeTool: async (call, api, context) => {
+          const role = await api.snapshot(RoleDoc, api.conversationId, context);
+          const args = (call.arguments ?? {}) as Record<string, unknown>;
+          const label = role?.role ?? '?';
+          let block: string | undefined;
+          if (call.name === 'bash') {
+            const command = String(args.command ?? '');
+            block = bashBlockReason(command, role?.workspace ?? null) ?? (isShapeAgent(role?.role) ? readOnlyBashBlockReason(command) : undefined);
+          } else if (call.name === 'read') {
+            block = await readBlockReason(String(args.path ?? ''), role?.workspace ?? null);
+          } else if (call.name === 'write' || call.name === 'edit') {
+            if (role?.role !== 'implement' || role.workspace === null) {
+              block = 'Blocked: only the implementer may change files.';
+            } else {
+              block = writeBlockReason(String(args.path ?? ''), role.workspace);
+            }
           }
-        }
-        logger.tool(label, `${describeCall(call.name, args)}${block ? `  ✖ ${block}` : ''}`);
-        return block === undefined ? undefined : { block };
-      },
-    }),
-  ],
-});
+          logger.tool(label, `${describeCall(call.name, args)}${block ? `  ✖ ${block}` : ''}`, runName(role?.repo ?? repo, role?.issue));
+          return block === undefined ? undefined : { block };
+        },
+      }),
+    ],
+  });
 
 export const Tools: Extension = defineExtension({
   name: 'phat.tools',
