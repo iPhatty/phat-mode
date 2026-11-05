@@ -1,5 +1,5 @@
 import type { Context } from '@earendil-works/chord/context';
-import type { ConversationId, TaskRuntime } from '@earendil-works/pi-durable';
+import type { ConversationId, TaskId, TaskRuntime } from '@earendil-works/pi-durable';
 import { type Report, type ReportData, ReportsDoc } from './agents.ts';
 import type { Logger } from './log.ts';
 import { NUDGE } from './prompts.ts';
@@ -98,4 +98,26 @@ export function failureGuard<Runtime extends { signal: AbortSignal }>(
         await toFail(runtime, task.input.issue, error.message, context);
       }
     };
+}
+
+/**
+ * Called as each phase of a run starts, before its work: the run's input, the phase's name, the task, and the signal
+ * that aborts the run. The phase waits for it, so it may hold the run back (and must stop waiting on `signal`).
+ */
+export type OnPhase<I> = (input: I, phase: string, taskId: TaskId, signal: AbortSignal) => void | Promise<void>;
+
+/**
+ * The phases of a task, for every repo: `phase(name)` looks up the run's repo's phase `name` and runs it, telling
+ * `onPhase` first. Use it for each entry of `defineTask`'s `phases`.
+ */
+export function phasesWith<I extends { repo: string }, P extends object>(
+  phasesFor: (repo: string) => Promise<P>,
+  onPhase?: OnPhase<I>,
+): <K extends keyof P & string>(name: K) => P[K] {
+  return (name) =>
+    (async (task: { input: I }, runtime: { taskId: TaskId; signal: AbortSignal }, context: Context) => {
+      await onPhase?.(task.input, name, runtime.taskId, runtime.signal);
+      const phases = await phasesFor(task.input.repo);
+      return (phases[name] as (...args: unknown[]) => Promise<void>)(task, runtime, context);
+    }) as never;
 }

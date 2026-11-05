@@ -31,3 +31,7 @@ _Avoid_: System skill, global skill, always-on skill
 **Step skill**:
 The skill for one step, pasted verbatim into that one request: phat-mode's pinned copy of `triage`, `to-spec`, `domain-modeling`, `to-tickets`, `code-review` or `pr`, or the repo's own verify skill.
 _Avoid_: Request skill, inline skill
+
+**Project lock**:
+The lock a process holds on one project (repo) while it has that project's durable database open; its file names the holder's pid and command and what it is doing (issue, kind, phase). See ADR 0004.
+_Avoid_: Global lock, state lock

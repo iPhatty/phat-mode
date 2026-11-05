@@ -65,7 +65,7 @@ import {
   standardsReviewPrompt,
   verifyPrompt,
 } from './prompts.ts';
-import { askForReport, failureGuard, perRepo, StepFailure } from './task-kit.ts';
+import { askForReport, failureGuard, type OnPhase, perRepo, phasesWith, StepFailure } from './task-kit.ts';
 import { type Checks, EVIDENCE_BRANCH, tail, type Workspaces } from './workspace.ts';
 import { verdictFor, yoloMarker } from './yolo.ts';
 
@@ -147,24 +147,28 @@ const axisCount = (report: AxisReport<unknown> | null) =>
 /**
  * The pipeline, for every repo: each run uses the services for its own repo (`task.input.repo`), so one process works
  * on any number of repos. `servicesFor` is called once per repo; a failure is retried on the next phase.
+ * `onPhase` is told as each phase starts.
  */
-export function createPipeline(servicesFor: (repo: string) => Promise<Services>) {
-  const phasesFor = perRepo(async (repo) => repoPhases(await servicesFor(repo)));
+export function createPipeline(servicesFor: (repo: string) => Promise<Services>, onPhase?: OnPhase<PipelineInput>) {
+  const phase = phasesWith<PipelineInput, ReturnType<typeof repoPhases>>(
+    perRepo(async (repo) => repoPhases(await servicesFor(repo))),
+    onPhase,
+  );
   const Pipeline = defineTask<PipelineInput, PipelineState, PipelineResult>({
     name: 'phat.pipeline',
     version: 1,
     initial: () => ({ phase: 'prepare' }),
     phases: {
-      prepare: async (task, runtime, context) => (await phasesFor(task.input.repo)).prepare(task, runtime, context),
-      plan: async (task, runtime, context) => (await phasesFor(task.input.repo)).plan(task, runtime, context),
-      implement: async (task, runtime, context) => (await phasesFor(task.input.repo)).implement(task, runtime, context),
-      check: async (task, runtime, context) => (await phasesFor(task.input.repo)).check(task, runtime, context),
-      review: async (task, runtime, context) => (await phasesFor(task.input.repo)).review(task, runtime, context),
-      verify: async (task, runtime, context) => (await phasesFor(task.input.repo)).verify(task, runtime, context),
-      describe: async (task, runtime, context) => (await phasesFor(task.input.repo)).describe(task, runtime, context),
-      update: async (task, runtime, context) => (await phasesFor(task.input.repo)).update(task, runtime, context),
-      publish: async (task, runtime, context) => (await phasesFor(task.input.repo)).publish(task, runtime, context),
-      fail: async (task, runtime, context) => (await phasesFor(task.input.repo)).fail(task, runtime, context),
+      prepare: phase('prepare'),
+      plan: phase('plan'),
+      implement: phase('implement'),
+      check: phase('check'),
+      review: phase('review'),
+      verify: phase('verify'),
+      describe: phase('describe'),
+      update: phase('update'),
+      publish: phase('publish'),
+      fail: phase('fail'),
     },
     abort: (_task, runtime, context) =>
       runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context),

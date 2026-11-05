@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -257,8 +257,17 @@ export function modelFor(config: Pick<Config, 'defaultModel' | 'models'>, role: 
 }
 
 export const paths = {
-  state: (config: Pick<Config, 'home'>) => join(config.home, 'state.sqlite'),
-  lock: (config: Pick<Config, 'home'>) => join(config.home, 'state.sqlite.lock'),
+  /** A project's durable database, opened only by the process holding its lock. */
+  projectState: (home: string, repo: string) => join(home, 'state', `${repo.replace('/', '__')}.sqlite`),
+  /** A project's lock: who holds the project, and what it is doing. */
+  projectLock: (home: string, repo: string) => join(home, 'locks', `${repo.replace('/', '__')}.lock`),
+  /** The folder of every project's database. */
+  stateDir: (home: string) => join(home, 'state'),
+  /** The database every project shared before per-project databases, and its lock. */
+  legacyState: (home: string) => join(home, 'state.sqlite'),
+  legacyLock: (home: string) => join(home, 'state.sqlite.lock'),
+  /** Taken by this version while it retires the old database, so only one process at a time does. */
+  retireLock: (home: string) => join(home, 'locks', 'state.sqlite.lock'),
   credentials: (config: Pick<Config, 'home'>) => join(config.home, 'auth.json'),
   repoClone: (config: Config) => join(config.home, 'repos', config.repo.replace('/', '__')),
   workspace: (config: Config, issue: number) =>
@@ -272,5 +281,21 @@ export const paths = {
   evidence: (config: Config, issue: number) =>
     join(config.home, 'evidence', config.repo.replace('/', '__'), `issue-${issue}`),
 };
+
+/** The projects ("owner/name") that have a database in `<home>/state`, sorted. */
+export async function projectsWithState(home: string): Promise<string[]> {
+  let files: string[];
+  try {
+    files = await readdir(paths.stateDir(home));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  return files
+    .filter((file) => file.endsWith('.sqlite') && file.includes('__'))
+    .map((file) => file.slice(0, -'.sqlite'.length).replace('__', '/'))
+    .filter(isRepoName)
+    .sort();
+}
 
 export const branchFor = (issue: number) => `phat-mode/issue-${issue}`;

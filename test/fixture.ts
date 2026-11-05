@@ -130,7 +130,7 @@ export async function fixture(files: Record<string, string> = {}, repo = 'test/r
     const models = createModels();
     models.setProvider(faux.provider);
     const storage = () => openNodeSqliteStorage(join(dir, 'state.sqlite'));
-    const phat = await openPhatMode({ home: config.home, servicesFor }, context, { storage, models });
+    const phat = await openPhatMode({ home: config.home, repo: config.repo, servicesFor }, context, { storage, models });
     return { phat, faux };
   };
 
