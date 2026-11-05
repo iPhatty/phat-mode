@@ -316,7 +316,6 @@ function repoPhases(services: Services) {
             prompt: grillPrompt({
               issue,
               comments: issue.comments,
-              skill: await pinnedSkill('grilling'),
               round,
               previous: rounds.at(-1),
             }),

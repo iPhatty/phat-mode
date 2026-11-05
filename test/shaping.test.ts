@@ -15,7 +15,7 @@ import { eligibility, listUnder } from '../src/spec.ts';
 import type { ShapingResult } from '../src/shaping.ts';
 import { skillBody } from '../src/skills.ts';
 import { GitWorkspaces } from '../src/workspace.ts';
-import { call, expectLast, fixture, textOf } from './fixture.ts';
+import { call, expectLast, fixture, sectionsOf, textOf } from './fixture.ts';
 
 const context = BACKGROUND_CONTEXT;
 setToolLogger(silentLogger);
@@ -519,9 +519,13 @@ describe('shaping', () => {
       const { github, runIssue } = await fixture();
       github.addIssue(22, { labels: ['agent-mode'] });
       const grilling = await readFile(new URL('../skills/grilling/SKILL.md', import.meta.url), 'utf8');
-      const seen: { model: string; text: string }[] = [];
+      const seen: { model: string; text: string; skills: string | undefined }[] = [];
       const as = (then: ReturnType<typeof call>): FauxResponseFactory => (request, _options, _state, model) => {
-        seen.push({ model: model.id, text: request.messages.map((message) => textOf(message as { content: unknown })).join('\n') });
+        seen.push({
+          model: model.id,
+          text: request.messages.map((message) => textOf(message as { content: unknown })).join('\n'),
+          skills: sectionsOf(request).skills,
+        });
         return then;
       };
       const { outcome } = await runIssue(22, oneTicket().map(as), 'shape');
@@ -532,8 +536,13 @@ describe('shaping', () => {
       );
       const [, firstRound, , secondRound] = seen;
       assert.doesNotMatch(firstRound!.text, /Run triage's checks/, 'its own conversation: not the answerer’s');
-      assert.ok(firstRound!.text.includes(`<skill name="grilling" source="mattpocock/skills@49dd158">\n${skillBody(grilling)}\n</skill>`));
-      assert.ok(firstRound!.text.includes(AUTONOMY_OVERLAY));
+      const pinned = `<skill name="grilling" source="mattpocock/skills@49dd158">\n${skillBody(grilling)}\n</skill>`;
+      assert.ok(!firstRound!.text.includes('<skill name="grilling"'), 'the request no longer carries the skill');
+      for (const round of [firstRound!, secondRound!]) {
+        assert.ok(round.skills?.includes(pinned), 'the standing skill, in the system prompt, on every round');
+        assert.ok(round.skills?.includes(AUTONOMY_OVERLAY));
+      }
+      assert.equal(seen[0]!.skills, undefined, 'the answerer has no standing skills');
       assert.match(secondRound!.text, /The answering agent answered round 1:[^]*Yes: a constant in code/);
       assert.match(seen[2]!.text, /Run triage's checks[^]*The questioner asks round 1/, 'the answerer keeps its own conversation');
     });
@@ -676,7 +685,15 @@ describe('shaping', () => {
 
       // Second process: only the responses for the rest.
       github.upsertComment = upsert;
-      const second = await open(all.slice(3));
+      let resumedSkills: string | undefined;
+      const [round2, ...rest] = all.slice(3);
+      const second = await open([
+        (request: Parameters<FauxResponseFactory>[0]) => {
+          resumedSkills = sectionsOf(request).skills;
+          return round2 as ReturnType<typeof call>;
+        },
+        ...rest,
+      ]);
       assert.deepEqual(await second.phat.start({ repo: config.repo, issue: 25 }, context, 'shape'), { taskId, resumed: true });
       second.phat.harness.resume();
       const { outcome } = (await second.phat.harness.waitForTask(taskId, context)).state;
@@ -687,6 +704,7 @@ describe('shaping', () => {
       assert.equal(second.faux.getPendingResponseCount(), 0);
       assert.equal(github.comments.length, 1);
       assert.match(github.comments[0]!.body, /Grilling Q&A \(1 round\)[^]*Storage/);
+      assert.match(resumedSkills ?? '', /<skill name="grilling"/, 'the resumed questioner still has its standing skill');
       assert.ok(github.issues.get(25)!.body.endsWith(`## Original request\n\n${ORIGINAL}`));
       assert.deepEqual(github.labels(25), ['phat-mode:shaped', 'ready-for-agent']);
     });

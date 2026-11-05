@@ -52,6 +52,21 @@ export const textOf = (message: { content: unknown }) =>
   typeof message.content === 'string'
     ? message.content
     : (message.content as { type: string; text?: string }[]).map((part) => part.text ?? '').join('');
+/**
+ * The system prompt sections in effect for a request: its system messages replayed in order (a later one replaces a
+ * section, `null` removes it).
+ */
+export const sectionsOf = (request: { messages: readonly { role: string }[] }): Record<string, string> => {
+  const sections: Record<string, string> = {};
+  for (const message of request.messages) {
+    if (message.role !== 'system') continue;
+    for (const [key, text] of Object.entries((message as { sections?: Record<string, string | null> }).sections ?? {})) {
+      if (text === null) delete sections[key];
+      else sections[key] = text;
+    }
+  }
+  return sections;
+};
 // ─── Fixture ────────────────────────────────────────────────────────────────
 
 const temp: string[] = [];
