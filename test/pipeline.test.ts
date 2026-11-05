@@ -309,7 +309,8 @@ describe('pipeline', () => {
   });
 
   test('open findings after the last round: the describer is told, so Merge Danger reflects them', async () => {
-    const { github, runIssue } = await fixture();
+    const { config, github, runIssue } = await fixture();
+    config.limits.maxReviewRounds = 2;
     github.addIssue(43);
     const { outcome } = await runIssue(43, [
       plan(),
@@ -840,7 +841,8 @@ describe('pipeline', () => {
   });
 
   test('opens the PR with must-fix findings flagged after the last review round, each under its own axis', async () => {
-    const { github, runIssue } = await fixture();
+    const { config, github, runIssue } = await fixture();
+    config.limits.maxReviewRounds = 2;
     github.addIssue(4);
     const { outcome } = await runIssue(4, [
       plan(),
@@ -861,7 +863,8 @@ describe('pipeline', () => {
   });
 
   test('must-fix findings still open: not clean for yolo', async () => {
-    const { github, runIssue, remote } = await fixture();
+    const { config, github, runIssue, remote } = await fixture();
+    config.limits.maxReviewRounds = 2;
     github.addIssue(4);
     await runIssue(4, [
       plan(),

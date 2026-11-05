@@ -118,7 +118,7 @@ export function defaultMachineConfig(home = DEFAULT_HOME): MachineConfig {
     },
     limits: {
       maxCheckFixes: 3,
-      maxReviewRounds: 2,
+      maxReviewRounds: 5,
       maxVerifyRounds: 2,
       maxImplementRuns: 8,
       maxBranchUpdates: 3,

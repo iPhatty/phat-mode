@@ -186,7 +186,7 @@ The skill gives no verdict, so phat-mode decides:
 | Standards violation | must fix: back to the implementer |
 | Code smell | judgement call: sent along with must-fix findings, but never blocks the PR |
 
-With nothing to fix, the PR opens. Otherwise the implementer fixes and both reviewers look again; after `maxReviewRounds` (2: one round of fixes) the PR opens with the open findings flagged. The PR's **Code review** section shows Standards and Spec side by side, never merged or reranked, and the skill's one-line summary (findings per axis and the worst within each).
+With nothing to fix, the PR opens. Otherwise the implementer fixes and both reviewers look again; after `maxReviewRounds` (5: up to four rounds of fixes) the PR opens with the open findings flagged. The PR's **Code review** section shows Standards and Spec side by side, never merged or reranked, and the skill's one-line summary (findings per axis and the worst within each).
 
 ## Setup
 
@@ -265,7 +265,7 @@ Optional; anything left out uses the defaults in [`src/config.ts`](src/config.ts
 {
   "repos": ["iPhatty/phatty-lingo"],
   "allowedAuthors": ["iPhatty"],
-  "limits": { "maxCheckFixes": 3, "maxReviewRounds": 2 },
+  "limits": { "maxCheckFixes": 3, "maxReviewRounds": 5 },
   "watchIntervalMs": 120000
 }
 ```
