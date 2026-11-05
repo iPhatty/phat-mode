@@ -12,6 +12,7 @@ import type { ParentIssue, Spec } from './spec.ts';
 import type { FeatureResult, VerifySkill } from './verify.ts';
 import type { Comment, Issue } from './github.ts';
 import type { PinnedSkill } from './skills.ts';
+import { agreedSeams } from './messages.ts';
 
 const SHARED = `You are part of phat-mode, an automated pipeline that turns triaged GitHub issues into pull requests.
 
@@ -46,7 +47,7 @@ export const AUTONOMY_OVERLAY =
  * unattended.
  */
 export const TDD_OVERLAY =
-  'the user is the planner. The tests the plan names are the agreed seams: write tests only at those seams, without asking anyone to confirm them. If a test needs a seam the plan does not name, add it and say so in report_done.';
+  'the user is the planner. The seams listed as the agreed seams in your request are the agreed seams: write tests only at those seams, without asking anyone to confirm them. If a test needs a seam that is not on that list, add it and say so in report_done.';
 
 /** The overlay each role's standing skills come with, if any. */
 const STANDING_OVERLAYS: Partial<Record<Agent, { name: string; text: string }>> = {
@@ -89,10 +90,10 @@ Finish each request by calling report_questions.`,
 
 Your role: planner. The issue was already triaged as ready for an agent; your job is to plan how to build it, not whether.
 Read the spec and explore the code (read files, ls, grep). Do not change any project files. Check whether the behaviour already exists.
-Use your standing codebase-design skill, in your system prompt, for the vocabulary when deciding where the seams go and which tests the plan names.
+Use your standing codebase-design skill, in your system prompt, to decide the test seams: the public interfaces the tests go through. Report them in report_plan's seams field, each with its interface, what testing there catches and what it misses. The implementer tests only at those seams.
 Research only as far as planning needs. Whatever you find that the implementer will need (sources, URLs, commands that worked, facts about the data or the code), put in report_plan's notes, and leave any files you download in the scratch folder named in the request, so the implementer does not redo your work.
 Decide:
-- proceed: the spec is clear. Give a short, concrete plan of steps, including the tests to add.
+- proceed: the spec is clear. Give a short, concrete plan of steps, including the tests to add, and the seams. With no behaviour to test (e.g. docs only), leave seams empty and say why in noSeamsReason, not in notes.
 - needs_info: the spec has a gap only its author can fill (for example, two reasonable readings that lead to different behaviour). List what is already established, and specific questions.
 - needs_human: it needs judgment calls, design decisions, external access or manual testing that an agent cannot do. Say why.
 Prefer proceed when a sensible reading exists. Finish by calling report_plan.`,
@@ -101,7 +102,7 @@ Prefer proceed when a sensible reading exists. Finish by calling report_plan.`,
 
 Your role: implementer. Make the change the spec asks for, following the plan.
 - Keep changes focused. Do not refactor unrelated code or touch anything out of scope.
-- Add or update tests for every behaviour change, following your standing tdd skill, in your system prompt, with its overlay: the tests the plan names are the agreed seams.
+- Add or update tests for every behaviour change, following your standing tdd skill, in your system prompt, with its overlay: the seams listed in your request are the agreed seams.
 - Make sure every acceptance criterion is met.
 - Run the project's checks (\`${checkCommand}\`) and fix every failure before you finish.
 Finish by calling report_done.`,
@@ -174,6 +175,8 @@ Plan summary: ${plan.summary}
 
 Plan:
 ${list(plan.plan)}
+
+${agreedSeams(plan)}
 ${
   notes
     ? `\nWhat the planner already found out. Build on it; do not redo this research unless something here turns out not to hold:\n\n${notes}\n`

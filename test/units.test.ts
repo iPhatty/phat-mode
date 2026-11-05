@@ -5,8 +5,9 @@ import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { FileCredentialStore, importPiCredential } from '../src/credentials.ts';
 import { agentEnv } from '../src/exec.ts';
-import { breakdownCriteria, evidence, pullRequestBody, shapedCriteria } from '../src/messages.ts';
-import { roleInstructions } from '../src/prompts.ts';
+import { planRejection, type PlanReport } from '../src/agents.ts';
+import { breakdownCriteria, evidence, planComment, pullRequestBody, shapedCriteria } from '../src/messages.ts';
+import { implementPrompt, roleInstructions } from '../src/prompts.ts';
 import { describeResult, runStatus } from '../src/runs.ts';
 import { dependencyOrder } from '../src/shaping.ts';
 
@@ -183,10 +184,38 @@ describe('instructions', () => {
     assert.match(ROLE_INSTRUCTIONS.question, /your standing grilling skill, phat-mode's pinned copy in your system prompt, with its autonomy overlay/);
     assert.doesNotMatch(ROLE_INSTRUCTIONS.question, /first request/);
     assert.match(ROLE_INSTRUCTIONS.plan, /your standing codebase-design skill/);
-    assert.match(ROLE_INSTRUCTIONS.implement, /your standing tdd skill[^]*the tests the plan names are the agreed seams/);
+    assert.match(ROLE_INSTRUCTIONS.implement, /your standing tdd skill[^]*the seams listed in your request are the agreed seams/);
     for (const role of ['answer', 'standards', 'spec', 'verify'] as const) {
       assert.doesNotMatch(ROLE_INSTRUCTIONS[role], /your standing/, role);
     }
+  });
+});
+
+describe('test seams', () => {
+  test('the planner reports its seams, and why there are none, in report_plan', () => {
+    assert.match(ROLE_INSTRUCTIONS.plan, /codebase-design skill[^]*report_plan's seams field, each with its interface, what testing there catches and what it misses/);
+    assert.match(ROLE_INSTRUCTIONS.plan, /leave seams empty and say why in noSeamsReason, not in notes/);
+  });
+
+  test('a proceed plan needs seams or a reason; handing back needs neither', () => {
+    const seam = { interface: 'save()', catches: 'lost progress', misses: 'the UI' };
+    assert.match(planRejection({ decision: 'proceed', seams: [], noSeamsReason: '' }) ?? '', /^Rejected: /);
+    assert.match(planRejection({ decision: 'proceed', seams: [], noSeamsReason: '  \n ' }) ?? '', /^Rejected: /);
+    assert.equal(planRejection({ decision: 'proceed', seams: [], noSeamsReason: 'Docs only.' }), undefined);
+    assert.equal(planRejection({ decision: 'proceed', seams: [seam], noSeamsReason: '' }), undefined);
+    assert.equal(planRejection({ decision: 'needs_info', seams: [], noSeamsReason: '' }), undefined);
+    assert.equal(planRejection({ decision: 'needs_human', seams: [], noSeamsReason: '' }), undefined);
+  });
+
+  test('a plan recorded before seams existed still renders, for a resumed run', () => {
+    const legacy = { ...plan, notes: '' } as PlanReport;
+    assert.equal('seams' in legacy, false);
+    const comment = planComment(legacy);
+    assert.match(comment, /\*\*Test seams\*\*\nnone listed/);
+    assert.doesNotMatch(comment, /undefined/);
+    const prompt = implementPrompt(issue, spec, legacy, '/scratch');
+    assert.match(prompt, /Agreed seams: none listed/);
+    assert.doesNotMatch(prompt, /undefined/);
   });
 });
 

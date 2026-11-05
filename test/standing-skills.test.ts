@@ -41,8 +41,8 @@ describe('standing skills', () => {
     assert.ok(text.includes(await skillTag('tdd')));
     for (const file of ['tests.md', 'mocking.md']) assert.ok(text.includes(await referenceTag('tdd', file)));
     assert.ok(text.includes(TDD_OVERLAY));
-    assert.match(TDD_OVERLAY, /^the user is the planner\. The tests the plan names are the agreed seams/);
-    assert.match(TDD_OVERLAY, /add it and say so in report_done/);
+    assert.match(TDD_OVERLAY, /^the user is the planner\. The seams listed as the agreed seams in your request are the agreed seams: write tests only at those seams/);
+    assert.match(TDD_OVERLAY, /a seam that is not on that list, add it and say so in report_done/);
   });
 
   test('every other role: none', async () => {
