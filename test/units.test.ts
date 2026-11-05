@@ -168,6 +168,26 @@ describe('instructions', () => {
   test('the planner hands its research over instead of leaving it for the implementer to redo', () => {
     assert.match(ROLE_INSTRUCTIONS.plan, /put in report_plan's notes, and leave any files you download in the scratch folder/);
   });
+
+  test('every role: phat-mode’s skills win over skills installed in the project', () => {
+    for (const [role, text] of Object.entries(ROLE_INSTRUCTIONS)) {
+      assert.match(
+        text,
+        /Skills installed in the project \(\.agents\/skills, \.claude\/skills and similar\) are background only\. Where phat-mode gives you a skill, as a standing skill in your system prompt or in a request, follow phat-mode's copy, never the project's\./,
+        role,
+      );
+    }
+  });
+
+  test('the questioner, planner and implementer follow their standing skills', () => {
+    assert.match(ROLE_INSTRUCTIONS.question, /your standing grilling skill, phat-mode's pinned copy in your system prompt, with its autonomy overlay/);
+    assert.doesNotMatch(ROLE_INSTRUCTIONS.question, /first request/);
+    assert.match(ROLE_INSTRUCTIONS.plan, /your standing codebase-design skill/);
+    assert.match(ROLE_INSTRUCTIONS.implement, /your standing tdd skill[^]*the tests the plan names are the agreed seams/);
+    for (const role of ['answer', 'standards', 'spec', 'verify'] as const) {
+      assert.doesNotMatch(ROLE_INSTRUCTIONS[role], /your standing/, role);
+    }
+  });
 });
 
 describe('run status', () => {

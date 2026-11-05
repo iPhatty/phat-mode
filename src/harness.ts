@@ -19,6 +19,7 @@ import { agentEnv } from './exec.ts';
 import { acquireLock } from './lock.ts';
 import { createPipeline, type PipelineInput, type PipelineResult, type Services } from './pipeline.ts';
 import { createShaping, type ShapingResult } from './shaping.ts';
+import { Skills } from './standing-skills.ts';
 
 /** What a run is: building an issue into a pull request, or shaping an agent-mode issue into tickets. */
 export type RunKind = 'build' | 'shape';
@@ -85,6 +86,7 @@ export async function openPhatMode(setup: Setup, context: Context, options: Open
   const registry = createRegistry();
   registry.install(Tools);
   registry.install(Guard);
+  registry.install(Skills);
   registry.install(extension);
   registry.install(shaping.extension);
 

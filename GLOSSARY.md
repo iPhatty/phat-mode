@@ -17,9 +17,17 @@ A tracer-bullet sub-issue of a Parent, labelled `ready-for-agent`, that can be b
 _Avoid_: Task, story, slice
 
 **Questioner**:
-The agent on the `grill` role that follows the pinned `grilling` skill, asking rounds of questions, each with a recommended answer.
+The agent on the `grill` role that follows the pinned `grilling` skill as its Standing skill, asking rounds of questions, each with a recommended answer.
 _Avoid_: Interviewer, griller
 
 **Answerer**:
 The agent on the `shape` role that decides each of the Questioner's questions from the codebase, the glossary and the ADRs; it also does triage's checks, the spec and the Ticket breakdown.
 _Avoid_: User, human, responder
+
+**Standing skill**:
+A skill a role follows for its whole conversation, rendered from phat-mode's pinned copy into a section of its system prompt, so it is on every request and survives compaction: `grilling` for the Questioner, `codebase-design` for the planner, `tdd` for the implementer.
+_Avoid_: System skill, global skill, always-on skill
+
+**Step skill**:
+The skill for one step, pasted verbatim into that one request: phat-mode's pinned copy of `triage`, `to-spec`, `domain-modeling`, `to-tickets`, `code-review` or `pr`, or the repo's own verify skill.
+_Avoid_: Request skill, inline skill

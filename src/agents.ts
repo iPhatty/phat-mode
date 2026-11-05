@@ -24,7 +24,7 @@ export type BuildAgent = 'plan' | 'implement' | 'standards' | 'spec' | 'verify';
 export const AGENTS: readonly BuildAgent[] = ['plan', 'implement', 'standards', 'spec', 'verify'];
 /**
  * The agents that shape a vague issue, both read-only, in separate conversations: the answerer (`shape` model) decides
- * from the codebase; the questioner (`grill` model) grills it, following the pinned `grilling` skill.
+ * from the codebase; the questioner (`grill` model) grills it, following the pinned `grilling` skill, its standing skill.
  */
 export type ShapeAgent = 'answer' | 'question';
 export const SHAPE_AGENTS: readonly ShapeAgent[] = ['answer', 'question'];

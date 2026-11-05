@@ -1,8 +1,11 @@
 import { readFile } from 'node:fs/promises';
+import type { Agent } from './agents.ts';
 
 /**
  * phat-mode follows mattpocock/skills' skills, pinned in skills/: `code-review` for its reviewers, `pr` for the pull
- * request description, and `triage`, `grilling`, `to-spec`, `domain-modeling` and `to-tickets` when it shapes an `agent-mode` issue. Pinned, so they are the same on every repo
+ * request description, and `triage`, `to-spec`, `domain-modeling` and `to-tickets` when it shapes an `agent-mode` issue: its step skills,
+ * each pasted into the one request it belongs to. Its standing skills (`STANDING_SKILLS`: `grilling`, `codebase-design`,
+ * `tdd`) are in a role's system prompt instead. Pinned, so they are the same on every repo
  * and exactly what the tests cover; a copy installed in the repo under review or being shaped is never used. It also pins the skills people use alongside it
  * (`PROJECT_SKILLS`), which `phat-mode init` installs into the repo. Upgrade all together: copy the new upstream files
  * into skills/, update `commit` here and in skills/<name>/README.md, and run `npm test`.
@@ -94,4 +97,36 @@ export async function pinnedSkill(name: string, references: readonly string[] = 
       references.map(async (file) => ({ file, text: (await readFile(new URL(file, skillDir(name)), 'utf8')).trim() })),
     ),
   };
+}
+
+/** A standing skill: its name and the reference docs, next to its SKILL.md, that come with it. */
+export type StandingSkill = { name: string; references: readonly string[] };
+
+/**
+ * Each role's standing skills: the skills it follows for its whole conversation, rendered from phat-mode's pinned copies
+ * into a system prompt section (see standing-skills.ts), so they are on every request and survive compaction. Fixed in
+ * code, like `ROLE_TOOLS`. Step skills, the skill for one request, are pasted into that request instead.
+ */
+export const STANDING_SKILLS: Record<Agent, readonly StandingSkill[]> = {
+  question: [{ name: 'grilling', references: [] }],
+  plan: [{ name: 'codebase-design', references: ['DEEPENING.md', 'DESIGN-IT-TWICE.md'] }],
+  implement: [{ name: 'tdd', references: ['tests.md', 'mocking.md'] }],
+  answer: [],
+  standards: [],
+  spec: [],
+  verify: [],
+};
+
+const standingCache = new Map<Agent, Promise<PinnedSkill[]>>();
+
+/** A role's standing skills, read once per process from phat-mode's own skills/, never from a repo. */
+export function standingSkills(role: Agent): Promise<PinnedSkill[]> {
+  let skills = standingCache.get(role);
+  if (skills === undefined) {
+    skills = Promise.all(STANDING_SKILLS[role].map((skill) => pinnedSkill(skill.name, skill.references)));
+    // A failed read is not cached: the next request tries again.
+    skills.catch(() => standingCache.delete(role));
+    standingCache.set(role, skills);
+  }
+  return skills;
 }

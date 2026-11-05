@@ -8,7 +8,9 @@ import { type FauxResponseFactory, type FauxResponseStep, fauxAssistantMessage }
 import { setToolLogger } from '../src/agents.ts';
 import { branchFor, paths } from '../src/config.ts';
 import { run } from '../src/exec.ts';
-import { call, expectLast, fixture, textOf } from './fixture.ts';
+import { call, expectLast, fixture, sectionsOf, textOf } from './fixture.ts';
+import { TDD_OVERLAY } from '../src/prompts.ts';
+import { skillBody } from '../src/skills.ts';
 import { type RunResult, RunsDoc } from '../src/harness.ts';
 import { LockedError } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
@@ -211,6 +213,61 @@ describe('pipeline', () => {
       github.prs[0]!.body,
       /## Merge Danger\n\n\*\*Door:\*\* one-way\n\nDeletes saved progress\.\n\n\*\*Blast Radius:\*\* data\n\nLearners lose streaks\./,
     );
+  });
+
+  test('standing skills: the planner’s and implementer’s system prompts carry phat-mode’s pinned copies; reviewers and verifier get none', async () => {
+    const pinned = async (skill: string, file = 'SKILL.md') =>
+      (await readFile(new URL(`../skills/${skill}/${file}`, import.meta.url), 'utf8')).trim();
+    const { github, runIssue } = await fixture({
+      ...VERIFY_SKILL_FILES,
+      '.agents/skills/tdd/SKILL.md': '---\nname: tdd\n---\nREPO COPY OF TDD',
+      '.agents/skills/tdd/tests.md': 'REPO COPY OF TESTS',
+      '.agents/skills/codebase-design/SKILL.md': '---\nname: codebase-design\n---\nREPO COPY OF CODEBASE-DESIGN',
+    });
+    github.addIssue(43);
+    const sections = new Map<string, (string | undefined)[]>();
+    const record = (step: FauxResponseStep): FauxResponseFactory => (request, options, state, model) => {
+      const first = textOf(request.messages.find((message) => message.role === 'user') as { content: unknown });
+      const who = first.startsWith('Plan this change')
+        ? 'plan'
+        : first.startsWith('Implement this change')
+          ? 'implement'
+          : first.includes('on the Standards axis')
+            ? 'standards'
+            : first.includes('on the Spec axis')
+              ? 'spec'
+              : first.includes('Verify this change')
+                ? 'verify'
+                : 'other';
+      sections.set(who, [...(sections.get(who) ?? []), sectionsOf(request).skills]);
+      return typeof step === 'function' ? step(request, options, state, model) : step;
+    };
+    const { outcome } = await runIssue(
+      43,
+      [plan(), write('hello.txt', 'hello\n'), done(), ...approve(), verificationReport([{}]), describePr()].map(record),
+    );
+    assert.equal(result(outcome).status, 'pr_opened');
+    assert.deepEqual([...sections.keys()].sort(), ['implement', 'plan', 'spec', 'standards', 'verify']);
+
+    for (const skills of sections.get('plan')!) {
+      assert.ok(skills?.includes(`<skill name="codebase-design" source="mattpocock/skills@49dd158">\n${skillBody(await pinned('codebase-design'))}\n</skill>`));
+      for (const file of ['DEEPENING.md', 'DESIGN-IT-TWICE.md']) {
+        assert.ok(skills?.includes(`<skill-reference skill="codebase-design" file="${file}">\n${await pinned('codebase-design', file)}\n</skill-reference>`));
+      }
+      assert.doesNotMatch(skills!, /REPO COPY/, 'never the repo’s copy');
+      assert.doesNotMatch(skills!, /<skill name="tdd"/);
+    }
+    for (const skills of sections.get('implement')!) {
+      assert.ok(skills?.includes(`<skill name="tdd" source="mattpocock/skills@49dd158">\n${skillBody(await pinned('tdd'))}\n</skill>`));
+      for (const file of ['tests.md', 'mocking.md']) {
+        assert.ok(skills?.includes(`<skill-reference skill="tdd" file="${file}">\n${await pinned('tdd', file)}\n</skill-reference>`));
+      }
+      assert.ok(skills?.includes(TDD_OVERLAY));
+      assert.doesNotMatch(skills!, /REPO COPY/, 'never the repo’s copy');
+    }
+    for (const agent of ['standards', 'spec', 'verify']) {
+      assert.deepEqual(sections.get(agent)!.filter((skills) => skills !== undefined), [], `${agent}: no standing skills`);
+    }
   });
 
   test('no description reported: the PR still opens, with a plain one', async () => {
