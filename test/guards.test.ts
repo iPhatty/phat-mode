@@ -163,6 +163,31 @@ describe('bashBlockReason', () => {
     }
   });
 
+  test('commands inside a command substitution are judged too, also inside double quotes', () => {
+    for (const home of [join(homedir(), 'pm2'), join(homedir(), '.phat-mode')]) {
+      const ws = join(home, 'workspaces', 'a', 'issue-1');
+      for (const command of [
+        `echo "$(cat ${home}/auth.json)"`,
+        `echo "x $(sqlite3 ${home}/state.sqlite .dump) y"`,
+        `echo "$(cat "${home}/auth.json")"`,
+        `echo "$(echo "$(cat ${home}/auth.json)")"`,
+        `echo "\`cat ${home}/auth.json\`"`,
+        `echo $(cat ${home}/auth.json)`,
+        'echo "$(cat ../../../auth.json)"',
+      ]) {
+        assert.match(bashBlockReason(command, ws, home) ?? '', /credential folders/, `${home}: ${command}`);
+      }
+      for (const command of [
+        `echo "$(cat ${ws}/README.md)"`,
+        'echo "$(ls src) and $((1 + 2))"',
+        `echo "\`ls ${ws}\`" "(${ws})"`,
+        `cat "$(git rev-parse --show-toplevel)/README.md"`,
+      ]) {
+        assert.equal(bashBlockReason(command, ws, home), undefined, `${home}: ${command}`);
+      }
+    }
+  });
+
   test('blocks sudo, deleting home or root, and reading credentials', () => {
     for (const command of ['sudo rm x', 'rm -rf ~', 'rm -rf /', 'cat ~/.ssh/id_ed25519', 'cat ~/.phat-mode/auth.json', 'cat ~/.config/gh/hosts.yml']) {
       assert.match(bashBlockReason(command) ?? '', /^Blocked:/, command);

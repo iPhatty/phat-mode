@@ -96,7 +96,8 @@ const OPERATORS = new Set([';', '|', '&', '<', '>', '(', ')', '`', '\n']);
 /**
  * The words of a shell command as the shell would read them: quotes and backslash escapes resolved (so a path with
  * spaces stays one word), `~` at the start of a word and `$HOME` / `${HOME}` outside single quotes expanded. `null`
- * marks where one command ends and the next begins (`;`, `&&`, `|`, `(`, `$(`…).
+ * marks where one command ends and the next begins (`;`, `&&`, `|`, `(`, `$(`…). A command substitution (`$(…)`, or
+ * `` `…` `` inside double quotes) is read as commands of its own, also inside double quotes, as the shell runs it.
  */
 function shellWords(command: string): (ShellWord | null)[] {
   const home = homedir();
@@ -106,6 +107,8 @@ function shellWords(command: string): (ShellWord | null)[] {
   let parts: string[] = [];
   let started = false;
   let quote: "'" | '"' | null = null;
+  /** Open command substitutions, innermost last: the quote to go back to, and the `(` still open inside it. */
+  const substitutions: { quote: '"' | null; depth: number; backtick: boolean }[] = [];
   const add = (chars: string) => {
     text += chars;
     part += chars;
@@ -117,6 +120,12 @@ function shellWords(command: string): (ShellWord | null)[] {
     part = '';
     parts = [];
     started = false;
+  };
+  const openSubstitution = (backtick: boolean) => {
+    endWord();
+    if (out.at(-1) !== null) out.push(null);
+    substitutions.push({ quote: quote as '"' | null, depth: 0, backtick });
+    quote = null;
   };
   for (let i = 0; i < command.length; i++) {
     const char = command[i]!;
@@ -140,15 +149,15 @@ function shellWords(command: string): (ShellWord | null)[] {
         i += variable.length - 1;
         continue;
       }
-      if (quote === null && next === '(') {
-        endWord();
-        out.push(null);
+      if (next === '(') {
+        openSubstitution(false);
         i++;
         continue;
       }
     }
     if (quote === '"') {
       if (char === '"') quote = null;
+      else if (char === '`') openSubstitution(true);
       else add(char);
       continue;
     }
@@ -160,6 +169,12 @@ function shellWords(command: string): (ShellWord | null)[] {
     } else if (OPERATORS.has(char)) {
       endWord();
       if (out.at(-1) !== null) out.push(null);
+      const open = substitutions.at(-1);
+      if (open !== undefined && open.backtick === (char === '`')) {
+        if (char === '(') open.depth++;
+        else if (char === ')' && open.depth > 0) open.depth--;
+        else if (char === ')' || char === '`') quote = substitutions.pop()!.quote;
+      }
     } else if (char === '~' && part === '' && (next === undefined || next === '/' || /[\s=:]/.test(next) || OPERATORS.has(next))) {
       add(home);
     } else if (char === '=' || char === ':') {
