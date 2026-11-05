@@ -14,19 +14,21 @@ import {
   modelFor,
   parseRepoSettings,
   paths,
+  projectsWithState,
   REPO_SETTINGS_FILE,
   ROLES,
 } from './config.ts';
 import { FileCredentialStore, importPiCredential } from './credentials.ts';
 import { run, runShell } from './exec.ts';
 import { GhGitHub, requiredLabels } from './github.ts';
-import { createCopilotModels, openPhatMode, type RunKind, type RunResult, RunsDoc } from './harness.ts';
+import { createCopilotModels, openPhatMode, type PhatMode, type RunKind, type RunResult, RunsDoc } from './harness.ts';
 import { detectCommands, installProjectSkills, readiness, settingsFile } from './init.ts';
-import { LockedError } from './lock.ts';
+import { describeHolder, LockedError, type LockInfo } from './lock.ts';
+import { describeUnfinished, finishInterrupted, liveRuns, projectStatus, resumeOnce, retireLegacyState } from './projects.ts';
 import { consoleLogger, consoleLoggerFor } from './log.ts';
 import type { Services } from './pipeline.ts';
 import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef, watchScope } from './repos.ts';
-import { describeResult, type RunRecord, runStatus } from './runs.ts';
+import { describeResult } from './runs.ts';
 import { MATTPOCOCK_SKILLS, PSTACK_SKILLS, VERIFICATION_SKILLS } from './skills.ts';
 import { describeStep, nextStep } from './watch.ts';
 import { runOrWait, SETTLE_MS, waitToMerge } from './yolo.ts';
@@ -46,11 +48,12 @@ Usage:
   phat-mode run <issue>         Work on a ready-for-agent issue until a PR is open, or shape an agent-mode
                                 issue (resumes if interrupted)
                                 --yolo: then merge the PR once it is clean and every check passed
-  phat-mode resume              Continue every run that was interrupted
+  phat-mode resume              Continue every run that was interrupted, in every project no other process holds
   phat-mode watch [repo...]     Keep going: work on the next ready issue each time you merge a PR (Ctrl-C to stop).
                                 In a set-up repo, asks whether to watch it alone or all your repos.
                                 --yolo: merge phat-mode's PRs itself once they are clean and every check passed
-  phat-mode status              List runs and where they are
+  phat-mode status              List every project's runs and where they are; for a project another phat-mode process
+                                holds, what that process is doing
   phat-mode abort <issue>       Stop the run for an issue
 
 <issue> is 12 (in the repo of this folder), owner/name#12, or the issue's URL. [repo] is owner/name.
@@ -93,25 +96,28 @@ function servicesFor(config: Config): Services {
   };
 }
 
-async function open(machine: MachineConfig, configFor: (repo: string) => Promise<Config>) {
+/** Open one project: take its lock (LockedError when another process holds it) and its database. */
+async function open(machine: MachineConfig, repo: string, configFor: (repo: string) => Promise<Config>) {
   setToolLogger(consoleLogger);
-  const phat = await openPhatMode(
-    { home: machine.home, servicesFor: async (repo) => servicesFor(await configFor(repo)) },
+  return openPhatMode(
+    { home: machine.home, repo, servicesFor: async (repo) => servicesFor(await configFor(repo)) },
     context,
     { lock, onReport: (error) => consoleLogger.error(`Report: ${error instanceof Error ? error.message : String(error)}`) },
   );
-  // Ctrl-C stops cleanly. Everything is saved; `phat-mode run` or `resume` continues where it stopped.
+}
+
+/** Ctrl-C stops cleanly, closing every open project. Everything is saved; `phat-mode run` or `resume` continues. */
+function closeOnCtrlC(phats: () => Iterable<PhatMode>) {
   let closing = false;
   process.once('SIGINT', () => {
     if (closing) return;
     closing = true;
     consoleLogger.info('Stopping… progress is saved. Run the same command again to continue.');
-    void phat.close(context).finally(() => process.exit(130));
+    void Promise.allSettled([...phats()].map((phat) => phat.close(context))).finally(() => process.exit(130));
   });
-  return phat;
 }
 
-async function waitAndReport(phat: Awaited<ReturnType<typeof open>>, taskId: TaskId<RunResult>): Promise<number> {
+async function waitAndReport(phat: PhatMode, taskId: TaskId<RunResult>): Promise<number> {
   const settled = await phat.harness.waitForTask(taskId, context);
   const { outcome } = settled.state;
   if (outcome.status === 'completed') {
@@ -124,18 +130,6 @@ async function waitAndReport(phat: Awaited<ReturnType<typeof open>>, taskId: Tas
   }
   console.log(`\n✖ ${outcome.status}`);
   return 1;
-}
-
-/** Runs that have not finished (interrupted, or still going), by `owner/name#issue`. */
-async function liveRuns(phat: Awaited<ReturnType<typeof open>>) {
-  const runs = (await phat.harness.snapshot(RunsDoc, phat.root.id, context))?.runs ?? {};
-  const live: { key: string; taskId: TaskId<RunResult> }[] = [];
-  for (const [key, list] of Object.entries(runs)) {
-    const taskId = list.at(-1)!.taskId as unknown as TaskId<RunResult>;
-    const record = await phat.harness.getTask(taskId, context);
-    if (record !== undefined && record.state.status !== 'terminal') live.push({ key, taskId });
-  }
-  return live;
 }
 
 const firstLine = (error: unknown) => (error instanceof Error ? error.message.split('\n')[0]! : String(error));
@@ -151,8 +145,16 @@ const YOLO_WARNING =
 
 async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Promise<number> {
   const configFor = repoConfigs(machine);
-  const phat = await open(machine, configFor);
-  phat.harness.resume();
+  // Every project's lock first. One held by another process: stop, naming it (LockedError).
+  const phats = new Map<string, PhatMode>();
+  closeOnCtrlC(() => phats.values());
+  try {
+    for (const repo of repos) phats.set(repo, await open(machine, repo, configFor));
+  } catch (error) {
+    await Promise.allSettled([...phats.values()].map((phat) => phat.close(context)));
+    throw error;
+  }
+  // Each project is resumed only when its turn comes, so its runs never overlap another project's.
   const minutes = Math.round(machine.watchIntervalMs / 60_000) || 1;
   consoleLogger.info(`Watching ${repos.join(', ')}: one run at a time, looking every ${minutes} min. Ctrl-C to stop.`);
   if (yolo) consoleLogger.info(YOLO_WARNING);
@@ -163,12 +165,11 @@ async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Pr
     last.set(repo, text);
   };
   for (;;) {
-    let ran = false;
-    for (const { key, taskId } of await liveRuns(phat)) {
-      consoleLogger.info(`Resuming ${key}`);
-      await waitAndReport(phat, taskId);
-      ran = true;
-    }
+    let ran =
+      (await finishInterrupted(phats.values(), context, async (phat, key, taskId) => {
+        consoleLogger.info(`Resuming ${key}`);
+        await waitAndReport(phat, taskId);
+      })) > 0;
     for (const repo of repos) {
       if (ran) break;
       try {
@@ -176,6 +177,8 @@ async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Pr
         const step = await nextStep(new GhGitHub(repo), config, consoleLoggerFor(repo), { yolo });
         say(repo, describeStep(step));
         if (step.kind === 'start' || step.kind === 'shape') {
+          const phat = phats.get(repo)!;
+          resumeOnce(phat);
           const { taskId } = await phat.start({ repo, issue: step.issue }, context, step.kind === 'shape' ? 'shape' : 'build');
           await waitAndReport(phat, taskId);
           ran = true;
@@ -446,27 +449,30 @@ async function init(machine: MachineConfig, args: string[]): Promise<number> {
   return checkOk && labels.failed.length === 0 ? 0 : 1;
 }
 
+/** Every project to look at: the ones in config.json, then any other with a database (`run` works on any repo). */
+async function knownProjects(machine: MachineConfig): Promise<string[]> {
+  return [...new Set([...machine.repos, ...(await projectsWithState(machine.home))])];
+}
+
+/** "doing #12 build (plan)", or "idle". */
+const describeDoing = (holder: LockInfo) =>
+  holder.doing === undefined ? 'idle' : `doing #${holder.doing.issue} ${holder.doing.kind} (${holder.doing.phase})`;
+
 async function status(machine: MachineConfig): Promise<number> {
-  const phat = await openPhatMode({ home: machine.home, servicesFor: repoServices(machine) }, context, { lock });
-  try {
-    const runs = (await phat.harness.snapshot(RunsDoc, phat.root.id, context))?.runs ?? {};
-    const keys = Object.keys(runs);
-    if (keys.length === 0) console.log('No runs yet.');
-    for (const key of keys) {
-      const latest = runs[key]!.at(-1)!;
-      const record = await phat.harness.getTask(latest.taskId as unknown as TaskId<RunResult>, context);
-      console.log(`${key}  ${runStatus(record as RunRecord | undefined)}`);
+  const projects = await knownProjects(machine);
+  if (projects.length === 0) console.log('No projects yet: none in config.json "repos", and no runs.');
+  for (const repo of projects) {
+    console.log(repo);
+    const project = await projectStatus(machine.home, repo, context, { lock });
+    if ('held' in project) {
+      console.log(`  held by ${describeHolder(project.held)}: ${describeDoing(project.held)}`);
+      continue;
     }
-  } finally {
-    await phat.close(context);
+    if (project.runs.length === 0) console.log('  No runs yet.');
+    for (const run of project.runs) console.log(`  ${run.key}  ${run.status}`);
   }
   return 0;
 }
-
-const repoServices = (machine: MachineConfig) => {
-  const configFor = repoConfigs(machine);
-  return async (repo: string) => servicesFor(await configFor(repo));
-};
 
 /** The repo of this folder, and whether it is set up: has a .phat-mode.json, from `phat-mode init`. */
 async function repoHere(): Promise<{ repo: string; setUp: boolean } | undefined> {
@@ -516,9 +522,34 @@ async function reposFrom(args: string[], machine: MachineConfig): Promise<string
   return here === undefined ? [] : [here];
 }
 
+const COMMANDS = ['init', 'login', 'doctor', 'status', 'run', 'resume', 'watch', 'abort'];
+
+/**
+ * The database every project shared before (`state.sqlite`): archived once no run in it is unfinished. With unfinished
+ * runs, false, after saying how to finish them; `status` (`warnOnly`) says so and carries on.
+ */
+async function legacyStateRetired(machine: MachineConfig, warnOnly: boolean): Promise<boolean> {
+  let retired;
+  try {
+    retired = await retireLegacyState(machine.home, context);
+  } catch (error) {
+    // An earlier phat-mode still uses it: `status` says so and carries on; the rest stop, naming it (exit 1).
+    if (!(warnOnly && error instanceof LockedError)) throw error;
+    console.error(`⚠ ${error.message}\n`);
+    return true;
+  }
+  if (retired.status === 'archived') {
+    consoleLogger.info(`Archived the old shared database to ${paths.legacyState(machine.home)}.legacy: each project has its own now.`);
+  }
+  if (retired.status !== 'unfinished') return true;
+  console.error(`${warnOnly ? '⚠' : '✖'} ${describeUnfinished(retired.runs, machine.home)}\n`);
+  return warnOnly;
+}
+
 async function main(argv: string[]): Promise<number> {
   const [command, ...args] = argv;
   const machine = await loadMachineConfig();
+  if (COMMANDS.includes(command ?? '') && !(await legacyStateRetired(machine, command === 'status'))) return 1;
 
   switch (command) {
     case 'init':
@@ -547,9 +578,10 @@ async function main(argv: string[]): Promise<number> {
       const agentMode = (await configFor(repo)).labels.agentMode;
       const github = new GhGitHub(repo);
       const kind: RunKind = (await github.getIssue(issue)).labels.includes(agentMode) ? 'shape' : 'build';
-      const phat = await open(machine, configFor);
+      const phat = await open(machine, repo, configFor);
+      closeOnCtrlC(() => [phat]);
       if (yolo) consoleLogger.info(YOLO_WARNING);
-      const runGoing = (await liveRuns(phat)).some((run) => run.key === `${repo}#${issue}`);
+      const runGoing = (await liveRuns(phat, context)).some((run) => run.key === `${repo}#${issue}`);
       if (!yolo || (await runOrWait(github, issue, { runGoing })) === 'run') {
         const { taskId, resumed } = await phat.start({ repo, issue }, context, kind);
         consoleLogger.info(`${resumed ? 'Resuming' : kind === 'shape' ? 'Shaping' : 'Starting'} ${repo}#${issue}`);
@@ -566,16 +598,31 @@ async function main(argv: string[]): Promise<number> {
       return code;
     }
     case 'resume': {
-      const phat = await open(machine, repoConfigs(machine));
-      phat.harness.resume();
-      const live = await liveRuns(phat);
+      // Projects with a database are the only ones with runs to resume. One another process holds is skipped.
+      const configFor = repoConfigs(machine);
+      const opened = new Set<PhatMode>();
+      closeOnCtrlC(() => opened);
       let code = 0;
-      for (const { key, taskId } of live) {
-        consoleLogger.info(`Resuming ${key}`);
-        code = Math.max(code, await waitAndReport(phat, taskId));
+      let resumed = 0;
+      for (const repo of await projectsWithState(machine.home)) {
+        let phat: PhatMode;
+        try {
+          phat = await open(machine, repo, configFor);
+        } catch (error) {
+          if (!(error instanceof LockedError)) throw error;
+          console.error(`✖ ${repo} is held by ${describeHolder(error.holder)}; not resuming it.`);
+          code = 1;
+          continue;
+        }
+        opened.add(phat);
+        resumed += await finishInterrupted([phat], context, async (phat, key, taskId) => {
+          consoleLogger.info(`Resuming ${key}`);
+          code = Math.max(code, await waitAndReport(phat, taskId));
+        });
+        await phat.close(context);
+        opened.delete(phat);
       }
-      if (live.length === 0) console.log('Nothing to resume.');
-      await phat.close(context);
+      if (resumed === 0) console.log('Nothing to resume.');
       return code;
     }
     case 'watch': {
@@ -599,7 +646,7 @@ async function main(argv: string[]): Promise<number> {
         return 2;
       }
       const { repo, issue } = parseIssueRef(args[0], await currentRepo());
-      const phat = await openPhatMode({ home: machine.home, servicesFor: repoServices(machine) }, context, { lock });
+      const phat = await open(machine, repo, repoConfigs(machine));
       const list = (await phat.harness.snapshot(RunsDoc, phat.root.id, context))?.runs[`${repo}#${issue}`];
       if (list === undefined) {
         console.log(`No run for ${repo}#${issue}.`);
@@ -621,7 +668,7 @@ async function main(argv: string[]): Promise<number> {
 try {
   process.exitCode = await main(process.argv.slice(2));
 } catch (error) {
-  if (error instanceof LockedError || error instanceof NotSetUpError) {
+  if (error instanceof NotSetUpError) {
     console.error(`✖ ${error.message}`);
     process.exitCode = 3;
   } else if (error instanceof Error && !(error instanceof TypeError) && !(error instanceof ReferenceError)) {

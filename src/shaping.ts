@@ -49,7 +49,7 @@ import {
 import { pinnedSkill } from './skills.ts';
 import { MARKER_SHAPE_REFUSED, shapingEligibility, trustedComments } from './spec.ts';
 import { InstallError } from './workspace.ts';
-import { askForReport, failureGuard, perRepo, StepFailure } from './task-kit.ts';
+import { askForReport, failureGuard, type OnPhase, perRepo, phasesWith, StepFailure } from './task-kit.ts';
 
 /**
  * Shaping: turning a vague `agent-mode` issue into a spec and tickets, with no human answering questions. Its own
@@ -151,21 +151,27 @@ export function dependencyOrder(tickets: TicketsReport['tickets']): number[] | {
   return order;
 }
 
-/** Shaping, for every repo: each run uses the services of its own repo, as the build pipeline does. */
-export function createShaping(servicesFor: (repo: string) => Promise<Services>) {
-  const phasesFor = perRepo(async (repo) => repoPhases(await servicesFor(repo)));
+/**
+ * Shaping, for every repo: each run uses the services of its own repo, as the build pipeline does. `onPhase` is told
+ * as each phase starts.
+ */
+export function createShaping(servicesFor: (repo: string) => Promise<Services>, onPhase?: OnPhase<ShapingInput>) {
+  const phase = phasesWith<ShapingInput, ReturnType<typeof repoPhases>>(
+    perRepo(async (repo) => repoPhases(await servicesFor(repo))),
+    onPhase,
+  );
   const Shaping = defineTask<ShapingInput, ShapingState, ShapingResult>({
     name: SHAPING_TASK,
     version: 1,
     initial: () => ({ phase: 'prepare' }),
     phases: {
-      prepare: async (task, runtime, context) => (await phasesFor(task.input.repo)).prepare(task, runtime, context),
-      triage: async (task, runtime, context) => (await phasesFor(task.input.repo)).triage(task, runtime, context),
-      grill: async (task, runtime, context) => (await phasesFor(task.input.repo)).grill(task, runtime, context),
-      spec: async (task, runtime, context) => (await phasesFor(task.input.repo)).spec(task, runtime, context),
-      tickets: async (task, runtime, context) => (await phasesFor(task.input.repo)).tickets(task, runtime, context),
-      publish: async (task, runtime, context) => (await phasesFor(task.input.repo)).publish(task, runtime, context),
-      fail: async (task, runtime, context) => (await phasesFor(task.input.repo)).fail(task, runtime, context),
+      prepare: phase('prepare'),
+      triage: phase('triage'),
+      grill: phase('grill'),
+      spec: phase('spec'),
+      tickets: phase('tickets'),
+      publish: phase('publish'),
+      fail: phase('fail'),
     },
     abort: (_task, runtime, context) =>
       runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), context),

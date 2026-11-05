@@ -114,7 +114,7 @@ One run at a time across all repos, in the order they are listed. The rules belo
 
 Merging a PR closes its issue (`Closes #N`), which unblocks the issues that wait for it, so blockers set up as GitHub issue dependencies or `Blocked by` lines give the order. When nothing can start, it says why, once: e.g. `#9 is blocked by #18 (ready-for-human)`.
 
-It polls rather than using GitHub webhooks: a webhook needs a public address for your Mac, and anything sent while the Mac sleeps would be lost. Polling works out everything from GitHub on each look, so it catches up after sleep, Ctrl-C or a crash. While `watch` runs, it holds the lock: `status`, `run` and `abort` say phat-mode is already running.
+It polls rather than using GitHub webhooks: a webhook needs a public address for your Mac, and anything sent while the Mac sleeps would be lost. Polling works out everything from GitHub on each look, so it catches up after sleep, Ctrl-C or a crash. While `watch` runs, it holds the [lock](#projects-locks-and-databases) of every project it watches: `run`, `resume` and `abort` on those projects say which process holds them, and `status` shows what it is doing. Other projects stay free for other phat-mode processes. If another process already holds one of its projects, `watch` exits 1, naming it. Inside one watch, still one run at a time: after a crash, it finishes the interrupted runs one project after another.
 
 ### Yolo
 
@@ -221,8 +221,8 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 | `phat-mode init` | Set up the repo in this folder. See [Setup](#setup). |
 | `phat-mode watch [--yolo] [repo…]` | Shape the `agent-mode` issues and work through the ready ones, one run at a time, until Ctrl-C. In a set-up repo, asks: this repo or all. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
 | `phat-mode run [--yolo] <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. `--yolo` then waits and merges the PR. See [Yolo](#yolo). |
-| `phat-mode resume` | Continue every interrupted run, building or shaping. |
-| `phat-mode status` | List runs (every repo): shaping or building, and where they are. |
+| `phat-mode resume` | Continue every interrupted run, building or shaping, in every project no other process holds (a held one is named and skipped, and the exit code is 1). |
+| `phat-mode status` | List every project (your `repos`, and any other with runs) and its runs: shaping or building, and where they are. For a project another process holds, what that process is doing, from its lock file. |
 | `phat-mode abort <issue>` | Stop a run. |
 | `phat-mode doctor [repo]` | Check git, gh, the Copilot login, the models, and each repo's settings, access and labels. |
 
@@ -230,7 +230,17 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 
 Ctrl-C is always safe: progress is saved, and `run` or `resume` continues from the last step.
 
-Only one phat-mode process can use `~/.phat-mode` at a time (Pi Durable storage has no cross-process locking), whatever the repo. A second one exits with `phat-mode is already running (…)`. A lock left by a crashed process is taken over automatically.
+### Projects: locks and databases
+
+Each project (repo) has its own **lock** (`locks/<owner>__<name>.lock` in phat-mode's home) and its own **durable database** (`state/<owner>__<name>.sqlite`). Pi Durable storage has no cross-process locking, so a process opens a project's database only while it holds that project's lock: different phat-mode processes can work on different projects at once, never on the same one. `run`, `resume` and `abort` on a project another process holds exit 1 with e.g. ``owner/x is held by pid 123 (`phat-mode watch`, since 10:04:12)``. A lock left by a crashed process is taken over automatically (a lock is a small folder of holder files; never edit it while phat-mode runs). Why: [ADR 0004](docs/adr/0004-one-lock-and-one-durable-database-per-project.md).
+
+The lock file says who holds the project (pid, command, since when) and what it is doing right now (issue, build or shaping, phase), kept current as the run moves on. That is what `status` shows for a held project, e.g. `held by pid 123 (…): doing #12 build (implement)`, without opening its database.
+
+Writes to `auth.json` (Copilot token refreshes) are locked across processes too, and each re-reads the file first, so one process never overwrites a newer token with an older one.
+
+### Upgrading from one shared database
+
+Earlier versions kept every project's runs in one database, `state.sqlite` in phat-mode's home. On its first start, this version archives it to `state.sqlite.legacy` when no run in it is unfinished, and carries on. If some are unfinished, every command but `status` exits 1, listing them (project, issue, kind, phase): finish or abort them with the previous phat-mode version first (`phat-mode resume`, or `phat-mode abort <issue>`, from a checkout of it), then start this one again. `status` shows the same list as a warning.
 
 ## Configuration
 
@@ -294,7 +304,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 - `phat-mode doctor` shows the model each role uses and checks it is on your Copilot account.
 - A run keeps the models it started with, also when resumed. New runs use the new config.
 
-`~/.phat-mode/` also holds the state database (`state.sqlite`, every repo's runs) and its lock, the Copilot login (`auth.json`, owner-only), and per repo the clone, workspaces (`workspaces/<owner>__<name>/issue-<n>`, and `shape-<n>` for shaping) and evidence.
+`~/.phat-mode/` also holds each project's database (`state/<owner>__<name>.sqlite`) and lock (`locks/<owner>__<name>.lock`), the Copilot login (`auth.json`, owner-only), and per repo the clone, workspaces (`workspaces/<owner>__<name>/issue-<n>`, and `shape-<n>` for shaping) and evidence.
 
 Set the environment variable **`PHAT_MODE_HOME`** to move that home (config.json, state, `auth.json`, clones, workspaces, evidence) somewhere other than `~/.phat-mode`, e.g. `PHAT_MODE_HOME=~/pm2 phat-mode watch`.
 
@@ -322,6 +332,7 @@ Set the environment variable **`PHAT_MODE_HOME`** to move that home (config.json
 - `src/yolo.ts`: `--yolo`: the verdict a run writes on its PR, and whether and when to merge it. `src/watch.ts`: what `watch` does next.
 - `src/agents.ts`: the build agents (planner, implementer, Standards and Spec reviewers, verifier) and shaping's answerer and questioner, their tools, the report tools agents finish with, and the guard hook.
 - `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code.
+- `src/harness.ts`: opens one project: takes its lock, then its database, and keeps the lock file's "doing" current. `src/lock.ts`: the locks. `src/projects.ts`: what `status` shows per project, and retiring the old shared database.
 - Issue comments carry hidden markers, so a rerun updates its comment instead of posting again.
 
 ## Development

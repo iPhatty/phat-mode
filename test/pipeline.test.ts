@@ -632,47 +632,44 @@ describe('pipeline', () => {
     assert.ok(github.comments[0]!.body.includes(`**Test seams**\nnone. The planner says: ${reason}`));
   });
 
-  test('one process, two repos: each run uses its own repo, settings and GitHub, even with the same issue number', async () => {
+  test('one process, two projects open at once: each run uses its own repo, settings, GitHub and state, even with the same issue number', async () => {
     const a = await fixture({}, 'test/a');
     const b = await fixture({}, 'test/b');
     b.config.checkCommand = 'make verify';
     b.checks.results.push({ passed: false, output: 'lint: 1 error' });
     a.github.addIssue(5, { title: 'Hello in a' });
     b.github.addIssue(5, { title: 'Hello in b' });
-    const repos: Record<string, Services> = { 'test/a': a.services, 'test/b': b.services };
     const asked: string[] = [];
-    const { phat } = await a.open(
+    const lookup = (services: Services) => async (repo: string) => {
+      asked.push(repo);
+      return services;
+    };
+    const first = await a.open([plan(), write('hello.txt', 'hello from a\n'), done(), ...approve(), describePr()], lookup(a.services));
+    const second = await b.open(
       [
-        // test/a#5
-        plan(),
-        write('hello.txt', 'hello from a\n'),
-        done(),
-        ...approve(),
-        describePr(),
-        // test/b#5: its own check command goes back to the implementer
         plan(),
         write('hello.txt', 'hello from b\n'),
         done(),
+        // test/b's own check command goes back to the implementer
         expectLast((message) => assert.match(textOf(message), /run `make verify` until it passes[^]*Output of `make verify`:\n```\nlint: 1 error/), done()),
         ...approve(),
         describePr(),
       ],
-      async (repo) => {
-        asked.push(repo);
-        return repos[repo]!;
-      },
+      lookup(b.services),
     );
-    phat.harness.resume();
-    for (const repo of ['test/a', 'test/b']) {
+    const runs: string[][] = [];
+    for (const [repo, { phat }] of [['test/a', first], ['test/b', second]] as const) {
+      phat.harness.resume();
       const { taskId } = await phat.start({ repo, issue: 5 }, context);
       const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
       assert.equal(result(outcome).status, 'pr_opened', repo);
+      runs.push(Object.keys((await phat.harness.snapshot(RunsDoc, phat.root.id, context))!.runs));
     }
-    const runs = Object.keys((await phat.harness.snapshot(RunsDoc, phat.root.id, context))!.runs);
-    await phat.close(context);
+    await first.phat.close(context);
+    await second.phat.close(context);
 
     assert.deepEqual([...new Set(asked)], ['test/a', 'test/b'], 'services looked up once per repo');
-    assert.deepEqual(runs.sort(), ['test/a#5', 'test/b#5']);
+    assert.deepEqual(runs, [['test/a#5'], ['test/b#5']], 'each project keeps its own runs');
     assert.equal(await a.remoteFile(5, 'hello.txt'), 'hello from a\n');
     assert.equal(await b.remoteFile(5, 'hello.txt'), 'hello from b\n');
     assert.deepEqual([a.github.prs.length, b.github.prs.length], [1, 1]);
@@ -1188,7 +1185,7 @@ describe('pipeline', () => {
     });
   });
 
-  test('only one process can open the state: a second open is refused until the first closes', async () => {
+  test('a project is open in one place at a time: a second open is refused until the first closes', async () => {
     const { open } = await fixture();
     const first = await open([]);
     await assert.rejects(open([]), LockedError);

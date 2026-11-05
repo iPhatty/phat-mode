@@ -15,8 +15,9 @@ terminal `watch` view is out of scope; the dashboard replaces it.
 
 ## Background
 
-- `openPhatMode()` takes a lock on `~/.phat-mode/state.sqlite.lock`: one process at a time. While `run` works, `status`,
-  `abort`, or a dashboard in another process exit with "already running". **The dashboard must therefore live inside
+- `openPhatMode()` takes the project's lock (`locks/<owner>__<name>.lock` in the home, ADR 0004): one process per
+  project at a time. While `run` works on a project, `abort` or a dashboard in another process cannot open its
+  database; `status` only reads its lock file (who holds it, and the issue and phase it is on). **The dashboard must therefore live inside
   the process that runs the work**: a long-running `phat-mode serve` daemon. The CLI commands become clients of it.
 - State the dashboard needs is already stored:
   - `RunsDoc` (root conversation): every run per issue, `taskId` and `startedAt`.
