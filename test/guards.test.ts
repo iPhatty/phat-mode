@@ -126,7 +126,7 @@ describe('bashBlockReason', () => {
     }
   });
 
-  test('relative paths are judged from where the command runs: the workspace, or where it cd-ed to', () => {
+  test('relative paths are judged from every folder the command might be in: where it runs, or where a cd took it', () => {
     for (const home of [join(homedir(), 'pm2'), join(homedir(), '.phat-mode')]) {
       const ws = join(home, 'workspaces', 'a', 'issue-1');
       for (const command of [
@@ -136,12 +136,30 @@ describe('bashBlockReason', () => {
         `cd ${home} && cat auth.json`,
         'cd ~/.phat-mode; ls',
         'cd .. && cd .. && cd .. && ls',
+        '(cd src && ls); cat ../../../auth.json',
+        'cd src | cat ../../../auth.json',
+        '(cd a); cd b; cat ../../../../auth.json',
+        `(cd ${ws}-scratch); cat ../../../state.sqlite`,
+        'cd missing; cat ../../../auth.json',
+        'cd missing || cat ../../../auth.json',
+        'cd src & cat ../../../auth.json',
+        'echo "$(cd src)" && cat ../../../auth.json',
       ]) {
         assert.match(bashBlockReason(command, ws, home) ?? '', /credential folders/, `${home}: ${command}`);
       }
-      for (const command of ['cat ../issue-1-scratch/notes.md', 'cd src && cat ../README.md', 'ls -la', `cd ${ws}-scratch && ls ../issue-1`]) {
+      for (const command of [
+        'cat ../issue-1-scratch/notes.md',
+        'cd src && cat ../README.md',
+        'ls -la',
+        `cd ${ws}-scratch && ls ../issue-1`,
+        'cd src/deep/x && cat ../../../README.md',
+        ['web', 'api', 'docs', 'cli'].map((dir) => `cd ${dir} && npm test && cd ..`).join(' && '),
+        '(cd web && npm run build) && npm test',
+      ]) {
         assert.equal(bashBlockReason(command, ws, home), undefined, `${home}: ${command}`);
       }
+      const lost = Array.from({ length: 8 }, (_, i) => `cd d${i}`).join('; ');
+      assert.match(bashBlockReason(lost, ws, home) ?? '', /too many ways/, `${home}: ${lost}`);
     }
   });
 

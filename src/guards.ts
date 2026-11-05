@@ -93,15 +93,19 @@ type ShellWord = { text: string; parts: string[] };
 /** Characters that end a word, outside quotes. `null` stands for the end of a command, where a new one starts. */
 const OPERATORS = new Set([';', '|', '&', '<', '>', '(', ')', '`', '\n']);
 
+/** The end of a command at `&&`: the next one runs only if this one succeeded. */
+const AND = '&&';
+
 /**
  * The words of a shell command as the shell would read them: quotes and backslash escapes resolved (so a path with
  * spaces stays one word), `~` at the start of a word and `$HOME` / `${HOME}` outside single quotes expanded. `null`
- * marks where one command ends and the next begins (`;`, `&&`, `|`, `(`, `$(`…). A command substitution (`$(…)`, or
- * `` `…` `` inside double quotes) is read as commands of its own, also inside double quotes, as the shell runs it.
+ * marks where one command ends and the next begins (`;`, `|`, `(`, `$(`…), `AND` where it ends at `&&`. A command
+ * substitution (`$(…)`, or `` `…` `` inside double quotes) is read as commands of its own, also inside double quotes,
+ * as the shell runs it.
  */
-function shellWords(command: string): (ShellWord | null)[] {
+function shellWords(command: string): (ShellWord | null | typeof AND)[] {
   const home = homedir();
-  const out: (ShellWord | null)[] = [];
+  const out: (ShellWord | null | typeof AND)[] = [];
   let text = '';
   let part = '';
   let parts: string[] = [];
@@ -166,6 +170,10 @@ function shellWords(command: string): (ShellWord | null)[] {
       started = true;
     } else if (/\s/.test(char) && char !== '\n') {
       endWord();
+    } else if (char === '&' && next === '&') {
+      endWord();
+      out.push(AND);
+      i++;
     } else if (OPERATORS.has(char)) {
       endWord();
       if (out.at(-1) !== null) out.push(null);
@@ -190,40 +198,56 @@ function shellWords(command: string): (ShellWord | null)[] {
   return out;
 }
 
+/** The most folders a command is followed in; a command that could be in more is blocked rather than half-checked. */
+const MAX_PLACES = 64;
+
 /**
- * The paths a shell command names, as absolute paths with `..` resolved. Relative ones are resolved against where they
- * are used: `cwd` at first, then wherever a `cd` (or `pushd`) in the command moves to. Every word counts, and also each
- * part after an unquoted `=` or `:`, since a word that is not a path judges as a harmless file in the current folder.
+ * The paths a shell command names, as absolute paths with `..` resolved; undefined when it could be in too many folders
+ * to follow. Relative ones are resolved against every folder the command might be in when it uses them: `cwd`, and
+ * wherever a `cd` (or `pushd`) in it moved to. A `cd` may fail, or not last (inside `( )`, `$( )`, either side of a
+ * `|`, or with `&`), so the folder before it is possible again from the next `;`, `||`, `|`, `&`, `(`, `)` or new line.
+ * Only `&&` does not bring it back: a failed `cd` skips the rest of an `&&` chain. Every word counts, and also each part
+ * after an unquoted `=` or `:`, since a word that is not a path judges as a harmless file in a folder.
  */
-export function commandPaths(command: string, cwd: string): string[] {
+export function commandPaths(command: string, cwd: string): string[] | undefined {
   const paths: string[] = [];
-  let here = resolve(cwd);
+  // Where the command might be now; and where it might be if a `cd` since the last rejoin failed or did not last.
+  let places = new Set([resolve(cwd)]);
+  const before = new Set<string>();
   let commandStart = true;
   let changingDirectory = false;
-  const commandEnds = () => {
-    if (changingDirectory) here = resolve(homedir()); // a bare `cd` goes home
+  const moveTo = (target: string) => {
+    for (const place of places) before.add(place);
+    places = new Set([...places].map((place) => resolve(place, target)));
+  };
+  const commandEnds = (and: boolean) => {
+    if (changingDirectory) moveTo(homedir()); // a bare `cd` goes home
+    if (!and) {
+      for (const place of before) places.add(place);
+      before.clear();
+    }
     commandStart = true;
     changingDirectory = false;
   };
   for (const word of shellWords(command)) {
-    if (word === null) {
-      commandEnds();
+    if (word === null || word === AND) {
+      commandEnds(word === AND);
+      if (places.size + before.size > MAX_PLACES) return undefined;
       continue;
     }
     for (const text of new Set([word.text, ...word.parts])) {
-      if (text !== '') paths.push(resolve(here, text));
+      if (text !== '') for (const place of places) paths.push(resolve(place, text));
     }
     if (changingDirectory && word.text === '-') {
       changingDirectory = false; // back to a folder this command line cannot know: stay
     } else if (changingDirectory && !word.text.startsWith('-')) {
-      here = resolve(here, word.text);
+      moveTo(word.text);
       changingDirectory = false;
     } else if (commandStart) {
       changingDirectory = word.text === 'cd' || word.text === 'pushd';
     }
     commandStart = false;
   }
-  commandEnds();
   return paths;
 }
 
@@ -236,7 +260,11 @@ export function bashBlockReason(command: string, workspace: string | null = null
     if (pattern.test(command)) return `Blocked: ${reason}.`;
   }
   const homes = phatModeHomes(home, workspace);
-  if (commandPaths(command, workspace ?? process.cwd()).some((path) => inHomeOutsideWorkspaces(path, homes))) {
+  const paths = commandPaths(command, workspace ?? process.cwd());
+  if (paths === undefined) {
+    return `Blocked: this command changes folder too many ways (\`cd\`) to check where its paths lead; split it into smaller commands.`;
+  }
+  if (paths.some((path) => inHomeOutsideWorkspaces(path, homes))) {
     return 'Blocked: reading credential folders is not allowed.';
   }
   return undefined;
