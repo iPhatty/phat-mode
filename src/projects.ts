@@ -198,12 +198,33 @@ const resumed = new WeakSet<PhatMode>();
 
 /**
  * Let a project's runs go ahead (`harness.resume()`), once. Until then they stay where they are: resuming a project
- * runs every run it has pending, so a process working on one run at a time resumes a project only when its turn comes.
+ * runs every run it has pending, so a watch resumes a project only when the project gets a run slot (src/scheduler.ts).
  */
 export function resumeOnce(phat: PhatMode): void {
   if (resumed.has(phat)) return;
   resumed.add(phat);
   phat.harness.resume();
+}
+
+/**
+ * A watch's look at a project's interrupted runs. None: undefined, and the project is left as it is. Otherwise the
+ * project is resumed, which lets every one of them go ahead (one at a time, see takeSlot in harness.ts), and the result
+ * waits until all of them have settled, calling `each` for every one: the project keeps its one slot until then, so a
+ * watch never has more runs going than it counts.
+ */
+export async function resumeInterrupted(
+  phat: PhatMode,
+  context: Context,
+  each: (key: string, taskId: TaskId<RunResult>) => Promise<void>,
+): Promise<(() => Promise<void>) | undefined> {
+  const live = await liveRuns(phat, context);
+  if (live.length === 0) return undefined;
+  resumeOnce(phat);
+  return async () => {
+    const results = await Promise.allSettled(live.map(({ key, taskId }) => each(key, taskId)));
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed !== undefined) throw failed.reason;
+  };
 }
 
 /**

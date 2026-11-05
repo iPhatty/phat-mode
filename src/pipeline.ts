@@ -345,7 +345,7 @@ function repoPhases(services: Services) {
               instructions: roleInstructions(config.checkCommand)[role],
               cwd: workspace,
             });
-            Object.assign(await tx.doc(RoleDoc, created.id), { role, issue: number, workspace });
+            Object.assign(await tx.doc(RoleDoc, created.id), { role, repo: config.repo, issue: number, workspace });
             conversations[role] = created.id;
           }
           return { status: 'running', checkpoint: { phase: 'plan', issue, spec, workspace, conversations } };

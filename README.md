@@ -97,15 +97,15 @@ Every outcome except a refusal removes `agent-mode`; a refused issue keeps all i
 
 ### How `watch` schedules shaping
 
-Each time [`watch`](#watch) looks at a repo, after finishing any run still going, it first closes finished Parents (every sub-issue closed), then shapes the lowest-numbered `agent-mode` issue that may be shaped, even while a phat-mode PR waits for you to merge it, and only then builds. It is still one run at a time across all repos, shaping or building.
+Each time [`watch`](#watch) looks at a repo, after finishing any run still going, it first closes finished Parents (every sub-issue closed), then shapes the lowest-numbered `agent-mode` issue that may be shaped, even while a phat-mode PR waits for you to merge it, and only then builds. Shaping takes a run slot like building does; waiting for a PR to be merged takes none (see [Parallel runs](#parallel-runs)).
 
 ## Watch
 
 `phat-mode watch` keeps going on its own: it shapes `agent-mode` issues into tickets as they appear, and after you merge a PR, it starts the next issue. It works on the repos named on the command line (`phat-mode watch owner/a owner/b`), else the `repos` in your config.json (`phat-mode init` adds each repo it sets up), else the repo of the current folder. Run inside a set-up repo (one with `.phat-mode.json`) while other repos are listed, it asks whether to watch that repo alone (the default) or all of them; when it cannot ask (not a terminal), it watches all. It runs in the foreground until Ctrl-C and looks at GitHub every `watchIntervalMs` (default 2 minutes).
 
-One run at a time across all repos, in the order they are listed. The rules below apply per repo: a PR waiting for you in one repo does not hold up the others. Each time, for each repo, it:
+Up to [`maxParallelRuns`](#parallel-runs) runs at once (default 1: one at a time), at most one per repo. The rules below apply per repo: a PR waiting for you in one repo does not hold up the others. Each time it looks at a repo with no run going, it:
 
-1. finishes any run that is still going;
+1. finishes any run left interrupted (e.g. by a crash or Ctrl-C);
 2. closes every open `phat-mode:shaped` Parent whose sub-issues (its tickets) are all closed, with a summary comment listing them. A shaped issue with no sub-issues (shaped into one ticket) closes when its own PR merges;
 3. [shapes](#agent-mode) the **lowest-numbered `agent-mode` issue that may be shaped**, before any build and even while a PR waits for you to merge it, so its tickets are ready by the time building can go on. An `agent-mode` issue that cannot be shaped is said among the waiting lines, once; one that is refused (already shaped, or also carrying a triage state label) also gets the same comment as `run` posts, once;
 4. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge (with [`--yolo`](#yolo), it merges the ones it can first, lowest issue first, and says why it does not merge the others);
@@ -114,7 +114,17 @@ One run at a time across all repos, in the order they are listed. The rules belo
 
 Merging a PR closes its issue (`Closes #N`), which unblocks the issues that wait for it, so blockers set up as GitHub issue dependencies or `Blocked by` lines give the order. When nothing can start, it says why, once: e.g. `#9 is blocked by #18 (ready-for-human)`.
 
-It polls rather than using GitHub webhooks: a webhook needs a public address for your Mac, and anything sent while the Mac sleeps would be lost. Polling works out everything from GitHub on each look, so it catches up after sleep, Ctrl-C or a crash. While `watch` runs, it holds the [lock](#projects-locks-and-databases) of every project it watches: `run`, `resume` and `abort` on those projects say which process holds them, and `status` shows what it is doing. Other projects stay free for other phat-mode processes. A project another process already holds is skipped, and taken over once that process stops: see [Several watches](#several-watches). Inside one watch, still one run at a time: after a crash, it finishes the interrupted runs one project after another.
+It polls rather than using GitHub webhooks: a webhook needs a public address for your Mac, and anything sent while the Mac sleeps would be lost. Polling works out everything from GitHub on each look, so it catches up after sleep, Ctrl-C or a crash. While `watch` runs, it holds the [lock](#projects-locks-and-databases) of every project it watches: `run`, `resume` and `abort` on those projects say which process holds them, and `status` shows what it is doing. Other projects stay free for other phat-mode processes. A project another process already holds is skipped, and taken over once that process stops: see [Several watches](#several-watches). After a crash, a project's interrupted runs are its next work: they go ahead one after another in that project's one slot, which stays taken until all of them have settled.
+
+### Parallel runs
+
+`maxParallelRuns` in your [config.json](#yours-phat-modeconfigjson) caps how many runs one watch does at once (default 1). A run is building an issue or shaping an `agent-mode` issue; waiting for a PR to be merged is not a run, so it takes no slot. A project never has two runs at once, whatever the cap, and the cap is per watch process: two watches each have their own.
+
+- When more projects have work than there are free slots, they start in the order of the watch's list, and a slot that frees up goes to the next project **after the one that last started** (wrapping round), so no project starves even when the first one always has work.
+- A run that fails or is aborted frees only its own slot: the other projects' runs carry on. So does a look that fails (offline, GitHub down).
+- Every log line of a run names it: steps and agents' tool lines show `name#12`, and the watch's own lines `owner/name`, so interleaved output stays readable.
+
+Parallel runs mean parallel verifications. Each project's [verify skill](#verification) must keep them from colliding: no fixed ports, simulators, devices or paths shared with another project's runs (pick a free port, a dedicated simulator, a per-workspace folder).
 
 ### Several watches
 
@@ -129,8 +139,8 @@ Several `phat-mode watch` processes can run side by side, e.g. one per terminal,
 All first (`repos` lists `owner/x` and `owner/y`), then one project in another terminal: that project is taken, so the second watch exits 1.
 
 ```console
-$ phat-mode watch                      # terminal 1
-20:05:39  Watching owner/x, owner/y: one run at a time, looking every 2 min. Ctrl-C to stop.
+$ phat-mode watch                      # terminal 1, with "maxParallelRuns": 2
+20:05:39  Watching owner/x, owner/y: up to 2 runs at once (one per project), looking every 2 min. Ctrl-C to stop.
 
 $ phat-mode watch owner/x              # terminal 2
 20:05:42  owner/x is watched by pid 25302 (phat-mode watch)
@@ -253,7 +263,7 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 | Command | |
 |---|---|
 | `phat-mode init` | Set up the repo in this folder. See [Setup](#setup). |
-| `phat-mode watch [--yolo] [repo…]` | Shape the `agent-mode` issues and work through the ready ones, one run at a time, until Ctrl-C. In a set-up repo, asks: this repo or all. Skips projects another watch holds and takes them over when it stops. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
+| `phat-mode watch [--yolo] [repo…]` | Shape the `agent-mode` issues and work through the ready ones, up to `maxParallelRuns` runs at once (default 1), one per project, until Ctrl-C. In a set-up repo, asks: this repo or all. Skips projects another watch holds and takes them over when it stops. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
 | `phat-mode run [--yolo] <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. `--yolo` then waits and merges the PR. See [Yolo](#yolo). |
 | `phat-mode resume` | Continue every interrupted run, building or shaping, in every project no other process holds (a held one is named and skipped, and the exit code is 1). |
 | `phat-mode status` | List every project (your `repos`, and any other with runs) and its runs: shaping or building, and where they are. For a project another process holds, what that process is doing, from its lock file. |
@@ -310,12 +320,14 @@ Optional; anything left out uses the defaults in [`src/config.ts`](src/config.ts
   "repos": ["iPhatty/phatty-lingo"],
   "allowedAuthors": ["iPhatty"],
   "limits": { "maxCheckFixes": 3, "maxReviewRounds": 5 },
-  "watchIntervalMs": 120000
+  "watchIntervalMs": 120000,
+  "maxParallelRuns": 1
 }
 ```
 
 - `repos`: what `watch` works on when no repos are named (inside a set-up repo, it asks: that one or all). `init` adds to it.
 - `allowedAuthors`: trusted on every repo that does not list its own. Default: you, the `gh` user.
+- `maxParallelRuns`: how many runs (builds and shapings, not waiting for a merge) one `watch` does at once, at most one per project. Default 1: one at a time. A whole number of 1 or more; the cap is per watch process. Each project's verify skill must keep parallel runs from colliding (ports, simulators, fixed paths): see [Parallel runs](#parallel-runs).
 - Repo settings (`checkCommand`, `repo`, …) here are an error, pointing to `.phat-mode.json`.
 
 #### Models

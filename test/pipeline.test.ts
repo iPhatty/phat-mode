@@ -5,7 +5,7 @@ import { describe, test } from 'node:test';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import type { ToolResultMessage } from '@earendil-works/pi-ai';
 import { type FauxResponseFactory, type FauxResponseStep, fauxAssistantMessage } from '@earendil-works/pi-ai/providers/faux';
-import { setToolLogger } from '../src/agents.ts';
+import { RoleDoc, setToolLogger } from '../src/agents.ts';
 import { branchFor, paths } from '../src/config.ts';
 import { run } from '../src/exec.ts';
 import { call, expectLast, fixture, sectionsOf, textOf } from './fixture.ts';
@@ -174,6 +174,20 @@ describe('pipeline', () => {
     assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:done', 'ready-for-agent']);
     // On the PR, ready-for-human means: ready for a human to review and merge.
     assert.deepEqual(github.labels(pr!.number), ['ready-for-human']);
+  });
+
+  test('every agent tool line names its run (repo and issue), so parallel runs stay readable', async () => {
+    const { github, runIssue } = await fixture({}, 'owner/lingo');
+    github.addIssue(1);
+    const lines: { label: string; message: string; run?: string }[] = [];
+    setToolLogger({ ...silentLogger, tool: (label, message, run) => lines.push({ label, message, ...(run === undefined ? {} : { run }) }) });
+    try {
+      await runIssue(1, [plan(), write('hello.txt', 'hello\n'), done(), ...approve(), describePr()]);
+    } finally {
+      setToolLogger(silentLogger);
+    }
+    assert.ok(lines.length > 0);
+    for (const line of lines) assert.equal(line.run, 'lingo#1', `${line.label} ${line.message}`);
   });
 
   test('a clean run marks the PR clean for yolo, with the exact commit it pushed; no verify skill is the repo’s choice', async () => {
@@ -1071,6 +1085,47 @@ describe('pipeline', () => {
     assert.equal(github.comments.filter((comment) => comment.marker.includes('plan')).length, 1);
     assert.equal(github.prs.length, 1);
     assert.equal(await remoteFile(9, 'hello.txt'), 'hello\n');
+  });
+
+  test('a run resumed from before runs recorded their repo: its tool lines still name the project', async () => {
+    const { github, open, config } = await fixture({}, 'owner/lingo');
+    github.addIssue(9);
+    let reachedImplement!: () => void;
+    const implementStarted = new Promise<void>((resolve) => (reachedImplement = resolve));
+    const hang: FauxResponseFactory = (_request, options) =>
+      new Promise((_resolve, reject) => {
+        reachedImplement();
+        options?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      });
+    const first = await open([plan(), hang]);
+    const { taskId } = await first.phat.start({ repo: config.repo, issue: 9 }, context);
+    first.phat.harness.resume();
+    await implementStarted;
+    await first.phat.close(context);
+
+    // Its conversations as an earlier phat-mode stored them: a role, an issue and a workspace, but no repo.
+    const second = await open([write('hello.txt', 'hello\n'), done(), ...approve(), describePr()]);
+    const record = await second.phat.harness.getTask(taskId, context);
+    const { conversations } = (record!.state as unknown as { checkpoint: { conversations: Record<string, string> } }).checkpoint;
+    await second.phat.root.commit(async (tx) => {
+      for (const id of Object.values(conversations)) {
+        const doc = (await tx.doc(RoleDoc, id as never)) as Record<string, unknown>;
+        doc.repo = undefined;
+      }
+    }, context);
+
+    const lines: string[] = [];
+    setToolLogger({ ...silentLogger, tool: (label, message, run) => lines.push(`${run ?? ''} ${label} ${message}`) });
+    try {
+      second.phat.harness.resume();
+      const { outcome } = (await second.phat.harness.waitForTask(taskId, context)).state;
+      assert.equal(result(outcome as { status: string; result?: PipelineResult }).status, 'pr_opened');
+    } finally {
+      setToolLogger(silentLogger);
+      await second.phat.close(context);
+    }
+    assert.ok(lines.length > 0);
+    for (const line of lines) assert.match(line, /^lingo#9 /, line);
   });
 
   describe('main moves on during a run', () => {

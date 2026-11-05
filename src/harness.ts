@@ -13,7 +13,7 @@ import {
 } from '@earendil-works/pi-durable';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
-import { Guard, Tools } from './agents.ts';
+import { guardFor, Tools } from './agents.ts';
 import { paths } from './config.ts';
 import { FileCredentialStore } from './credentials.ts';
 import { agentEnv } from './exec.ts';
@@ -89,6 +89,8 @@ export type Setup = {
 /** What opening the durable state needs, whatever it holds: one project's runs, or the old shared database's. */
 export type HarnessSetup = {
   home: string;
+  /** The project whose runs the storage holds; undefined for the old shared database. */
+  repo?: string;
   servicesFor: (repo: string) => Promise<Services>;
   storage: Storage;
   models?: Models;
@@ -107,7 +109,7 @@ export async function openHarness(setup: HarnessSetup, context: Context) {
   const shaping = createShaping(setup.servicesFor, onPhase && ((input, phase, id, signal) => onPhase(input, 'shape', phase, id, signal)));
   const registry = createRegistry();
   registry.install(Tools);
-  registry.install(Guard);
+  registry.install(guardFor(setup.repo));
   registry.install(Skills);
   registry.install(extension);
   registry.install(shaping.extension);
@@ -192,6 +194,7 @@ export async function openPhatMode(setup: Setup, context: Context, options: Open
     opened = await openHarness(
       {
         home,
+        repo,
         servicesFor: setup.servicesFor,
         storage,
         models: options.models,

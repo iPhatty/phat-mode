@@ -10,9 +10,10 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { setToolLogger } from '../src/agents.ts';
 import { paths } from '../src/config.ts';
 import { openPhatMode, type RunKind } from '../src/harness.ts';
-import { finishInterrupted, projectStatus, resumeOnce, retireLegacyState, takeProjects, takenOver, watchedBy } from '../src/projects.ts';
+import { finishInterrupted, projectStatus, resumeInterrupted, resumeOnce, retireLegacyState, takeProjects, takenOver, watchedBy } from '../src/projects.ts';
 import { type Doing, LockedError, readLock } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
+import { type ProjectQueue, watchProjects } from '../src/scheduler.ts';
 import { call, fixture, textOf } from './fixture.ts';
 
 const context = BACKGROUND_CONTEXT;
@@ -424,6 +425,82 @@ describe('finishing interrupted runs, one project after another (watch)', () => 
     assert.equal((await phat.harness.waitForTask(second.taskId, context)).state.outcome.status, 'aborted');
     const record = await phat.harness.getTask(first.taskId, context);
     assert.notEqual(record?.state.status, 'terminal', 'the first one is still going');
+    await phat.close(context);
+  });
+});
+
+describe('a watch resumes a project’s interrupted runs in one slot (resumeInterrupted)', () => {
+  test('two interrupted runs in one project and a ready one in another, one run at a time: the other waits for both', async () => {
+    const a = await fixture({}, 'test/a');
+    const b = await fixture({}, 'test/b');
+    a.github.addIssue(1);
+    a.github.addIssue(2);
+    b.github.addIssue(3);
+    {
+      // Both left interrupted, e.g. `run 1` stopped with Ctrl-C, then `run 2` stopped too.
+      const { phat } = await a.open([]);
+      await phat.start({ repo: 'test/a', issue: 1 }, context);
+      await phat.start({ repo: 'test/a', issue: 2 }, context);
+      await phat.close(context);
+    }
+    const events: string[] = [];
+    const planner = (repo: string): FauxResponseFactory => async (request) => {
+      const issue = /<issue number="(\d+)"/.exec(request.messages.map(textOf).join('\n'))?.[1] ?? '?';
+      events.push(`start ${repo}#${issue}`);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      events.push(`finish ${repo}#${issue}`);
+      return plan('needs_info', ['Which folder?']);
+    };
+    const first = await a.open([planner('a'), planner('a')]);
+    const second = await b.open([planner('b')]);
+    const reported: string[] = [];
+    const stop = new AbortController();
+    let bStarted = false;
+    let bSettled!: () => void;
+    const bDone = new Promise<void>((resolve) => (bSettled = resolve));
+    const queues: ProjectQueue[] = [
+      {
+        repo: 'test/a',
+        next: () =>
+          resumeInterrupted(first.phat, context, async (key, taskId) => {
+            reported.push(`${key} ${(await first.phat.harness.waitForTask(taskId, context)).state.outcome.status}`);
+          }),
+      },
+      {
+        repo: 'test/b',
+        async next() {
+          if (bStarted) return undefined;
+          bStarted = true;
+          resumeOnce(second.phat);
+          const { taskId } = await second.phat.start({ repo: 'test/b', issue: 3 }, context);
+          return async () => {
+            await second.phat.harness.waitForTask(taskId, context);
+            bSettled();
+          };
+        },
+      },
+    ];
+    const watching = watchProjects({
+      projects: async () => queues,
+      maxParallelRuns: 1,
+      sleep: (wake) => new Promise((resolve) => wake.addEventListener('abort', () => resolve(), { once: true })),
+      onError: (repo, error) => assert.fail(`${repo}: ${String(error)}`),
+      signal: stop.signal,
+    });
+    await bDone;
+    stop.abort();
+    await watching;
+    await first.phat.close(context);
+    await second.phat.close(context);
+    assert.deepEqual(reported.sort(), ['test/a#1 completed', 'test/a#2 completed']);
+    assert.equal(events.length, 6, events.join(', '));
+    assert.deepEqual(events.slice(4), ['start b#3', 'finish b#3'], `b waits for both of a’s runs: ${events.join(', ')}`);
+  });
+
+  test('no interrupted run: nothing to wait for', async () => {
+    const a = await fixture({}, 'test/a');
+    const { phat } = await a.open([]);
+    assert.equal(await resumeInterrupted(phat, context, async () => assert.fail('no run')), undefined);
     await phat.close(context);
   });
 });

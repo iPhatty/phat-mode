@@ -29,6 +29,7 @@ import {
   finishInterrupted,
   liveRuns,
   projectStatus,
+  resumeInterrupted,
   resumeOnce,
   retireLegacyState,
   takenOver,
@@ -40,6 +41,7 @@ import type { Services } from './pipeline.ts';
 import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef, watchScope } from './repos.ts';
 import { describeResult } from './runs.ts';
 import { MATTPOCOCK_SKILLS, PSTACK_SKILLS, VERIFICATION_SKILLS } from './skills.ts';
+import { type ProjectQueue, watchProjects } from './scheduler.ts';
 import { describeStep, nextStep } from './watch.ts';
 import { runOrWait, SETTLE_MS, waitToMerge } from './yolo.ts';
 import { CommandChecks, GitWorkspaces, tail } from './workspace.ts';
@@ -127,32 +129,34 @@ function closeOnCtrlC(phats: () => Iterable<PhatMode>) {
   });
 }
 
-async function waitAndReport(phat: PhatMode, taskId: TaskId<RunResult>): Promise<number> {
+/** Wait for a run to settle and say how it ended, naming the run (`owner/name#12`): parallel runs share the log. */
+async function waitAndReport(phat: PhatMode, taskId: TaskId<RunResult>, key: string): Promise<number> {
   const settled = await phat.harness.waitForTask(taskId, context);
   const { outcome } = settled.state;
   if (outcome.status === 'completed') {
-    console.log(`\n${describeResult(outcome.result, settled.kind)}`);
+    console.log(`\n${key}: ${describeResult(outcome.result, settled.kind)}`);
     return 0;
   }
   if (outcome.status === 'failed') {
-    console.log(`\n✖ Failed: ${outcome.error.message.split('\n')[0]}`);
+    console.log(`\n✖ ${key} failed: ${outcome.error.message.split('\n')[0]}`);
     return 1;
   }
-  console.log(`\n✖ ${outcome.status}`);
+  console.log(`\n✖ ${key}: ${outcome.status}`);
   return 1;
 }
 
 const firstLine = (error: unknown) => (error instanceof Error ? error.message.split('\n')[0]! : String(error));
 
-/**
- * Work through the ready and `agent-mode` issues of `repos`, one run at a time, until Ctrl-C: finish any run that is
- * going, then shape or start the next issue, in the order the repos are listed. Within a repo, shaping goes ahead
- * while a phat-mode pull request is open, but no new build starts; other repos carry on. See src/watch.ts.
- */
 const YOLO_WARNING =
   '⚠ --yolo: phat-mode merges its own pull requests (squash) when it found them clean, every check passed and the ' +
   `commit is ${SETTLE_MS / 1_000} seconds old. It never bypasses branch protection.`;
 
+/**
+ * Work through the ready and `agent-mode` issues of `repos` until Ctrl-C: up to `maxParallelRuns` runs at once, at most
+ * one per project (src/scheduler.ts). Each project keeps its own queue: finish a run left interrupted, then shape or
+ * start its next issue (src/watch.ts). Within a repo, shaping goes ahead while a phat-mode pull request is open, but no
+ * new build starts; waiting for that pull request takes no slot.
+ */
 async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Promise<number> {
   const configFor = repoConfigs(machine);
   // The lock of every free project in the list; those another process holds are skipped, and tried again on every look.
@@ -165,55 +169,77 @@ async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Pr
     console.error('✖ Nothing to watch: other processes hold every project in the list.');
     return 1;
   }
-  // Each project is resumed only when its turn comes, so its runs never overlap another project's.
+  const { maxParallelRuns } = machine;
   const minutes = Math.round(machine.watchIntervalMs / 60_000) || 1;
   const watching = projects.held().map((phat) => phat.repo);
   const waiting = [...projects.skipped.keys()];
+  const runs = maxParallelRuns === 1 ? 'one run at a time' : `up to ${maxParallelRuns} runs at once (one per project)`;
   consoleLogger.info(
-    `Watching ${watching.join(', ')}${waiting.length > 0 ? `; waiting for ${waiting.join(', ')}` : ''}: one run at a time, ` +
+    `Watching ${watching.join(', ')}${waiting.length > 0 ? `; waiting for ${waiting.join(', ')}` : ''}: ${runs}, ` +
       `looking every ${minutes} min. Ctrl-C to stop.`,
   );
   if (yolo) consoleLogger.info(YOLO_WARNING);
-  // What was last said about each repo: say it once, not on every look.
+  // What was last said about each repo: say it once, not on every look. Every line names its repo.
   const last = new Map<string, string>();
   const say = (repo: string, text: string, log = consoleLogger.info) => {
-    if (last.get(repo) !== text) log(repos.length > 1 ? `${repo}: ${text}` : text);
+    if (last.get(repo) !== text) log(`${repo}: ${text}`);
     last.set(repo, text);
   };
-  for (;;) {
-    // Projects whose holder has exited since: taken over, within one look.
-    for (const { repo, previous } of await projects.retake()) consoleLogger.info(takenOver(repo, previous));
-    let ran =
-      (await finishInterrupted(projects.held(), context, async (phat, key, taskId) => {
+  /** Wait for a run, then say again what the project is doing, at its next look. */
+  const waitFor = (phat: PhatMode, key: string, taskId: TaskId<RunResult>) => async () => {
+    try {
+      await waitAndReport(phat, taskId, key);
+    } catch (error) {
+      // Its slot is freed all the same; the other projects' runs carry on.
+      consoleLogger.error(`${key}: ${firstLine(error)}`);
+    } finally {
+      last.delete(phat.repo);
+    }
+  };
+  // One project's queue. Its runs go ahead (resumeOnce) only when it gets a slot: resuming runs everything it has pending.
+  const queueOf = (phat: PhatMode): ProjectQueue => ({
+    repo: phat.repo,
+    async next() {
+      const repo = phat.repo;
+      // Runs left interrupted: all of them go ahead, one at a time, in this project's one slot.
+      const interrupted = await resumeInterrupted(phat, context, async (key, taskId) => {
         consoleLogger.info(`Resuming ${key}`);
-        await waitAndReport(phat, taskId);
-      })) > 0;
-    for (const repo of repos) {
-      if (ran) break;
-      const phat = projects.get(repo);
-      // Held by another process: not this watch's to look at.
-      if (phat === undefined) continue;
-      try {
-        const config = await configFor(repo);
-        const step = await nextStep(new GhGitHub(repo), config, consoleLoggerFor(repo), { yolo });
-        say(repo, describeStep(step));
-        if (step.kind === 'start' || step.kind === 'shape') {
-          resumeOnce(phat);
-          const { taskId } = await phat.start({ repo, issue: step.issue }, context, step.kind === 'shape' ? 'shape' : 'build');
-          await waitAndReport(phat, taskId);
-          ran = true;
-        }
-      } catch (error) {
-        // Offline, asleep, GitHub is down, or the repo is not set up: try again on the next look.
-        say(repo, error instanceof NotSetUpError ? error.message : `Could not check GitHub: ${firstLine(error)}`, consoleLogger.error);
-      }
-    }
-    if (ran) {
-      last.clear();
-      continue;
-    }
-    await new Promise((resolve) => setTimeout(resolve, machine.watchIntervalMs));
-  }
+        await waitFor(phat, key, taskId)();
+      });
+      if (interrupted !== undefined) return interrupted;
+      const config = await configFor(repo);
+      const step = await nextStep(new GhGitHub(repo), config, consoleLoggerFor(repo), { yolo });
+      say(repo, describeStep(step));
+      if (step.kind !== 'start' && step.kind !== 'shape') return undefined;
+      resumeOnce(phat);
+      const { taskId } = await phat.start({ repo, issue: step.issue }, context, step.kind === 'shape' ? 'shape' : 'build');
+      return waitFor(phat, `${repo}#${step.issue}`, taskId);
+    },
+  });
+  await watchProjects({
+    async projects() {
+      // Projects whose holder has exited since: taken over, within one look.
+      for (const { repo, previous } of await projects.retake()) consoleLogger.info(takenOver(repo, previous));
+      return projects.held().map(queueOf);
+    },
+    maxParallelRuns,
+    sleep: (wake) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, machine.watchIntervalMs);
+        wake.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      }),
+    onError: (repo, error) =>
+      // Offline, asleep, GitHub is down, or the repo is not set up: try again on the next look.
+      say(repo, error instanceof NotSetUpError ? error.message : `Could not check GitHub: ${firstLine(error)}`, consoleLogger.error),
+  });
+  return 0;
 }
 
 /** `run --yolo`, once the pull request is open: wait until it merges (0) or only you can move it on (1). */
@@ -606,7 +632,7 @@ async function main(argv: string[]): Promise<number> {
         const { taskId, resumed } = await phat.start({ repo, issue }, context, kind);
         consoleLogger.info(`${resumed ? 'Resuming' : kind === 'shape' ? 'Shaping' : 'Starting'} ${repo}#${issue}`);
         phat.harness.resume();
-        const code = await waitAndReport(phat, taskId);
+        const code = await waitAndReport(phat, taskId, `${repo}#${issue}`);
         const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
         if (!yolo || code !== 0 || outcome.status !== 'completed' || outcome.result.status !== 'pr_opened') {
           await phat.close(context);
@@ -637,7 +663,7 @@ async function main(argv: string[]): Promise<number> {
         opened.add(phat);
         resumed += await finishInterrupted([phat], context, async (phat, key, taskId) => {
           consoleLogger.info(`Resuming ${key}`);
-          code = Math.max(code, await waitAndReport(phat, taskId));
+          code = Math.max(code, await waitAndReport(phat, taskId, key));
         });
         await phat.close(context);
         opened.delete(phat);
