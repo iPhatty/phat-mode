@@ -296,6 +296,8 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 
 `~/.phat-mode/` also holds the state database (`state.sqlite`, every repo's runs) and its lock, the Copilot login (`auth.json`, owner-only), and per repo the clone, workspaces (`workspaces/<owner>__<name>/issue-<n>`, and `shape-<n>` for shaping) and evidence.
 
+Set the environment variable **`PHAT_MODE_HOME`** to move that home (config.json, state, `auth.json`, clones, workspaces, evidence) somewhere other than `~/.phat-mode`, e.g. `PHAT_MODE_HOME=~/pm2 phat-mode watch`.
+
 ## Safety
 
 - Only `ready-for-agent` issues (a label only people with triage access can set) specified by `allowedAuthors` are worked on, and only `agent-mode` issues opened by `allowedAuthors` are shaped; others are ignored without any reply. Briefs from anyone else are ignored.
@@ -305,6 +307,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 - phat-mode only merges with `--yolo`, only the exact commit it judged clean, after every check passed, and never past branch protection. See [Yolo](#yolo).
 - Only the implementer can write files, and only inside its workspace (never `.git`). Shaping's checkout is read-only on disk too (its files and folders, `node_modules` aside), and its agent may not change permissions, so commands it runs cannot change it.
 - Agent commands run without your tokens in their environment, and credential folders are blocked, for commands and for the read tool (checked where a path really leads, so symlinks and `..` do not get around it).
+- Agents may not look into phat-mode's home outside its `workspaces/`, for commands and for the read tool, under one rule: both the configured home (`PHAT_MODE_HOME`) and the default `~/.phat-mode` are protected, however the path is written (`~`, `$HOME`, absolute, quoted, or relative to the workspace or a `cd`, with `..`). A folder that only shares the name as a prefix (`~/.phat-mode-2`) is not mistaken for it.
 - **Not a sandbox yet.** Agents run shell commands as you, on your Mac. Use it on repos and issues you trust. Containers come in a later stage.
 
 ## How it works

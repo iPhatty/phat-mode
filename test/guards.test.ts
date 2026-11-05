@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { bashBlockReason, readBlockReason, readOnlyBashBlockReason, writeBlockReason } from '../src/guards.ts';
@@ -77,6 +77,92 @@ describe('bashBlockReason', () => {
     }
   });
 
+  test('a custom home not named .phat-mode is protected outside its workspaces', () => {
+    const home = join(homedir(), 'pm2');
+    const ws = join(home, 'workspaces', 'a', 'issue-1');
+    for (const command of ['cat ~/pm2/auth.json', 'sqlite3 $HOME/pm2/state.sqlite', `cat ${home}/auth.json`, `ls ${home}`]) {
+      assert.match(bashBlockReason(command, ws, home) ?? '', /credential folders/, command);
+      assert.match(bashBlockReason(command, null, home) ?? '', /credential folders/, command);
+    }
+    assert.equal(bashBlockReason('cat ~/pm2/workspaces/a/issue-1/x', ws, home), undefined);
+  });
+
+  test('a home that only shares the .phat-mode prefix is not mistaken for the default home', () => {
+    const home = join(homedir(), '.phat-mode-2');
+    const ws = join(home, 'workspaces', 'a', 'issue-1');
+    const allowed = `cd ${ws} && ls ${ws}-scratch`;
+    assert.equal(bashBlockReason(allowed, ws, home), undefined);
+    assert.equal(bashBlockReason(allowed), undefined);
+    assert.match(bashBlockReason('cat ~/.phat-mode-2/auth.json', ws, home) ?? '', /credential folders/);
+  });
+
+  test('~, $HOME, ${HOME}, quoted and absolute forms of a path are judged alike', () => {
+    const home = join(homedir(), 'pm2');
+    for (const [rest, blocked] of [['pm2/auth.json', true], ['pm2/workspaces/a/issue-1/x', false]] as const) {
+      for (const path of [`~/${rest}`, `$HOME/${rest}`, `\${HOME}/${rest}`, `"$HOME"/${rest}`, `'${homedir()}/${rest}'`, `${homedir()}/${rest}`]) {
+        const reason = bashBlockReason(`cat ${path}`, null, home);
+        if (blocked) assert.match(reason ?? '', /credential folders/, path);
+        else assert.equal(reason, undefined, path);
+      }
+    }
+  });
+
+  test('.. out of workspaces is blocked, for the default and a custom home', () => {
+    const home = join(homedir(), 'pm2');
+    for (const command of [
+      'cat ~/pm2/workspaces/../auth.json',
+      `sqlite3 ${home}/workspaces/a/../../state.sqlite`,
+      `cat ${join(homedir(), '.phat-mode')}/workspaces/a/../../auth.json`,
+      'cat ~/.phat-mode/workspaces/../auth.json',
+    ]) {
+      assert.match(bashBlockReason(command, null, home) ?? '', /credential folders/, command);
+    }
+  });
+
+  test('the default home stays protected when a custom home is set', () => {
+    const home = join(homedir(), 'pm2');
+    for (const command of ['cat ~/.phat-mode/auth.json', `cat ${join(homedir(), '.phat-mode', 'state.sqlite')}`]) {
+      assert.match(bashBlockReason(command, join(home, 'workspaces', 'a', 'issue-1'), home) ?? '', /credential folders/, command);
+    }
+  });
+
+  test('relative paths are judged from where the command runs: the workspace, or where it cd-ed to', () => {
+    for (const home of [join(homedir(), 'pm2'), join(homedir(), '.phat-mode')]) {
+      const ws = join(home, 'workspaces', 'a', 'issue-1');
+      for (const command of [
+        'cat ../../../auth.json',
+        'sqlite3 ../../../state.sqlite',
+        'cd ../.. && cat ../auth.json',
+        `cd ${home} && cat auth.json`,
+        'cd ~/.phat-mode; ls',
+        'cd .. && cd .. && cd .. && ls',
+      ]) {
+        assert.match(bashBlockReason(command, ws, home) ?? '', /credential folders/, `${home}: ${command}`);
+      }
+      for (const command of ['cat ../issue-1-scratch/notes.md', 'cd src && cat ../README.md', 'ls -la', `cd ${ws}-scratch && ls ../issue-1`]) {
+        assert.equal(bashBlockReason(command, ws, home), undefined, `${home}: ${command}`);
+      }
+    }
+  });
+
+  test('quoted and escaped paths keep their spaces, so a home with spaces is protected', () => {
+    const home = join(homedir(), 'pm home');
+    const ws = join(home, 'workspaces', 'a', 'issue-1');
+    for (const command of [
+      `cat "${home}/auth.json"`,
+      `cat '${home}/state.sqlite'`,
+      `cat ${home.replace(' ', '\\ ')}/auth.json`,
+      'cat ~/"pm home"/auth.json',
+      'cat "$HOME/pm home/auth.json"',
+      `cd "${ws}" && cat ../../../auth.json`,
+    ]) {
+      assert.match(bashBlockReason(command, ws, home) ?? '', /credential folders/, command);
+    }
+    for (const command of [`cat "${ws}/README.md"`, `ls '${ws}-scratch'`, `cd "${ws}" && cat src/a.ts`]) {
+      assert.equal(bashBlockReason(command, ws, home), undefined, command);
+    }
+  });
+
   test('blocks sudo, deleting home or root, and reading credentials', () => {
     for (const command of ['sudo rm x', 'rm -rf ~', 'rm -rf /', 'cat ~/.ssh/id_ed25519', 'cat ~/.phat-mode/auth.json', 'cat ~/.config/gh/hosts.yml']) {
       assert.match(bashBlockReason(command) ?? '', /^Blocked:/, command);
@@ -116,6 +202,64 @@ describe('readOnlyBashBlockReason', () => {
       assert.equal(readOnlyBashBlockReason(command), undefined, command);
     }
   });
+});
+
+describe('bash and the read tool judge phat-mode’s home alike', () => {
+  const cases: { name: string; home: string; paths: [string, boolean][] }[] = [
+    {
+      name: 'a custom home',
+      home: join(homedir(), 'pm2'),
+      paths: [
+        ['~/pm2/auth.json', true],
+        [join(homedir(), 'pm2', 'state.sqlite'), true],
+        [join(homedir(), 'pm2', 'workspaces', 'a', '..', '..', 'auth.json'), true],
+        ['~/pm2/workspaces/a/issue-1/README.md', false],
+        ['../../../auth.json', true],
+        ['../issue-1-scratch/x', false],
+        ['~/.phat-mode/auth.json', true],
+        ['/etc/hosts', false],
+      ],
+    },
+    {
+      name: 'a home named .phat-mode-2',
+      home: join(homedir(), '.phat-mode-2'),
+      paths: [
+        ['~/.phat-mode-2/auth.json', true],
+        [join(homedir(), '.phat-mode-2', 'workspaces', 'a', 'issue-1-scratch', 'x'), false],
+        ['~/.phat-mode/config.json', true],
+      ],
+    },
+    {
+      name: 'the default home',
+      home: join(homedir(), '.phat-mode'),
+      paths: [
+        ['~/.phat-mode/auth.json', true],
+        ['~/.phat-mode/workspaces/../state.sqlite', true],
+        ['../../../state.sqlite', true],
+        [join(homedir(), '.phat-mode', 'workspaces', 'a', 'issue-1', 'x'), false],
+        [join(homedir(), '.phat-mode-2', 'workspaces', 'a', 'issue-1', 'x'), false],
+      ],
+    },
+    {
+      name: 'a home with a space in its name',
+      home: join(homedir(), 'pm home'),
+      paths: [
+        [`"${join(homedir(), 'pm home', 'auth.json')}"`, true],
+        [`"${join(homedir(), 'pm home', 'workspaces', 'a', 'issue-1', 'x')}"`, false],
+      ],
+    },
+  ];
+  for (const { name, home, paths } of cases) {
+    test(name, async () => {
+      const ws = join(home, 'workspaces', 'a', 'issue-1');
+      for (const [path, blocked] of paths) {
+        const bash = bashBlockReason(`cat ${path}`, ws, home) !== undefined;
+        const read = (await readBlockReason(path.replace(/^"|"$/g, ''), ws, home)) !== undefined;
+        assert.equal(bash, blocked, `bash: ${path}`);
+        assert.equal(read, blocked, `read: ${path}`);
+      }
+    });
+  }
 });
 
 describe('readBlockReason', () => {
