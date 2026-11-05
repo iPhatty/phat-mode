@@ -16,8 +16,8 @@ vague issue labelled agent-mode   →  phat-mode watch shapes it    →  tickets
 Or skip the skills: label a rough issue you opened `agent-mode`, and phat-mode shapes it into a spec and tickets itself, with no human answering questions. See [Agent mode](#agent-mode).
 
 1. **Prepare**: only works on issues that are open, labelled `ready-for-agent`, specified by a trusted author, and not blocked by open issues. Anything else is left alone, with no reply. Labels it `phat-mode:working` and checks out branch `phat-mode/issue-12` in its own workspace.
-2. **Plan** (AI, Claude Opus 5.5): reads the spec and the code, and plans *how* to build it, with Matt Pocock's `codebase-design` skill as its standing skill (see [Skills](#skills)). If the spec has a gap, it posts triage notes and moves the issue back to `needs-info`. If an agent shouldn't do it, it moves it to `ready-for-human`.
-3. **Implement** (AI, Claude Opus 5.5): changes the code and adds tests, following Matt Pocock's `tdd` skill as its standing skill, test-first at the seams the plan names (see [Skills](#skills)).
+2. **Plan** (AI, Claude Opus 5.5): reads the spec and the code, and plans *how* to build it, with Matt Pocock's `codebase-design` skill as its standing skill (see [Skills](#skills)). The plan carries its **test seams**: each one the public interface under test, what testing there catches and what it misses. A plan to proceed without seams must say why (for example, docs only), or phat-mode rejects it and the planner reports again. The plan comment on the issue lists the seams. If the spec has a gap, it posts triage notes and moves the issue back to `needs-info`. If an agent shouldn't do it, it moves it to `ready-for-human`.
+3. **Implement** (AI, Claude Opus 5.5): changes the code and adds tests, following Matt Pocock's `tdd` skill as its standing skill, test-first at the plan's seams, which its request lists as the agreed seams (see [Skills](#skills)).
 4. **Verify** (code, not AI): runs `npm run check`. On failure, the output goes back to the implementer (up to 3 times).
 5. **Code review** (GPT-6.1 Sol, a different model family, read-only): two reviewers in parallel, following Matt Pocock's [code-review](https://github.com/mattpocock/skills/blob/main/skills/engineering/code-review/SKILL.md) skill. See [Code review](#code-review).
 6. **Verify** (AI, read-only, in the real app): follows the repo's own verification skill. See [Verification](#verification).
@@ -157,7 +157,7 @@ Every skill an agent follows is **phat-mode's pinned copy**, from its own [`skil
   |---|---|
   | questioner | `grilling`, with the autonomy overlay |
   | planner | `codebase-design`, with `DEEPENING.md` and `DESIGN-IT-TWICE.md` |
-  | implementer | `tdd`, with `tests.md` and `mocking.md`, and the unattended-TDD overlay: *"the user is the planner. The tests the plan names are the agreed seams: write tests only at those seams, without asking anyone to confirm them. If a test needs a seam the plan does not name, add it and say so in report_done."* |
+  | implementer | `tdd`, with `tests.md` and `mocking.md`, and the unattended-TDD overlay: *"the user is the planner. The seams listed as the agreed seams in your request are the agreed seams: write tests only at those seams, without asking anyone to confirm them. If a test needs a seam that is not on that list, add it and say so in report_done."* |
   | answerer, reviewers, verifier | none |
 
 - **Step skills**: the skill for one step, pasted verbatim into that one request: `triage`, `to-spec` with `domain-modeling`, and `to-tickets` for the answerer; `code-review` for the reviewers; `pr` for the description; the repo's own verify skill for the verifier.

@@ -48,6 +48,12 @@ export const RoleDoc = defineDoc<{ role: Agent | null; issue: number | null; wor
   initial: () => ({ role: null, issue: null, workspace: null }),
 });
 
+/**
+ * A test seam the planner agreed on, as the tdd skill notes it: the public interface under test, what testing there
+ * catches, and what it misses.
+ */
+export type Seam = { interface: string; catches: string; misses: string };
+
 export type PlanReport = {
   /** proceed: build it. needs_info: the spec has gaps only the author can fill. needs_human: an agent should not do it. */
   decision: 'proceed' | 'needs_info' | 'needs_human';
@@ -60,7 +66,24 @@ export type PlanReport = {
   reason: string;
   /** What the planner found out that the implementer needs, so it does not redo the research. */
   notes?: string;
+  /**
+   * The agreed test seams, decided with the codebase-design skill. Optional: a plan recorded before seams existed has
+   * none, so every reader must handle `undefined`.
+   */
+  seams?: Seam[];
+  /** For proceed with no seams: why the change has no behaviour to test (e.g. docs only). */
+  noSeamsReason?: string;
 };
+
+/**
+ * Why a plan report must be made again, or `undefined` when it is accepted. A proceed plan needs at least one seam, or
+ * a reason why there is no behaviour to test; handing back (needs_info, needs_human) needs neither.
+ */
+export function planRejection(plan: { decision: string; seams?: readonly Seam[]; noSeamsReason?: string }): string | undefined {
+  if (plan.decision !== 'proceed') return undefined;
+  if ((plan.seams ?? []).length > 0 || (plan.noSeamsReason ?? '').trim() !== '') return undefined;
+  return 'Rejected: a proceed plan needs its test seams. Call report_plan again with seams, or with noSeamsReason saying why there is no behaviour to test.';
+}
 export type DoneReport = { summary: string; testing: string };
 
 /** The pull request description, following mattpocock/skills' `pr` skill. Written by the implementer, last. */
@@ -180,8 +203,25 @@ export const reportPlan = defineTool({
       description:
         'When proceeding: what you found out that the implementer needs (sources, URLs, commands that worked, facts about the data or code, files you left in the scratch folder), so it does not redo your research. Empty if nothing.',
     }),
+    seams: Type.Array(
+      Type.Object({
+        interface: Type.String({ description: 'The public interface under test (module, function, command, endpoint…).' }),
+        catches: Type.String({ description: 'What testing at this interface catches.' }),
+        misses: Type.String({ description: 'What testing at this interface misses.' }),
+      }),
+      {
+        description:
+          'The agreed test seams, decided with your codebase-design skill: the implementer writes tests only at these. ' +
+          'When proceeding, at least one, unless the change has no behaviour to test (then say why in noSeamsReason). Empty for needs_info and needs_human.',
+      },
+    ),
+    noSeamsReason: Type.String({
+      description: 'When proceeding with no seams: why the change has no behaviour to test (e.g. docs only). Empty otherwise.',
+    }),
   }),
   execute: async (args, api, context) => {
+    const rejection = planRejection(args);
+    if (rejection !== undefined) return { output: [{ type: 'text' as const, text: rejection }], isError: true };
     await api.commit(async (tx) => {
       (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'plan', data: { ...args } as PlanReport });
     }, context);
