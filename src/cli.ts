@@ -24,7 +24,17 @@ import { GhGitHub, requiredLabels } from './github.ts';
 import { createCopilotModels, openPhatMode, type PhatMode, type RunKind, type RunResult, RunsDoc } from './harness.ts';
 import { detectCommands, installProjectSkills, readiness, settingsFile } from './init.ts';
 import { describeHolder, LockedError, type LockInfo } from './lock.ts';
-import { describeUnfinished, finishInterrupted, liveRuns, projectStatus, resumeOnce, retireLegacyState } from './projects.ts';
+import {
+  describeUnfinished,
+  finishInterrupted,
+  liveRuns,
+  projectStatus,
+  resumeOnce,
+  retireLegacyState,
+  takenOver,
+  takeProjects,
+  watchedBy,
+} from './projects.ts';
 import { consoleLogger, consoleLoggerFor } from './log.ts';
 import type { Services } from './pipeline.ts';
 import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef, watchScope } from './repos.ts';
@@ -145,18 +155,24 @@ const YOLO_WARNING =
 
 async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Promise<number> {
   const configFor = repoConfigs(machine);
-  // Every project's lock first. One held by another process: stop, naming it (LockedError).
-  const phats = new Map<string, PhatMode>();
-  closeOnCtrlC(() => phats.values());
-  try {
-    for (const repo of repos) phats.set(repo, await open(machine, repo, configFor));
-  } catch (error) {
-    await Promise.allSettled([...phats.values()].map((phat) => phat.close(context)));
-    throw error;
+  // The lock of every free project in the list; those another process holds are skipped, and tried again on every look.
+  // `repos` is read once, at start: a project added to config.json later is watched after a restart.
+  const projects = await takeProjects(repos, (repo) => open(machine, repo, configFor));
+  closeOnCtrlC(() => projects.held());
+  for (const [repo, holder] of projects.skipped) consoleLogger.info(watchedBy(repo, holder));
+  if (projects.held().length === 0) {
+    await projects.close(context);
+    console.error('✖ Nothing to watch: other processes hold every project in the list.');
+    return 1;
   }
   // Each project is resumed only when its turn comes, so its runs never overlap another project's.
   const minutes = Math.round(machine.watchIntervalMs / 60_000) || 1;
-  consoleLogger.info(`Watching ${repos.join(', ')}: one run at a time, looking every ${minutes} min. Ctrl-C to stop.`);
+  const watching = projects.held().map((phat) => phat.repo);
+  const waiting = [...projects.skipped.keys()];
+  consoleLogger.info(
+    `Watching ${watching.join(', ')}${waiting.length > 0 ? `; waiting for ${waiting.join(', ')}` : ''}: one run at a time, ` +
+      `looking every ${minutes} min. Ctrl-C to stop.`,
+  );
   if (yolo) consoleLogger.info(YOLO_WARNING);
   // What was last said about each repo: say it once, not on every look.
   const last = new Map<string, string>();
@@ -165,19 +181,23 @@ async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Pr
     last.set(repo, text);
   };
   for (;;) {
+    // Projects whose holder has exited since: taken over, within one look.
+    for (const { repo, previous } of await projects.retake()) consoleLogger.info(takenOver(repo, previous));
     let ran =
-      (await finishInterrupted(phats.values(), context, async (phat, key, taskId) => {
+      (await finishInterrupted(projects.held(), context, async (phat, key, taskId) => {
         consoleLogger.info(`Resuming ${key}`);
         await waitAndReport(phat, taskId);
       })) > 0;
     for (const repo of repos) {
       if (ran) break;
+      const phat = projects.get(repo);
+      // Held by another process: not this watch's to look at.
+      if (phat === undefined) continue;
       try {
         const config = await configFor(repo);
         const step = await nextStep(new GhGitHub(repo), config, consoleLoggerFor(repo), { yolo });
         say(repo, describeStep(step));
         if (step.kind === 'start' || step.kind === 'shape') {
-          const phat = phats.get(repo)!;
           resumeOnce(phat);
           const { taskId } = await phat.start({ repo, issue: step.issue }, context, step.kind === 'shape' ? 'shape' : 'build');
           await waitAndReport(phat, taskId);
