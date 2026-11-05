@@ -571,7 +571,7 @@ export const Guard = defineExtension({
         let block: string | undefined;
         if (call.name === 'bash') {
           const command = String(args.command ?? '');
-          block = bashBlockReason(command) ?? (isShapeAgent(role?.role) ? readOnlyBashBlockReason(command) : undefined);
+          block = bashBlockReason(command, role?.workspace ?? null) ?? (isShapeAgent(role?.role) ? readOnlyBashBlockReason(command) : undefined);
         } else if (call.name === 'read') {
           block = await readBlockReason(String(args.path ?? ''), role?.workspace ?? null);
         } else if (call.name === 'write' || call.name === 'edit') {

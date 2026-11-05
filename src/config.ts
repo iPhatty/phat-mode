@@ -95,7 +95,11 @@ export type Config = Omit<MachineConfig, 'repos' | 'allowedAuthors'> & {
   checkCommand: string;
 };
 
-export const DEFAULT_HOME = process.env.PHAT_MODE_HOME ?? join(homedir(), '.phat-mode');
+/** phat-mode's home when `PHAT_MODE_HOME` is not set. */
+export const STANDARD_HOME = join(homedir(), '.phat-mode');
+
+/** phat-mode's configured home: `PHAT_MODE_HOME`, or `~/.phat-mode`. */
+export const DEFAULT_HOME = process.env.PHAT_MODE_HOME ?? STANDARD_HOME;
 
 export const DEFAULT_LABELS: Labels = {
   needsTriage: 'needs-triage',
