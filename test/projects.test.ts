@@ -10,7 +10,7 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { setToolLogger } from '../src/agents.ts';
 import { paths } from '../src/config.ts';
 import { openPhatMode, type RunKind } from '../src/harness.ts';
-import { finishInterrupted, projectStatus, resumeOnce, retireLegacyState } from '../src/projects.ts';
+import { finishInterrupted, projectStatus, resumeOnce, retireLegacyState, takeProjects, takenOver, watchedBy } from '../src/projects.ts';
 import { type Doing, LockedError, readLock } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
 import { call, fixture, textOf } from './fixture.ts';
@@ -425,5 +425,122 @@ describe('finishing interrupted runs, one project after another (watch)', () => 
     const record = await phat.harness.getTask(first.taskId, context);
     assert.notEqual(record?.state.status, 'terminal', 'the first one is still going');
     await phat.close(context);
+  });
+});
+
+describe('a watch takes the free projects in its list and skips held ones (takeProjects)', () => {
+  /** Open a project as `phat-mode watch` does, taking its lock (LockedError when another process holds it). */
+  const takeIn = (home: string) => (repo: string) =>
+    openPhatMode({ home, repo, servicesFor: async () => assert.fail('no services') }, context, {
+      lock: { command: 'phat-mode watch' },
+      models: fauxModels([]),
+    });
+
+  test('a free project is held and a held one is skipped, naming its holder', async () => {
+    const { config } = await fixture({}, 'test/a');
+    const other = await holder(paths.projectLock(config.home, 'test/b'), 'phat-mode watch test/b');
+    const projects = await takeProjects(['test/a', 'test/b'], takeIn(config.home));
+    try {
+      assert.deepEqual(projects.held().map((phat) => phat.repo), ['test/a']);
+      assert.ok(projects.get('test/a'));
+      assert.equal(projects.get('test/b'), undefined);
+      const skipped = projects.skipped.get('test/b');
+      assert.equal(skipped?.pid, other.pid);
+      assert.equal(skipped?.command, 'phat-mode watch test/b');
+      assert.equal(watchedBy('test/b', skipped!), `test/b is watched by pid ${other.pid} (phat-mode watch test/b)`);
+    } finally {
+      await projects.close(context);
+      await other.stop();
+    }
+  });
+
+  test('when every project is held, none is held and each is skipped', async () => {
+    const { config } = await fixture({}, 'test/a');
+    const a = await holder(paths.projectLock(config.home, 'test/a'), 'phat-mode watch');
+    const b = await holder(paths.projectLock(config.home, 'test/b'), 'phat-mode watch');
+    const projects = await takeProjects(['test/a', 'test/b'], takeIn(config.home));
+    try {
+      assert.deepEqual(projects.held(), []);
+      assert.deepEqual([...projects.skipped.keys()], ['test/a', 'test/b']);
+    } finally {
+      await projects.close(context);
+      await a.stop();
+      await b.stop();
+    }
+  });
+
+  test('once its holder has exited, a skipped project is taken over on retake, naming the previous holder', async () => {
+    const { config } = await fixture({}, 'test/a');
+    const other = await holder(paths.projectLock(config.home, 'test/b'), 'phat-mode watch test/b');
+    const projects = await takeProjects(['test/b', 'test/a'], takeIn(config.home));
+    try {
+      await other.stop();
+      const taken = await projects.retake();
+      assert.deepEqual(
+        taken.map(({ repo, phat, previous }) => ({ repo, phat: phat.repo, pid: previous.pid })),
+        [{ repo: 'test/b', phat: 'test/b', pid: other.pid }],
+      );
+      assert.equal(takenOver('test/b', taken[0]!.previous), `Now watching test/b: pid ${other.pid} (phat-mode watch test/b) has stopped.`);
+      assert.deepEqual(projects.held().map((phat) => phat.repo), ['test/b', 'test/a']);
+      assert.equal(projects.skipped.size, 0);
+      assert.equal((await readLock(paths.projectLock(config.home, 'test/b')))?.pid, process.pid);
+    } finally {
+      await projects.close(context);
+    }
+  });
+
+  test('while its holder is alive, a skipped project is not taken on retake, and its lock is untouched', async () => {
+    const { config } = await fixture({}, 'test/a');
+    const other = await holder(paths.projectLock(config.home, 'test/b'), 'phat-mode watch test/b');
+    const projects = await takeProjects(['test/a', 'test/b'], takeIn(config.home));
+    try {
+      assert.deepEqual(await projects.retake(), []);
+      assert.deepEqual(projects.held().map((phat) => phat.repo), ['test/a']);
+      assert.equal(projects.skipped.get('test/b')?.pid, other.pid);
+      assert.equal((await readLock(paths.projectLock(config.home, 'test/b')))?.pid, other.pid);
+    } finally {
+      await projects.close(context);
+      await other.stop();
+    }
+  });
+
+  test('close releases every lock held, including those taken over, so another process can take them', async () => {
+    const { config } = await fixture({}, 'test/a');
+    const other = await holder(paths.projectLock(config.home, 'test/b'), 'phat-mode watch test/b');
+    const projects = await takeProjects(['test/a', 'test/b'], takeIn(config.home));
+    await other.stop();
+    await projects.retake();
+    await projects.close(context);
+    assert.deepEqual(projects.held(), []);
+    for (const repo of ['test/a', 'test/b']) {
+      assert.equal(await readLock(paths.projectLock(config.home, repo)), undefined, `${repo} released`);
+      const next = await holder(paths.projectLock(config.home, repo), 'phat-mode watch');
+      assert.equal((await readLock(paths.projectLock(config.home, repo)))?.pid, next.pid);
+      await next.stop();
+    }
+  });
+
+  test('two processes never hold one project: each lock names exactly one holder', async () => {
+    const { config } = await fixture({}, 'test/a');
+    const other = await holder(paths.projectLock(config.home, 'test/b'), 'phat-mode watch test/b');
+    const projects = await takeProjects(['test/a', 'test/b'], takeIn(config.home));
+    try {
+      await projects.retake();
+      assert.equal((await readLock(paths.projectLock(config.home, 'test/a')))?.pid, process.pid);
+      assert.equal((await readLock(paths.projectLock(config.home, 'test/b')))?.pid, other.pid);
+    } finally {
+      await projects.close(context);
+      await other.stop();
+    }
+  });
+
+  test('any other error while taking closes the projects already taken and is rethrown', async () => {
+    const { config } = await fixture({}, 'test/a');
+    const take = takeIn(config.home);
+    await assert.rejects(
+      takeProjects(['test/a', 'test/b'], async (repo) => (repo === 'test/b' ? Promise.reject(new Error('broken')) : take(repo))),
+      /broken/,
+    );
+    assert.equal(await readLock(paths.projectLock(config.home, 'test/a')), undefined);
   });
 });

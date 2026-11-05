@@ -114,7 +114,41 @@ One run at a time across all repos, in the order they are listed. The rules belo
 
 Merging a PR closes its issue (`Closes #N`), which unblocks the issues that wait for it, so blockers set up as GitHub issue dependencies or `Blocked by` lines give the order. When nothing can start, it says why, once: e.g. `#9 is blocked by #18 (ready-for-human)`.
 
-It polls rather than using GitHub webhooks: a webhook needs a public address for your Mac, and anything sent while the Mac sleeps would be lost. Polling works out everything from GitHub on each look, so it catches up after sleep, Ctrl-C or a crash. While `watch` runs, it holds the [lock](#projects-locks-and-databases) of every project it watches: `run`, `resume` and `abort` on those projects say which process holds them, and `status` shows what it is doing. Other projects stay free for other phat-mode processes. If another process already holds one of its projects, `watch` exits 1, naming it. Inside one watch, still one run at a time: after a crash, it finishes the interrupted runs one project after another.
+It polls rather than using GitHub webhooks: a webhook needs a public address for your Mac, and anything sent while the Mac sleeps would be lost. Polling works out everything from GitHub on each look, so it catches up after sleep, Ctrl-C or a crash. While `watch` runs, it holds the [lock](#projects-locks-and-databases) of every project it watches: `run`, `resume` and `abort` on those projects say which process holds them, and `status` shows what it is doing. Other projects stay free for other phat-mode processes. A project another process already holds is skipped, and taken over once that process stops: see [Several watches](#several-watches). Inside one watch, still one run at a time: after a crash, it finishes the interrupted runs one project after another.
+
+### Several watches
+
+Several `phat-mode watch` processes can run side by side, e.g. one per terminal, each holding its own projects. None needs restarting when another starts or stops; two watches never work on the same project at once.
+
+- A watch reads its list of projects **once**, when it starts. A project added to `repos` later (e.g. by `phat-mode init`) is watched only after a restart.
+- It takes the lock of every free project in its list, and skips each one another process holds, with one line naming the holder: `owner/x is watched by pid 123 (phat-mode watch owner/x)`.
+- If every project in its list is held, it exits 1.
+- On every look it tries the skipped projects again: once their holder has stopped (Ctrl-C, crash), it takes them over and says so.
+- Ctrl-C releases every lock it holds, so other watches take its projects over on their next look.
+
+All first (`repos` lists `owner/x` and `owner/y`), then one project in another terminal: that project is taken, so the second watch exits 1.
+
+```console
+$ phat-mode watch                      # terminal 1
+20:05:39  Watching owner/x, owner/y: one run at a time, looking every 2 min. Ctrl-C to stop.
+
+$ phat-mode watch owner/x              # terminal 2
+20:05:42  owner/x is watched by pid 25302 (phat-mode watch)
+✖ Nothing to watch: other processes hold every project in the list.
+```
+
+One project first, then all: the second watch skips `owner/x`, watches the rest, and takes `owner/x` over once the first stops.
+
+```console
+$ phat-mode watch owner/x              # terminal 1
+20:05:59  Watching owner/x: one run at a time, looking every 2 min. Ctrl-C to stop.
+
+$ phat-mode watch                      # terminal 2
+20:05:59  owner/x is watched by pid 25362 (phat-mode watch owner/x)
+20:05:59  Watching owner/y; waiting for owner/x: one run at a time, looking every 2 min. Ctrl-C to stop.
+…                                      # Ctrl-C in terminal 1
+20:06:08  Now watching owner/x: pid 25362 (phat-mode watch owner/x) has stopped.
+```
 
 ### Yolo
 
@@ -219,7 +253,7 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 | Command | |
 |---|---|
 | `phat-mode init` | Set up the repo in this folder. See [Setup](#setup). |
-| `phat-mode watch [--yolo] [repo…]` | Shape the `agent-mode` issues and work through the ready ones, one run at a time, until Ctrl-C. In a set-up repo, asks: this repo or all. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
+| `phat-mode watch [--yolo] [repo…]` | Shape the `agent-mode` issues and work through the ready ones, one run at a time, until Ctrl-C. In a set-up repo, asks: this repo or all. Skips projects another watch holds and takes them over when it stops. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
 | `phat-mode run [--yolo] <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. `--yolo` then waits and merges the PR. See [Yolo](#yolo). |
 | `phat-mode resume` | Continue every interrupted run, building or shaping, in every project no other process holds (a held one is named and skipped, and the exit code is 1). |
 | `phat-mode status` | List every project (your `repos`, and any other with runs) and its runs: shaping or building, and where they are. For a project another process holds, what that process is doing, from its lock file. |
@@ -232,7 +266,7 @@ Ctrl-C is always safe: progress is saved, and `run` or `resume` continues from t
 
 ### Projects: locks and databases
 
-Each project (repo) has its own **lock** (`locks/<owner>__<name>.lock` in phat-mode's home) and its own **durable database** (`state/<owner>__<name>.sqlite`). Pi Durable storage has no cross-process locking, so a process opens a project's database only while it holds that project's lock: different phat-mode processes can work on different projects at once, never on the same one. `run`, `resume` and `abort` on a project another process holds exit 1 with e.g. ``owner/x is held by pid 123 (`phat-mode watch`, since 10:04:12)``. A lock left by a crashed process is taken over automatically (a lock is a small folder of holder files; never edit it while phat-mode runs). Why: [ADR 0004](docs/adr/0004-one-lock-and-one-durable-database-per-project.md).
+Each project (repo) has its own **lock** (`locks/<owner>__<name>.lock` in phat-mode's home) and its own **durable database** (`state/<owner>__<name>.sqlite`). Pi Durable storage has no cross-process locking, so a process opens a project's database only while it holds that project's lock: different phat-mode processes can work on different projects at once, never on the same one. A `watch` skips the projects another process holds and takes them over when it stops ([Several watches](#several-watches)); `run`, `resume` and `abort` on a project another process holds exit 1 with e.g. ``owner/x is held by pid 123 (`phat-mode watch`, since 10:04:12)``. A lock left by a crashed process is taken over automatically (a lock is a small folder of holder files; never edit it while phat-mode runs). Why: [ADR 0004](docs/adr/0004-one-lock-and-one-durable-database-per-project.md).
 
 The lock file says who holds the project (pid, command, since when) and what it is doing right now (issue, build or shaping, phase), kept current as the run moves on. That is what `status` shows for a held project, e.g. `held by pid 123 (…): doing #12 build (implement)`, without opening its database.
 

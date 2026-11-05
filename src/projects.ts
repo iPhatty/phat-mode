@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { access, link, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import type { Context } from '@earendil-works/chord/context';
+import { BACKGROUND_CONTEXT, type Context } from '@earendil-works/chord/context';
 import type { TaskId } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { paths } from './config.ts';
@@ -226,4 +226,75 @@ export async function finishInterrupted(
     }
   }
   return count;
+}
+
+/** The projects of one watch: those it holds, in list order, and those another process holds (skipped). */
+export type WatchedProjects = {
+  /** The projects this watch holds, in the order of its list. */
+  held(): PhatMode[];
+  get(repo: string): PhatMode | undefined;
+  /** The projects another process holds, with the holder last seen. */
+  readonly skipped: ReadonlyMap<string, LockInfo>;
+  /**
+   * Try each skipped project once more: those whose holder has exited are taken over and returned, with the holder they
+   * had; for the others, the holder seen now is recorded. Any error but LockedError closes everything and is rethrown.
+   */
+  retake(): Promise<{ repo: string; phat: PhatMode; previous: LockInfo }[]>;
+  /** Close every project held, releasing their locks. */
+  close(context: Context): Promise<void>;
+};
+
+/**
+ * Take every project of `repos` that is free, with `take` (which throws LockedError when another process holds the
+ * project), and skip the held ones. Any other error closes what was taken and is rethrown.
+ */
+export async function takeProjects(repos: readonly string[], take: (repo: string) => Promise<PhatMode>): Promise<WatchedProjects> {
+  const held = new Map<string, PhatMode>();
+  const skipped = new Map<string, LockInfo>();
+  const close = async (context: Context) => {
+    const all = [...held.values()];
+    held.clear();
+    await Promise.allSettled(all.map((phat) => phat.close(context)));
+  };
+  /** Take `repo`, or record its holder. Undefined when another process holds it. */
+  const tryTake = async (repo: string): Promise<PhatMode | undefined> => {
+    try {
+      const phat = await take(repo);
+      held.set(repo, phat);
+      skipped.delete(repo);
+      return phat;
+    } catch (error) {
+      if (!(error instanceof LockedError)) {
+        await close(BACKGROUND_CONTEXT);
+        throw error;
+      }
+      skipped.set(repo, error.holder);
+      return undefined;
+    }
+  };
+  for (const repo of repos) await tryTake(repo);
+  return {
+    held: () => repos.flatMap((repo) => held.get(repo) ?? []),
+    get: (repo) => held.get(repo),
+    skipped,
+    async retake() {
+      const taken: { repo: string; phat: PhatMode; previous: LockInfo }[] = [];
+      for (const [repo, previous] of [...skipped]) {
+        const phat = await tryTake(repo);
+        if (phat !== undefined) taken.push({ repo, phat, previous });
+      }
+      return taken;
+    },
+    close,
+  };
+}
+
+/** "owner/x is watched by pid 123 (phat-mode watch owner/x)" */
+export function watchedBy(repo: string, holder: LockInfo): string {
+  return `${repo} is watched by pid ${holder.pid} (${holder.command})`;
+}
+
+/** "Now watching owner/x: pid 123 (phat-mode watch owner/x) has stopped." */
+export function takenOver(repo: string, previous: LockInfo): string {
+  return `Now watching ${repo}: pid ${previous.pid} (${previous.command}) has stopped.`;
 }
