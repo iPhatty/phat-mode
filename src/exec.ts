@@ -60,6 +60,10 @@ export function run(command: string, args: readonly string[], options: RunOption
         resolve(result);
       }
     });
+    // A command that exits before reading its input (most do) closes the pipe: EPIPE then is no error of the command's.
+    child.stdin.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EPIPE') reject(error);
+    });
     child.stdin.end(options.input ?? '');
   });
 }

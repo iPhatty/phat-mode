@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline/promises';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import type { TaskId } from '@earendil-works/pi-durable';
 import { setToolLogger } from './agents.ts';
+import { type CleanupOptions, cleanWorkspaces, describeRemoval, formatSize, removalText, totalBytes } from './cleanup.ts';
 import {
   type Config,
   DEFAULT_LABELS,
@@ -67,6 +68,9 @@ Usage:
   phat-mode status              List every project's runs and where they are; for a project another phat-mode process
                                 holds, what that process is doing
   phat-mode abort <issue>       Stop the run for an issue
+  phat-mode clean [--dry-run] [repo...]
+                                Remove the workspaces nothing needs any more (closed issues, shaped issues), in every
+                                project no other process holds. --dry-run: only say what it would remove
 
 <issue> is 12 (in the repo of this folder), owner/name#12, or the issue's URL. [repo] is owner/name.
 init options: --check "<command>"  --install "<command>"  --yes (accept what it detects)  --no-check (do not run it)
@@ -89,23 +93,45 @@ function repoConfigs(machine: MachineConfig) {
   };
 }
 
+/** A project's workspaces. `config`: a repo's settings; without them (cleaning up), enough to list and remove them. */
+function workspacesFor(project: Pick<Config, 'home' | 'repo'>, config?: Config): GitWorkspaces {
+  return new GitWorkspaces({
+    remoteUrl: `https://github.com/${project.repo}.git`,
+    // Cleaning up never checks anything out: the base branch is not needed, so the repo's settings are not read.
+    baseBranch: config?.baseBranch ?? 'main',
+    cloneDir: paths.repoClone(project),
+    workspaceDir: (issue) => paths.workspace(project, issue),
+    baseWorkspaceDir: paths.baseWorkspace(project),
+    shapeWorkspaceDir: (issue) => paths.shapeWorkspace(project, issue),
+    workspacesRoot: paths.workspacesRoot(project.home, project.repo),
+    ...(config === undefined ? {} : { installCommand: config.installCommand, installTimeoutMs: config.limits.installTimeoutMs }),
+  });
+}
+
 function servicesFor(config: Config): Services {
   return {
     config,
     logger: consoleLoggerFor(config.repo),
     github: new GhGitHub(config.repo),
-    workspaces: new GitWorkspaces({
-      remoteUrl: `https://github.com/${config.repo}.git`,
-      baseBranch: config.baseBranch,
-      cloneDir: paths.repoClone(config),
-      workspaceDir: (issue) => paths.workspace(config, issue),
-      baseWorkspaceDir: paths.baseWorkspace(config),
-      shapeWorkspaceDir: (issue) => paths.shapeWorkspace(config, issue),
-      installCommand: config.installCommand,
-      installTimeoutMs: config.limits.installTimeoutMs,
-    }),
+    workspaces: workspacesFor(config, config),
     checks: new CommandChecks(config.checkCommand, config.limits.checkTimeoutMs),
   };
+}
+
+/**
+ * Remove the project's workspaces nothing needs any more (src/cleanup.ts), holding its lock, and log each removal.
+ * Best effort: a problem is logged, and whatever called it goes on.
+ */
+async function cleanUp(phat: PhatMode, machine: MachineConfig, options: CleanupOptions = {}): Promise<void> {
+  const logger = consoleLoggerFor(phat.repo);
+  try {
+    const services = { github: new GhGitHub(phat.repo), workspaces: workspacesFor({ home: machine.home, repo: phat.repo }) };
+    const report = await cleanWorkspaces(phat, services, context, options);
+    for (const removal of report.removed) logger.step(removal.issue, removalText(removal));
+    for (const { issue, message } of report.errors) logger.error(`#${issue}: could not clean up its workspace: ${message}`);
+  } catch (error) {
+    logger.error(`Could not clean up workspaces: ${firstLine(error)}`);
+  }
 }
 
 /** Open one project: take its lock (LockedError when another process holds it) and its database. */
@@ -201,6 +227,8 @@ async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Pr
     repo: phat.repo,
     async next() {
       const repo = phat.repo;
+      // Workspaces nothing needs any more go first, under the project's lock, before any work starts.
+      await cleanUp(phat, machine);
       // Runs left interrupted: all of them go ahead, one at a time, in this project's one slot.
       const interrupted = await resumeInterrupted(phat, context, async (key, taskId) => {
         consoleLogger.info(`Resuming ${key}`);
@@ -568,7 +596,54 @@ async function reposFrom(args: string[], machine: MachineConfig): Promise<string
   return here === undefined ? [] : [here];
 }
 
-const COMMANDS = ['init', 'login', 'doctor', 'status', 'run', 'resume', 'watch', 'abort'];
+const COMMANDS = ['init', 'login', 'doctor', 'status', 'run', 'resume', 'watch', 'abort', 'clean'];
+
+/**
+ * Remove the workspaces nothing needs any more in `args`' projects (every known project when none are named), each
+ * under its lock; one another process holds is skipped (exit 1). `--dry-run`: say what would go, remove nothing.
+ */
+async function clean(machine: MachineConfig, args: string[]): Promise<number> {
+  const dryRun = args.includes('--dry-run');
+  const named = args.filter((arg) => arg !== '--dry-run');
+  const bad = named.filter((arg) => !isRepoName(arg));
+  if (bad.length > 0) throw new Error(`Not a repo (owner/name): ${bad.join(', ')}`);
+  const repos = named.length > 0 ? named : await knownProjects(machine);
+  if (repos.length === 0) {
+    console.log('No projects: none named, none in config.json "repos", and no runs.');
+    return 0;
+  }
+  const configFor = repoConfigs(machine);
+  let code = 0;
+  let total = 0;
+  for (const repo of repos) {
+    let phat: PhatMode;
+    try {
+      phat = await open(machine, repo, configFor);
+    } catch (error) {
+      if (!(error instanceof LockedError)) throw error;
+      console.error(`✖ ${repo} is held by ${describeHolder(error.holder)}; not cleaning it.`);
+      code = 1;
+      continue;
+    }
+    try {
+      const services = { github: new GhGitHub(repo), workspaces: workspacesFor({ home: machine.home, repo }) };
+      const report = await cleanWorkspaces(phat, services, context, { dryRun });
+      console.log(repo);
+      if (report.removed.length === 0) console.log(`  Nothing to ${dryRun ? 'remove' : 'clean up'}.`);
+      for (const removal of report.removed) console.log(`  ${describeRemoval(removal, dryRun)}`);
+      for (const name of report.unknown) console.log(`  left alone: ${name}`);
+      for (const { issue, message } of report.errors) {
+        console.log(`  ✖ #${issue}: could not clean up its workspace: ${message}`);
+        code = 1;
+      }
+      total += totalBytes(report.removed);
+    } finally {
+      await phat.close(context);
+    }
+  }
+  console.log(`${dryRun ? 'Would free' : 'Freed'} ${formatSize(total)}`);
+  return code;
+}
 
 /**
  * The database every project shared before (`state.sqlite`): archived once no run in it is unfinished. With unfinished
@@ -627,21 +702,25 @@ async function main(argv: string[]): Promise<number> {
       const phat = await open(machine, repo, configFor);
       closeOnCtrlC(() => [phat]);
       if (yolo) consoleLogger.info(YOLO_WARNING);
-      const runGoing = (await liveRuns(phat, context)).some((run) => run.key === `${repo}#${issue}`);
-      if (!yolo || (await runOrWait(github, issue, { runGoing })) === 'run') {
-        const { taskId, resumed } = await phat.start({ repo, issue }, context, kind);
-        consoleLogger.info(`${resumed ? 'Resuming' : kind === 'shape' ? 'Shaping' : 'Starting'} ${repo}#${issue}`);
-        phat.harness.resume();
-        const code = await waitAndReport(phat, taskId, `${repo}#${issue}`);
-        const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
-        if (!yolo || code !== 0 || outcome.status !== 'completed' || outcome.result.status !== 'pr_opened') {
-          await phat.close(context);
-          return code;
+      const runAndWait = async () => {
+        const runGoing = (await liveRuns(phat, context)).some((run) => run.key === `${repo}#${issue}`);
+        if (!yolo || (await runOrWait(github, issue, { runGoing })) === 'run') {
+          const { taskId, resumed } = await phat.start({ repo, issue }, context, kind);
+          consoleLogger.info(`${resumed ? 'Resuming' : kind === 'shape' ? 'Shaping' : 'Starting'} ${repo}#${issue}`);
+          phat.harness.resume();
+          const code = await waitAndReport(phat, taskId, `${repo}#${issue}`);
+          const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
+          if (!yolo || code !== 0 || outcome.status !== 'completed' || outcome.result.status !== 'pr_opened') return code;
         }
+        return yoloWait(github, issue, machine.watchIntervalMs);
+      };
+      try {
+        return await runAndWait();
+      } finally {
+        // The issue's workspace, if nothing needs it now: e.g. merged by --yolo, or the issue was shaped.
+        await cleanUp(phat, machine, { issue });
+        await phat.close(context);
       }
-      const code = await yoloWait(github, issue, machine.watchIntervalMs);
-      await phat.close(context);
-      return code;
     }
     case 'resume': {
       // Projects with a database are the only ones with runs to resume. One another process holds is skipped.
@@ -686,6 +765,8 @@ async function main(argv: string[]): Promise<number> {
       }
       return watch(machine, repos, yolo);
     }
+    case 'clean':
+      return clean(machine, args);
     case 'abort': {
       if (args[0] === undefined) {
         console.error('Usage: phat-mode abort <issue>');

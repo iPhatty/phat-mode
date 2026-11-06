@@ -66,7 +66,7 @@ import {
   verifyPrompt,
 } from './prompts.ts';
 import { askForReport, failureGuard, type OnPhase, perRepo, phasesWith, StepFailure } from './task-kit.ts';
-import { type Checks, EVIDENCE_BRANCH, tail, type Workspaces } from './workspace.ts';
+import { type Checks, EVIDENCE_BRANCH, scratchFor, tail, type Workspaces } from './workspace.ts';
 import { verdictFor, yoloMarker } from './yolo.ts';
 
 export type Services = {
@@ -135,8 +135,6 @@ const MARKERS = { plan: commentMarker('plan'), result: commentMarker('result') }
 /** A parent issue is background; long specs (PRDs) are cut so they do not crowd out the issue itself. */
 const PARENT_MAX_CHARS = 20_000;
 
-/** Where the planner and implementer keep downloads and working files: next to the workspace, never committed. */
-export const scratchFor = (workspace: string) => `${workspace}-scratch`;
 
 const NO_VERIFY_SKILL =
   'This repo has no verification skill (a `verify-*` skill in `.agents/skills`, `.claude/skills` or `.cursor/skills`). Create one with `/create-verification-skill` (`phat-mode init` installs it).';

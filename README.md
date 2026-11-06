@@ -15,7 +15,7 @@ vague issue labelled agent-mode   →  phat-mode watch shapes it    →  tickets
 
 Or skip the skills: label a rough issue you opened `agent-mode`, and phat-mode shapes it into a spec and tickets itself, with no human answering questions. See [Agent mode](#agent-mode).
 
-1. **Prepare**: only works on issues that are open, labelled `ready-for-agent`, specified by a trusted author, and not blocked by open issues. Anything else is left alone, with no reply. Labels it `phat-mode:working` and checks out branch `phat-mode/issue-12` in its own workspace.
+1. **Prepare**: only works on issues that are open, labelled `ready-for-agent`, specified by a trusted author, and not blocked by open issues. Anything else is left alone, with no reply. Labels it `phat-mode:working` and checks out branch `phat-mode/issue-12` in its own workspace, always fresh from the base branch (see [Workspaces](#workspaces)).
 2. **Plan** (AI, Claude Opus 5.5): reads the spec and the code, and plans *how* to build it, with Matt Pocock's `codebase-design` skill as its standing skill (see [Skills](#skills)). The plan carries its **test seams**: each one the public interface under test, what testing there catches and what it misses. A plan to proceed without seams must say why (for example, docs only), or phat-mode rejects it and the planner reports again. The plan request also lists **what changed since the ticket was written**: the ADRs (with their titles) and glossary changes (`GLOSSARY.md`, `CONTEXT.md`) added or changed on the base branch since the spec was written (the Agent Brief's time, else the `shaped-at` time, else the issue's creation time), each with its commit's short sha and subject, or says nothing changed. The planner follows a later constraint the ticket doesn't mention, and reports `needs_info` naming the conflict where a later change contradicts the ticket. The plan also carries its **silent decisions**: each question the spec leaves open that the plan answers, with the decision and why. A plan to proceed without any must say why the spec settles everything, or it is rejected the same way. The plan comment on the issue lists the seams, then the silent decisions under **Decided where the ticket was silent**. Why: [ADR 0005](docs/adr/0005-silent-decisions-agreed-with-the-implementer-and-checked-by-the-spec-reviewer.md). If the spec has a gap, it posts triage notes and moves the issue back to `needs-info`. If an agent shouldn't do it, it moves it to `ready-for-human`.
 3. **Implement** (AI, Claude Opus 5.5): changes the code and adds tests, following Matt Pocock's `tdd` skill as its standing skill, test-first at the plan's seams, which its request lists as the agreed seams (see [Skills](#skills)). Its request lists the silent decisions as **agreed decisions**: it follows them, or reports each one the change does not follow as a **departure** in `report_done`, with what it does instead and why.
 4. **Verify** (code, not AI): runs `npm run check`. On failure, the output goes back to the implementer (up to 3 times).
@@ -105,12 +105,13 @@ Each time [`watch`](#watch) looks at a repo, after finishing any run still going
 
 Up to [`maxParallelRuns`](#parallel-runs) runs at once (default 1: one at a time), at most one per repo. The rules below apply per repo: a PR waiting for you in one repo does not hold up the others. Each time it looks at a repo with no run going, it:
 
-1. finishes any run left interrupted (e.g. by a crash or Ctrl-C);
-2. closes every open `phat-mode:shaped` Parent whose sub-issues (its tickets) are all closed, with a summary comment listing them. A shaped issue with no sub-issues (shaped into one ticket) closes when its own PR merges;
-3. [shapes](#agent-mode) the **lowest-numbered `agent-mode` issue that may be shaped**, before any build and even while a PR waits for you to merge it, so its tickets are ready by the time building can go on. An `agent-mode` issue that cannot be shaped is said among the waiting lines, once; one that is refused (already shaped, or also carrying a triage state label) also gets the same comment as `run` posts, once;
-4. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge (with [`--yolo`](#yolo), it merges the ones it can first, lowest issue first, and says why it does not merge the others);
-5. hands an issue to a human if its PR was closed without merging (`ready-for-human`, with a comment; label it `ready-for-agent` again to retry);
-6. starts the **lowest-numbered issue that is ready and not blocked**: open, `ready-for-agent`, not `agent-mode`, specified by a trusted author, no open blockers, and not `phat-mode:working` or `phat-mode:done`. `phat-mode:failed` with `ready-for-agent` again means: try again.
+1. removes the [workspaces](#workspaces) nothing needs any more (closed issues, shaped issues), holding the repo's lock, and logs each one with the space freed, e.g. `lingo#72  ▸ removed workspace (785 MB)`;
+2. finishes any run left interrupted (e.g. by a crash or Ctrl-C);
+3. closes every open `phat-mode:shaped` Parent whose sub-issues (its tickets) are all closed, with a summary comment listing them. A shaped issue with no sub-issues (shaped into one ticket) closes when its own PR merges;
+4. [shapes](#agent-mode) the **lowest-numbered `agent-mode` issue that may be shaped**, before any build and even while a PR waits for you to merge it, so its tickets are ready by the time building can go on. An `agent-mode` issue that cannot be shaped is said among the waiting lines, once; one that is refused (already shaped, or also carrying a triage state label) also gets the same comment as `run` posts, once;
+5. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge (with [`--yolo`](#yolo), it merges the ones it can first, lowest issue first, and says why it does not merge the others);
+6. hands an issue to a human if its PR was closed without merging (`ready-for-human`, with a comment; label it `ready-for-agent` again to retry);
+7. starts the **lowest-numbered issue that is ready and not blocked**: open, `ready-for-agent`, not `agent-mode`, specified by a trusted author, no open blockers, and not `phat-mode:working` or `phat-mode:done`. `phat-mode:failed` with `ready-for-agent` again means: try again.
 
 Merging a PR closes its issue (`Closes #N`), which unblocks the issues that wait for it, so blockers set up as GitHub issue dependencies or `Blocked by` lines give the order. When nothing can start, it says why, once: e.g. `#9 is blocked by #18 (ready-for-human)`.
 
@@ -268,6 +269,7 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 | `phat-mode resume` | Continue every interrupted run, building or shaping, in every project no other process holds (a held one is named and skipped, and the exit code is 1). |
 | `phat-mode status` | List every project (your `repos`, and any other with runs) and its runs: shaping or building, and where they are. For a project another process holds, what that process is doing, from its lock file. |
 | `phat-mode abort <issue>` | Stop a run. |
+| `phat-mode clean [--dry-run] [repo…]` | Remove the [workspaces](#workspaces) nothing needs any more, in the named projects or every known one (your `repos`, and any other with runs). Prints each removal and the total space freed; lists folders it does not know and leaves them alone. A project another process holds is named and skipped (exit 1). `--dry-run` prints the same plan and removes nothing. |
 | `phat-mode doctor [repo]` | Check git, gh, the Copilot login, the models, and each repo's settings, access and labels. |
 
 `<issue>` is `12` (an issue in the repo of the current folder), `owner/name#12`, or the issue's URL; `[repo]` is `owner/name`. Without the link, `node src/cli.ts …` in this folder does the same.
@@ -276,11 +278,36 @@ Ctrl-C is always safe: progress is saved, and `run` or `resume` continues from t
 
 ### Projects: locks and databases
 
-Each project (repo) has its own **lock** (`locks/<owner>__<name>.lock` in phat-mode's home) and its own **durable database** (`state/<owner>__<name>.sqlite`). Pi Durable storage has no cross-process locking, so a process opens a project's database only while it holds that project's lock: different phat-mode processes can work on different projects at once, never on the same one. A `watch` skips the projects another process holds and takes them over when it stops ([Several watches](#several-watches)); `run`, `resume` and `abort` on a project another process holds exit 1 with e.g. ``owner/x is held by pid 123 (`phat-mode watch`, since 10:04:12)``. A lock left by a crashed process is taken over automatically (a lock is a small folder of holder files; never edit it while phat-mode runs). Why: [ADR 0004](docs/adr/0004-one-lock-and-one-durable-database-per-project.md).
+Each project (repo) has its own **lock** (`locks/<owner>__<name>.lock` in phat-mode's home) and its own **durable database** (`state/<owner>__<name>.sqlite`). Pi Durable storage has no cross-process locking, so a process opens a project's database only while it holds that project's lock: different phat-mode processes can work on different projects at once, never on the same one. A `watch` skips the projects another process holds and takes them over when it stops ([Several watches](#several-watches)); `run`, `resume`, `abort` and `clean` on a project another process holds exit 1 with e.g. ``owner/x is held by pid 123 (`phat-mode watch`, since 10:04:12)``. A lock left by a crashed process is taken over automatically (a lock is a small folder of holder files; never edit it while phat-mode runs). Why: [ADR 0004](docs/adr/0004-one-lock-and-one-durable-database-per-project.md).
 
 The lock file says who holds the project (pid, command, since when) and what it is doing right now (issue, build or shaping, phase), kept current as the run moves on. That is what `status` shows for a held project, e.g. `held by pid 123 (…): doing #12 build (implement)`, without opening its database.
 
 Writes to `auth.json` (Copilot token refreshes) are locked across processes too, and each re-reads the file first, so one process never overwrites a newer token with an older one.
+
+### Workspaces
+
+Each project's workspaces live in `workspaces/<owner>__<name>/` in phat-mode's home:
+
+- `issue-<n>`: a build's git worktree, on branch `phat-mode/issue-<n>`, with its own installed dependencies (often most of its size), and `issue-<n>-scratch`, the planner's and implementer's scratch folder;
+- `shape-<n>`: shaping's read-only, detached checkout of the base branch;
+- `base`: the base branch checkout for "before" evidence, one per repo. It is never removed, and neither is the evidence (`evidence/`, outside `workspaces/`).
+
+**Created**: a new build run's prepare step always starts from a fresh checkout of the base branch: it removes any worktree and scratch folder an earlier run of the issue left (an aborted or failed one, say), then creates the worktree and runs `installCommand`. Nothing an earlier run left on the branch or in its scratch folder carries over. A resumed run keeps the workspace it made. Shaping resets `shape-<n>` each time it starts.
+
+**Kept** while anything can need them:
+
+- while a run for the issue, building or shaping, is still going or unfinished (resumable);
+- while the issue is open;
+- after a build that fails or hands the issue back (`needs-info`, `ready-for-human`, `phat-mode:failed`), and after a shaping run that fails or hands it back, until the issue is closed, so you can look at what it did.
+
+**Removed** once nothing can need them:
+
+- `issue-<n>` and `issue-<n>-scratch`: once issue #n is closed (its PR merged with `Closes #n`, or closed by hand) and no run for it is unfinished;
+- `shape-<n>`: once its shaping run has shaped the issue (into one ticket or several), or once the issue is closed.
+
+**Who removes them**: `watch` on each look at a project, holding its lock, before it starts anything; `run`, for the issue it just finished (e.g. after `run --yolo` merged it); and `phat-mode clean`, for the workspaces that have built up. Each removal is logged with the issue and the space freed, e.g. `#72: removed workspace (785 MB)`.
+
+**How**: a worktree is removed through git (`git worktree remove --force`, then `git worktree prune`), so the clone's worktree list stays right; a shaping checkout gets write permission back first. Nothing outside the project's `workspaces/<owner>__<name>/` is ever removed, and symlinks are never followed out of it (a workspace that is itself a symlink loses only the link). If `workspaces/` or `workspaces/<owner>__<name>` itself is a symlink (phat-mode's home is the trusted boundary), phat-mode lists and removes nothing through it, and a new build run refuses to start there. The local `phat-mode/issue-<n>` branch stays in the clone.
 
 ### Upgrading from one shared database
 
@@ -350,7 +377,7 @@ Every agent uses `defaultModel` (built in: **Claude Opus 5.5, medium thinking**)
 - `phat-mode doctor` shows the model each role uses and checks it is on your Copilot account.
 - A run keeps the models it started with, also when resumed. New runs use the new config.
 
-`~/.phat-mode/` also holds each project's database (`state/<owner>__<name>.sqlite`) and lock (`locks/<owner>__<name>.lock`), the Copilot login (`auth.json`, owner-only), and per repo the clone, workspaces (`workspaces/<owner>__<name>/issue-<n>`, and `shape-<n>` for shaping) and evidence.
+`~/.phat-mode/` also holds each project's database (`state/<owner>__<name>.sqlite`) and lock (`locks/<owner>__<name>.lock`), the Copilot login (`auth.json`, owner-only), and per repo the clone, workspaces (`workspaces/<owner>__<name>/issue-<n>` and `issue-<n>-scratch`, `shape-<n>` for shaping, and `base`) and evidence. Workspaces go once nothing needs them; see [Workspaces](#workspaces).
 
 Set the environment variable **`PHAT_MODE_HOME`** to move that home (config.json, state, `auth.json`, clones, workspaces, evidence) somewhere other than `~/.phat-mode`, e.g. `PHAT_MODE_HOME=~/pm2 phat-mode watch`.
 
@@ -377,7 +404,7 @@ Set the environment variable **`PHAT_MODE_HOME`** to move that home (config.json
 - `src/code-review.ts`: reads phat-mode's pinned code-review skill, finds standards sources, and decides what must be fixed.
 - `src/yolo.ts`: `--yolo`: the verdict a run writes on its PR, and whether and when to merge it. `src/watch.ts`: what `watch` does next.
 - `src/agents.ts`: the build agents (planner, implementer, Standards and Spec reviewers, verifier) and shaping's answerer and questioner, their tools, the report tools agents finish with, and the guard hook.
-- `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code, including the ADR and glossary changes listed for the planner.
+- `src/workspace.ts` / `src/github.ts`: git and GitHub, called only by pipeline code, including the ADR and glossary changes listed for the planner, and removing workspaces safely. `src/cleanup.ts`: when a workspace goes (`watch`, `run` and `clean`).
 - `src/harness.ts`: opens one project: takes its lock, then its database, and keeps the lock file's "doing" current. `src/lock.ts`: the locks. `src/projects.ts`: what `status` shows per project, and retiring the old shared database.
 - Issue comments carry hidden markers, so a rerun updates its comment instead of posting again.
 

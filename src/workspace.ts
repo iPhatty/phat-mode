@@ -1,14 +1,41 @@
 import { createHash } from 'node:crypto';
-import { access, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { branchFor } from './config.ts';
 import { CommandError, run, runShell, type RunResult } from './exec.ts';
 
+/** Where the planner and implementer keep downloads and working files: next to the workspace, never committed. */
+export const scratchFor = (workspace: string) => `${workspace}-scratch`;
+
+/**
+ * What a folder in a project's workspaces folder is, by its name: an issue's build workspace (`issue-<n>`), its scratch
+ * folder (`issue-<n>-scratch`), its shaping checkout (`shape-<n>`), the "before" evidence checkout (`base`), or unknown.
+ */
+export type WorkspaceFolder = { name: string; kind: 'build' | 'scratch' | 'shape' | 'base' | 'unknown'; issue?: number };
+
+/** What `remove` takes away: an issue's build workspace with its scratch folder, or its shaping checkout. */
+export type WorkspaceTarget = { kind: 'build' | 'shape'; issue: number };
+
+/** The folders `remove` took away (or would, on a dry run), and their size on disk. */
+export type WorkspaceRemoval = { paths: string[]; bytes: number };
+
 /** Git work for one issue. Pipeline code calls these, never the model. */
 export interface Workspaces {
-  /** Clone or update the repository and check out the issue's branch in its own directory. Safe to repeat. */
+  /**
+   * Clone or update the repository and check out the issue's branch, fresh from the base branch, in its own directory:
+   * any workspace and scratch folder an earlier run left for the issue are removed first. Only a new run calls it (a
+   * resumed run keeps the workspace it made), so nothing an earlier run left carries over.
+   */
   prepare(issue: number): Promise<string>;
+  /** Every entry directly in the project's workspaces folder, by kind. Empty when there is none. */
+  folders(): Promise<WorkspaceFolder[]>;
+  /**
+   * Remove an issue's build workspace (the git worktree, through git, and its scratch folder) or its shaping checkout.
+   * Never removes anything outside the project's workspaces folder, never follows a symlink out of it, and keeps the
+   * issue's branch. `dryRun`: only measure. Returns the folders that were there, and their size.
+   */
+  remove(target: WorkspaceTarget, options?: { dryRun?: boolean }): Promise<WorkspaceRemoval>;
   /**
    * The commit of the base branch the work is based on: where the branch last met it (`git merge-base`). Fixed while
    * `origin/<base>` moves on, until the base branch is merged in, so reviewers never see newer commits on it as part of
@@ -109,6 +136,11 @@ export type GitWorkspacesOptions = {
   baseWorkspaceDir?: string;
   /** The checkout for shaping an issue. Default: `shape-<issue>` next to the issue's workspace. */
   shapeWorkspaceDir?: (issue: number) => string;
+  /**
+   * The project's workspaces folder, `workspaces/<owner>__<name>/`: the only place `remove` removes anything from.
+   * Default: the folder of `workspaceDir`'s workspaces.
+   */
+  workspacesRoot?: string;
   installCommand?: string;
   installTimeoutMs?: number;
 };
@@ -118,6 +150,33 @@ const exists = (path: string) =>
     () => true,
     () => false,
   );
+
+/**
+ * The names phat-mode gives an issue's folders: `issue-<n>` (build), `issue-<n>-scratch` (scratch), `shape-<n>`
+ * (shape). Undefined for any other name. The only names `remove` ever removes.
+ */
+function parseIssueFolder(name: string): { kind: 'build' | 'scratch' | 'shape'; issue: number } | undefined {
+  const match = /^(issue-(\d+)(-scratch)?|shape-(\d+))$/.exec(name);
+  if (match === null) return undefined;
+  if (match[4] !== undefined) return { kind: 'shape', issue: Number(match[4]) };
+  return { kind: match[3] === undefined ? 'build' : 'scratch', issue: Number(match[2]) };
+}
+
+/** A folder's kind, by its name. `base`: the name of the "before" evidence checkout. */
+export function classifyFolder(name: string, base = 'base'): WorkspaceFolder {
+  if (name === base) return { name, kind: 'base' };
+  return { name, ...(parseIssueFolder(name) ?? { kind: 'unknown' }) };
+}
+
+const missingAsUndefined = <T>(promise: Promise<T>): Promise<T | undefined> =>
+  promise.catch((error: NodeJS.ErrnoException) => (error.code === 'ENOENT' ? undefined : Promise.reject(error)));
+
+/** Size on disk of `path`, without following symlinks (`du` does not); 0 when it is gone. */
+async function sizeOf(path: string): Promise<number> {
+  const du = await run('du', ['-sk', path], { allowFailure: true });
+  const kilobytes = Number.parseInt(du.stdout.trim().split(/\s/)[0] ?? '', 10);
+  return Number.isFinite(kilobytes) ? kilobytes * 1024 : 0;
+}
 
 export class GitWorkspaces implements Workspaces {
   readonly #options: GitWorkspacesOptions;
@@ -173,9 +232,95 @@ export class GitWorkspaces implements Workspaces {
     return this.#detachedCheckout(this.#baseDir, ref);
   }
 
-  async prepareShaping(issue: number): Promise<string> {
+  #shapeDir(issue: number): string {
     const { shapeWorkspaceDir, workspaceDir } = this.#options;
-    const dir = shapeWorkspaceDir?.(issue) ?? join(dirname(workspaceDir(issue)), `shape-${issue}`);
+    return shapeWorkspaceDir?.(issue) ?? join(dirname(workspaceDir(issue)), `shape-${issue}`);
+  }
+
+  get #root(): string {
+    return this.#options.workspacesRoot ?? dirname(this.#options.workspaceDir(0));
+  }
+
+  async folders(): Promise<WorkspaceFolder[]> {
+    const root = await this.#trustedRoot();
+    if (root === undefined) return [];
+    const names = await readdir(root);
+    const base = basename(this.#baseDir);
+    return names.sort().map((name) => classifyFolder(name, base));
+  }
+
+  async remove(target: WorkspaceTarget, options: { dryRun?: boolean } = {}): Promise<WorkspaceRemoval> {
+    const workspace = this.#options.workspaceDir(target.issue);
+    const candidates = target.kind === 'build' ? [workspace, scratchFor(workspace)] : [this.#shapeDir(target.issue)];
+    const removal: WorkspaceRemoval = { paths: [], bytes: 0 };
+    for (const path of candidates) {
+      const entry = await this.#checked(path);
+      if (entry === undefined) continue;
+      removal.paths.push(path);
+      if (!entry.isSymbolicLink()) removal.bytes += await sizeOf(path);
+      if (!options.dryRun) await this.#removePath(path, entry.isSymbolicLink());
+    }
+    return removal;
+  }
+
+  /**
+   * What is at `path`, without following it; undefined when nothing is. Throws unless `path` is directly in the
+   * project's workspaces folder (its real location, symlinks resolved) under a name `remove` may remove.
+   */
+  async #checked(path: string) {
+    if (parseIssueFolder(basename(path)) === undefined) throw new Error(`Not a workspace phat-mode removes: ${path}`);
+    const root = await this.#trustedRoot();
+    if (root === undefined) return undefined;
+    if ((await missingAsUndefined(realpath(dirname(path)))) !== root) throw new Error(`Not in ${this.#root}: ${path}`);
+    return missingAsUndefined(lstat(path));
+  }
+
+  /**
+   * The real path of the project's workspaces folder (`<home>/workspaces/<owner>__<name>`); undefined when there is
+   * none. `<home>` is the trusted boundary: the `workspaces` and `<owner>__<name>` folders below it must each be a real
+   * folder of its own, never a symlink, or this throws, so nothing is ever listed or removed through a redirection.
+   */
+  async #trustedRoot(): Promise<string | undefined> {
+    const root = this.#root;
+    const parent = dirname(root);
+    const home = dirname(parent);
+    for (const dir of [parent, root]) {
+      const entry = await missingAsUndefined(lstat(dir));
+      if (entry === undefined) return undefined;
+      if (entry.isSymbolicLink() || !entry.isDirectory()) {
+        throw new Error(`${dir} is a symlink or not a folder: phat-mode lists and removes nothing in ${root}`);
+      }
+    }
+    const real = await realpath(root);
+    const expected = join(await realpath(home), basename(parent), basename(root));
+    if (real !== expected) {
+      throw new Error(`${root} resolves to ${real}, through a symlink: phat-mode lists and removes nothing in it`);
+    }
+    return real;
+  }
+
+  /**
+   * Remove a checked path. A symlink: only the link. A folder: write permission back on its folders (a shaping checkout
+   * is read-only; `find -type d` never matches a symlink, so nothing outside is touched), a worktree removed through git,
+   * then whatever is left (`rm` does not follow symlinks), and the clone's worktree list pruned. Branches stay.
+   */
+  async #removePath(path: string, symlink: boolean): Promise<void> {
+    if (symlink) {
+      await unlink(path);
+      return;
+    }
+    const { cloneDir } = this.#options;
+    await run('find', [path, '-type', 'd', '!', '-perm', '-u+w', '-exec', 'chmod', 'u+w', '{}', '+'], { allowFailure: true });
+    const clone = await exists(join(cloneDir, '.git'));
+    if (clone && (await exists(join(path, '.git')))) {
+      await this.#git(cloneDir, ['worktree', 'remove', '--force', '--force', path], true);
+    }
+    await rm(path, { recursive: true, force: true });
+    if (clone) await this.#git(cloneDir, ['worktree', 'prune']);
+  }
+
+  async prepareShaping(issue: number): Promise<string> {
+    const dir = this.#shapeDir(issue);
     // Writable while it is reset and installed, read-only for the agents.
     await this.#setReadOnly(dir, false);
     await this.#detachedCheckout(dir);
@@ -272,12 +417,12 @@ export class GitWorkspaces implements Workspaces {
     const cloneDir = await this.#ensureClone();
 
     const workspace = this.#options.workspaceDir(issue);
-    if (!(await exists(join(workspace, '.git')))) {
-      await mkdir(dirname(workspace), { recursive: true });
-      await this.#git(cloneDir, ['worktree', 'prune']);
-      await this.#git(cloneDir, ['worktree', 'add', '-B', branchFor(issue), workspace, this.#base]);
-    }
-    if (!(await exists(join(workspace, 'node_modules')))) await this.#install(workspace);
+    // A fresh start: whatever an earlier run of this issue left, on its branch or in its scratch folder, goes.
+    await this.remove({ kind: 'build', issue });
+    await mkdir(dirname(workspace), { recursive: true });
+    await this.#git(cloneDir, ['worktree', 'prune']);
+    await this.#git(cloneDir, ['worktree', 'add', '-B', branchFor(issue), workspace, this.#base]);
+    await this.#install(workspace);
     return workspace;
   }
 
