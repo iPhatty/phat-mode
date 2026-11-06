@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { type ChildProcess, spawn } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
@@ -57,4 +57,25 @@ test('`phat-mode watch owner/x` while another process watches owner/x: names the
   const { code, output } = await phatMode(home, ['watch', 'owner/x']);
   assert.match(output, new RegExp(`owner/x is watched by pid ${other.pid} \\(phat-mode watch\\)`));
   assert.equal(code, 1);
+});
+
+test('`phat-mode clean owner/x` while another process holds owner/x: names the holder, cleans nothing and exits 1', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'phat-mode-clean-'));
+  homes.push(home);
+  const other = await holder(paths.projectLock(home, 'owner/x'), 'phat-mode watch owner/x');
+  const workspace = paths.workspace({ home, repo: 'owner/x' }, 3);
+  await mkdir(workspace, { recursive: true });
+  const { code, output } = await phatMode(home, ['clean', 'owner/x']);
+  assert.match(output, new RegExp(`owner/x is held by pid ${other.pid} \\(\`phat-mode watch owner/x\``));
+  assert.match(output, /not cleaning it/);
+  assert.equal(code, 1);
+  await access(workspace);
+});
+
+test('`phat-mode --help` lists clean', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'phat-mode-help-'));
+  homes.push(home);
+  const { code, output } = await phatMode(home, ['--help']);
+  assert.equal(code, 0);
+  assert.match(output, /phat-mode clean \[--dry-run\] \[repo\.\.\.\]/);
 });

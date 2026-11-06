@@ -278,14 +278,16 @@ export const paths = {
   /** Taken by this version while it retires the old database, so only one process at a time does. */
   retireLock: (home: string) => join(home, 'locks', 'state.sqlite.lock'),
   credentials: (config: Pick<Config, 'home'>) => join(config.home, 'auth.json'),
-  repoClone: (config: Config) => join(config.home, 'repos', config.repo.replace('/', '__')),
-  workspace: (config: Config, issue: number) =>
-    join(config.home, 'workspaces', config.repo.replace('/', '__'), `issue-${issue}`),
+  repoClone: (config: Pick<Config, 'home' | 'repo'>) => join(config.home, 'repos', config.repo.replace('/', '__')),
+  /** A project's workspaces folder: its issues' workspaces, scratch folders and shaping checkouts, and `base`. */
+  workspacesRoot: (home: string, repo: string) => join(home, 'workspaces', repo.replace('/', '__')),
+  workspace: (config: Pick<Config, 'home' | 'repo'>, issue: number) =>
+    join(paths.workspacesRoot(config.home, config.repo), `issue-${issue}`),
   /** The read-only checkout of the base branch that shaping's agents explore. */
-  shapeWorkspace: (config: Config, issue: number) =>
-    join(config.home, 'workspaces', config.repo.replace('/', '__'), `shape-${issue}`),
+  shapeWorkspace: (config: Pick<Config, 'home' | 'repo'>, issue: number) =>
+    join(paths.workspacesRoot(config.home, config.repo), `shape-${issue}`),
   /** The base branch checkout, for "before" evidence. */
-  baseWorkspace: (config: Config) => join(config.home, 'workspaces', config.repo.replace('/', '__'), 'base'),
+  baseWorkspace: (config: Pick<Config, 'home' | 'repo'>) => join(paths.workspacesRoot(config.home, config.repo), 'base'),
   /** phat-mode's copies of verification evidence, kept until published. */
   evidence: (config: Config, issue: number) =>
     join(config.home, 'evidence', config.repo.replace('/', '__'), `issue-${issue}`),
