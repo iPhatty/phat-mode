@@ -1,0 +1,11 @@
+This folder contains unmodified copies of two files from the Elephant-Goldfish Model:
+
+  https://github.com/google/elephant-goldfish-model
+  at commit 6a8001ea31ccf72430ba0603a467ec6df9f69dd7
+
+  agents/implementation_readiness.md
+  resources/document_standards/implementation-readiness-standard.md
+
+They are licensed under the Apache License, Version 2.0 (see LICENSE in this folder).
+The upstream repository had no NOTICE file at that commit. The files are unmodified copies;
+README.md and this NOTICE were added by phat-mode.

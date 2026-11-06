@@ -1,0 +1,26 @@
+{
+  "repo": "o/r",
+  "number": 1,
+  "silentDecisionsRecorded": true,
+  "departuresRecorded": true,
+  "gaps": [
+    { "id": "G1", "severity": "Blocker", "real": true, "outcome": "handled", "visible": "plan", "inSilentDecisions": true, "evidence": "Plan decision 1 settles it." },
+    { "id": "G2", "severity": "Major", "real": true, "outcome": "handled", "visible": "pr", "inSilentDecisions": false, "evidence": "PR summary explains it." },
+    { "id": "G3", "severity": "Major", "real": true, "outcome": "guessed", "visible": "code-only", "inSilentDecisions": false, "evidence": "src/x.ts picks a timeout ADR 0001 forbids." },
+    { "id": "G4", "severity": "Major", "real": false, "outcome": null, "visible": null, "inSilentDecisions": false, "evidence": "The ticket's second criterion answers it." }
+  ],
+  "adrs": [
+    { "path": "docs/adr/0001-timeouts.md", "relevant": true, "followed": "yes", "evidence": "Uses the shared timeout." },
+    { "path": "docs/adr/0002-colours.md", "relevant": false, "followed": null, "evidence": "UI only." }
+  ],
+  "departures": [
+    { "decision": "Newest first.", "justified": true, "caughtBySpecReviewer": null, "evidence": "The UI needed it." },
+    { "decision": "Retry three times.", "justified": false, "caughtBySpecReviewer": false, "evidence": "No reason given; review passed it." }
+  ],
+  "silentDecisions": [
+    { "decision": "Use the cache.", "sound": true, "followed": true, "reportedAsDeparture": null, "passedBySpecReviewer": null, "evidence": "src/cache.ts" },
+    { "decision": "Newest first.", "sound": true, "followed": false, "reportedAsDeparture": true, "passedBySpecReviewer": null, "evidence": "Reported." },
+    { "decision": "Store tokens in plain text.", "sound": false, "followed": true, "reportedAsDeparture": null, "passedBySpecReviewer": true, "evidence": "Conflicts with ADR 0001; review raised nothing." },
+    { "decision": "Log every request.", "sound": true, "followed": false, "reportedAsDeparture": false, "passedBySpecReviewer": false, "evidence": "The Spec reviewer flagged it." }
+  ]
+}
