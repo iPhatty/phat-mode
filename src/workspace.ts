@@ -85,6 +85,17 @@ const isAdrPath = (path: string) => /(^|\/)docs\/adr\/[^/]+\.md$/.test(path) && 
 /** The files that count as changed domain docs: ADRs and glossaries. Other docs change in nearly every commit. */
 const isDocPath = (path: string) => isAdrPath(path) || ['GLOSSARY.md', 'CONTEXT.md'].includes(basename(path));
 
+/**
+ * One line of `git log --name-status --diff-filter=AMR` (`M\tpath`, `R087\told\tnew`) as a domain doc change, or
+ * undefined when it is not an ADR or glossary. A rename counts as added, at its new path.
+ */
+export function docChangeOf(line: string): { path: string; kind: 'added' | 'changed'; doc: 'adr' | 'glossary' } | undefined {
+  const [status = '', ...paths] = line.split('\t');
+  const path = paths.at(-1);
+  if (path === undefined || !isDocPath(path)) return undefined;
+  return { path, kind: status.startsWith('M') ? 'changed' : 'added', doc: isAdrPath(path) ? 'adr' : 'glossary' };
+}
+
 /** `source`: a local file. `path`: where it goes on the evidence branch. */
 export type EvidenceFile = { source: string; path: string };
 
@@ -288,11 +299,10 @@ export class GitWorkspaces implements Workspaces {
       const [full = '', sha = '', committed = '', subject = ''] = header.split('\x1f');
       if (!(Date.parse(committed) > after)) continue;
       for (const line of files) {
-        const [status = '', ...paths] = line.split('\t');
-        const path = paths.at(-1);
-        if (path === undefined || !isDocPath(path)) continue;
-        const kind = status.startsWith('M') ? 'changed' : 'added';
-        const title = isAdrPath(path) ? await this.#adrTitle(workspace, full, path) : undefined;
+        const change = docChangeOf(line);
+        if (change === undefined) continue;
+        const { path, kind } = change;
+        const title = change.doc === 'adr' ? await this.#adrTitle(workspace, full, path) : undefined;
         changes.push({ path, kind, ...(title === undefined ? {} : { title }), sha, subject });
       }
     }

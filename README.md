@@ -388,3 +388,5 @@ npm run check   # typecheck + tests
 ```
 
 The tests run the whole pipeline with a scripted fake model, a fake GitHub and real git, including a crash and restart in the middle of a run.
+
+[`evals/silent-decisions/`](evals/silent-decisions/) is an evaluation kit, run by hand, that measures how well silent decisions and departures catch the gaps in built tickets. It is not part of phat-mode's runtime; only its unit tests run with `npm test`.

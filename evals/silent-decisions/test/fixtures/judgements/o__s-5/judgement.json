@@ -1,0 +1,16 @@
+{
+  "repo": "o/s",
+  "number": 5,
+  "silentDecisionsRecorded": true,
+  "departuresRecorded": true,
+  "gaps": [
+    { "id": "G1", "severity": "Major", "real": true, "outcome": "handled", "visible": "plan", "inSilentDecisions": true, "evidence": "Decision 1." },
+    { "id": "G2", "severity": "Blocker", "real": true, "outcome": "handled", "visible": "plan", "inSilentDecisions": true, "evidence": "Decision 2." },
+    { "id": "G3", "severity": "Major", "real": true, "outcome": "missed", "visible": null, "inSilentDecisions": false, "evidence": "No migration for old rows." }
+  ],
+  "adrs": [],
+  "departures": [],
+  "silentDecisions": [
+    { "decision": "Keep the old column.", "sound": true, "followed": false, "reportedAsDeparture": false, "passedBySpecReviewer": true, "evidence": "Column dropped; not reported; review passed it." }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "repo": "o/r",
+  "number": 2,
+  "silentDecisionsRecorded": false,
+  "departuresRecorded": false,
+  "gaps": [
+    { "id": "G1", "severity": "Blocker", "real": true, "outcome": "missed", "visible": null, "inSilentDecisions": null, "evidence": "Errors are swallowed." },
+    { "id": "G2", "severity": "Major", "real": true, "outcome": "moot", "visible": null, "inSilentDecisions": null, "evidence": "The flag never ships." },
+    { "id": "G3", "severity": "Blocker", "real": true, "outcome": "handled", "visible": "plan", "inSilentDecisions": null, "evidence": "Plan step 2." }
+  ],
+  "adrs": [
+    { "path": "docs/adr/0003-locks.md", "relevant": true, "followed": "partly", "evidence": "Takes the lock, never releases it on error." }
+  ],
+  "departures": [],
+  "silentDecisions": []
+}
