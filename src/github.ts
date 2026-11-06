@@ -16,6 +16,8 @@ export type Issue = {
   url: string;
   labels: string[];
   comments: Comment[];
+  /** When the issue was opened: when its spec was written, unless a brief or shaping says otherwise. */
+  createdAt: string;
 };
 
 export type PullRequest = {
@@ -212,7 +214,7 @@ export class GhGitHub implements GitHub {
     const raw = JSON.parse(
       await this.#gh([
         'issue', 'view', String(issue), '-R', this.#repo,
-        '--json', 'number,title,body,author,state,url,labels,comments',
+        '--json', 'number,title,body,author,state,url,labels,comments,createdAt',
       ]),
     ) as {
       number: number;
@@ -223,6 +225,7 @@ export class GhGitHub implements GitHub {
       url: string;
       labels: { name: string }[];
       comments: { author: { login: string } | null; body: string; createdAt: string }[];
+      createdAt: string;
     };
     return {
       number: raw.number,
@@ -237,6 +240,7 @@ export class GhGitHub implements GitHub {
         body: comment.body,
         createdAt: comment.createdAt,
       })),
+      createdAt: raw.createdAt,
     };
   }
 

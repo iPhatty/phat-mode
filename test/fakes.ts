@@ -117,6 +117,8 @@ export class FakeGitHub implements GitHub {
       labels: ['enhancement', 'ready-for-agent'],
       comments: [],
       ...fields,
+      // A fixed past time: everything committed in a test comes after it.
+      createdAt: fields.createdAt ?? '2026-01-01T00:00:00Z',
     });
   }
   labels(number: number) {

@@ -12,6 +12,7 @@ import {
   findSpec,
   listUnder,
   parentRef,
+  shapedAtMarker,
   shapingEligibility,
   trustedComments,
 } from '../src/spec.ts';
@@ -65,6 +66,7 @@ const issue = (fields: Partial<Issue> = {}): Issue => ({
   url: '',
   labels: ['ready-for-agent'],
   comments: [],
+  createdAt: '2026-09-01T00:00:00Z',
   ...fields,
 });
 const comment = (author: string, body: string, createdAt = '2026-10-01T00:00:00Z') => ({ author, body, createdAt });
@@ -179,6 +181,34 @@ describe('findSpec', () => {
     assert.equal(spec?.source, 'brief');
     assert.equal(spec?.acceptanceCriteria.length, 3);
     assert.deepEqual(spec?.blockedBy, [4, 5, 6]);
+  });
+});
+
+describe('when the spec was written (writtenAt)', () => {
+  const trusted = ['iPhatty'];
+  const repo = 'iPhatty/phatty-lingo';
+  const shaped = `${shapedAtMarker('2026-09-15T08:00:00.000Z')}\n\n## Acceptance criteria\n\n- [ ] It works`;
+
+  test('an Agent Brief: the brief comment’s creation time, even on a shaped issue', () => {
+    const spec = findSpec(
+      issue({ body: shaped, createdAt: '2026-09-01T00:00:00Z', comments: [comment('iPhatty', TEMPLATE_BRIEF, '2026-10-02T12:30:00Z')] }),
+      trusted,
+      repo,
+    );
+    assert.equal(spec?.source, 'brief');
+    assert.equal(spec?.writtenAt, '2026-10-02T12:30:00Z');
+  });
+
+  test('a body shaping rewrote: its shaped-at time, not the issue’s creation time', () => {
+    const spec = findSpec(issue({ body: shaped, createdAt: '2026-09-01T00:00:00Z' }), trusted, repo);
+    assert.equal(spec?.source, 'issue');
+    assert.equal(spec?.writtenAt, '2026-09-15T08:00:00.000Z');
+  });
+
+  test('otherwise: the issue’s creation time', () => {
+    const spec = findSpec(issue({ body: TICKET_BODY, createdAt: '2026-09-01T00:00:00Z' }), trusted, repo);
+    assert.equal(spec?.source, 'issue');
+    assert.equal(spec?.writtenAt, '2026-09-01T00:00:00Z');
   });
 });
 

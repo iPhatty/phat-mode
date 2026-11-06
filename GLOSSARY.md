@@ -35,3 +35,11 @@ _Avoid_: Request skill, inline skill
 **Project lock**:
 The lock a process holds on one project (repo) while it has that project's durable database open; its file names the holder's pid and command and what it is doing (issue, kind, phase). See ADR 0004.
 _Avoid_: Global lock, state lock
+
+**Silent decision**:
+A question the spec leaves open that the plan answers, reported by the planner in `report_plan` with its decision and why; the implementer agrees to follow it, and the Spec reviewer checks it. See ADR 0005.
+_Avoid_: Assumption, gap, plan note
+
+**Departure**:
+A silent decision the change does not follow, reported by the implementer in `report_done` with what the change does instead and why; the Spec reviewer judges whether it is justified.
+_Avoid_: Deviation, override, exception

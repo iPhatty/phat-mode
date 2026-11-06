@@ -356,12 +356,17 @@ function repoPhases(services: Services) {
         const state = task.state.checkpoint;
         const { issue, spec } = state;
         logger.step(issue.number, `Plan (${modelFor(config, 'plan').modelId})`);
+        // A run saved before the spec's time was recorded cannot tell what changed since: undefined.
+        const changes = spec.writtenAt === undefined ? undefined : await workspaces.docChanges(state.workspace, spec.writtenAt);
+        if (changes !== undefined && changes.length > 0) {
+          logger.step(issue.number, `${changes.length} ADR or glossary change(s) since the spec was written`);
+        }
         const plan = await askForReport(
           runtime,
           {
             conversation: state.conversations.plan,
             requestId: 'plan',
-            prompt: planPrompt(issue, spec, scratchFor(state.workspace)),
+            prompt: planPrompt(issue, spec, scratchFor(state.workspace), changes),
             baseline: 0,
             type: 'plan',
             tool: 'report_plan',
@@ -492,7 +497,16 @@ function repoPhases(services: Services) {
             {
               conversation: state.conversations.spec,
               requestId: `spec-${round}`,
-              prompt: specReviewPrompt({ skill, issue: state.issue, spec: state.spec, baseRef, diff, round }),
+              prompt: specReviewPrompt({
+                skill,
+                issue: state.issue,
+                spec: state.spec,
+                plan: state.plan,
+                departures: state.done?.departures,
+                baseRef,
+                diff,
+                round,
+              }),
               baseline: state.baseline.spec,
               type: 'spec',
               tool: 'report_spec',

@@ -76,18 +76,54 @@ export type PlanReport = {
   seams?: Seam[];
   /** For proceed with no seams: why the change has no behaviour to test (e.g. docs only). */
   noSeamsReason?: string;
+  /**
+   * The questions the spec leaves open that the plan answers: agreed with the implementer, checked by the Spec reviewer.
+   * Optional: a plan recorded before silent decisions existed has none, so every reader must handle `undefined`.
+   */
+  silentDecisions?: SilentDecision[];
+  /** For proceed with no silent decisions: why the spec settles everything. */
+  noSilentDecisionsReason?: string;
 };
+
+/** A question the spec leaves open, the plan's answer to it, and why. */
+export type SilentDecision = { question: string; decision: string; why: string };
+
+/** An agreed silent decision the change does not follow: what it does instead, and why. */
+export type Departure = { decision: string; instead: string; why: string };
 
 /**
  * Why a plan report must be made again, or `undefined` when it is accepted. A proceed plan needs at least one seam, or
- * a reason why there is no behaviour to test; handing back (needs_info, needs_human) needs neither.
+ * a reason why there is no behaviour to test, and at least one silent decision, or a reason why the spec settles
+ * everything; handing back (needs_info, needs_human) needs neither.
  */
-export function planRejection(plan: { decision: string; seams?: readonly Seam[]; noSeamsReason?: string }): string | undefined {
+export function planRejection(plan: {
+  decision: string;
+  seams?: readonly Seam[];
+  noSeamsReason?: string;
+  silentDecisions?: readonly SilentDecision[];
+  noSilentDecisionsReason?: string;
+}): string | undefined {
   if (plan.decision !== 'proceed') return undefined;
-  if ((plan.seams ?? []).length > 0 || (plan.noSeamsReason ?? '').trim() !== '') return undefined;
-  return 'Rejected: a proceed plan needs its test seams. Call report_plan again with seams, or with noSeamsReason saying why there is no behaviour to test.';
+  const given = (items: readonly unknown[] | undefined, reason: string | undefined) =>
+    (items ?? []).length > 0 || (reason ?? '').trim() !== '';
+  const problems: string[] = [];
+  if (!given(plan.seams, plan.noSeamsReason)) {
+    problems.push(
+      'a proceed plan needs its test seams. Call report_plan again with seams, or with noSeamsReason saying why there is no behaviour to test.',
+    );
+  }
+  if (!given(plan.silentDecisions, plan.noSilentDecisionsReason)) {
+    problems.push(
+      'a proceed plan needs its silent decisions. Call report_plan again with silentDecisions (the questions the spec leaves open that your plan answers), or with noSilentDecisionsReason saying why the spec settles everything.',
+    );
+  }
+  return problems.length === 0 ? undefined : `Rejected: ${problems.join(' Also, ')}`;
 }
-export type DoneReport = { summary: string; testing: string };
+/**
+ * `departures`: every agreed silent decision the change does not follow, as of this report (the latest replaces the
+ * earlier ones). Optional: a report made before departures existed has none.
+ */
+export type DoneReport = { summary: string; testing: string; departures?: Departure[] };
 
 /** The pull request description, following mattpocock/skills' `pr` skill. Written by the implementer, last. */
 export type PrReport = {
@@ -220,6 +256,22 @@ export const reportPlan = defineTool({
     ),
     noSeamsReason: Type.String({
       description: 'When proceeding with no seams: why the change has no behaviour to test (e.g. docs only). Empty otherwise.',
+    }),
+    silentDecisions: Type.Array(
+      Type.Object({
+        question: Type.String({ description: 'A question the spec leaves open.' }),
+        decision: Type.String({ description: 'How the plan answers it.' }),
+        why: Type.String({ description: 'Why: what in the spec, the code, the glossary or the ADRs decided it.' }),
+      }),
+      {
+        description:
+          'The questions the spec leaves open that your plan answers, including constraints from "Changed since this ticket was written". ' +
+          'The implementer must follow them or report a departure, and the Spec reviewer checks them. ' +
+          'When proceeding, at least one, unless the spec settles everything (then say why in noSilentDecisionsReason). Empty for needs_info and needs_human.',
+      },
+    ),
+    noSilentDecisionsReason: Type.String({
+      description: 'When proceeding with no silent decisions: why the spec settles everything. Empty otherwise.',
     }),
   }),
   execute: async (args, api, context) => {
@@ -387,10 +439,21 @@ export const reportDone = defineTool({
   parameters: Type.Object({
     summary: Type.String({ description: 'What you changed and why, for the pull request description.' }),
     testing: Type.String({ description: 'Which tests you added or changed, and what you ran.' }),
+    departures: Type.Array(
+      Type.Object({
+        decision: Type.String({ description: 'The agreed decision the change does not follow, as your request listed it.' }),
+        instead: Type.String({ description: 'What the change does instead.' }),
+        why: Type.String({ description: 'Why: what in the code showed the decision was wrong.' }),
+      }),
+      {
+        description:
+          'Every agreed decision the change as a whole does not follow, each time you report (this list replaces the earlier one). Empty when it follows all of them.',
+      },
+    ),
   }),
   execute: async (args, api, context) => {
     await api.commit(async (tx) => {
-      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'done', data: { ...args } });
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'done', data: { ...args } as DoneReport });
     }, context);
     return recorded('Done recorded.');
   },
@@ -464,14 +527,19 @@ export const reportSpec = defineTool({
     ...axisFields,
     findings: Type.Array(
       Type.Object({
-        kind: StringEnum(['missing', 'unasked', 'wrong', 'bug'], {
+        kind: StringEnum(['missing', 'unasked', 'wrong', 'bug', 'decision'], {
           description:
             'missing: asked for, but missing or partial. unasked: not asked for (scope creep). ' +
             'wrong: looks implemented, but the implementation looks wrong. ' +
-            'bug: a bug, broken edge case or leftover debugging code, wherever it is.',
+            'bug: a bug, broken edge case or leftover debugging code, wherever it is. ' +
+            'decision: a silent decision that is unreasonable or conflicts with the spec or the repo\'s docs; ' +
+            'one the change does not follow and that is not reported as a departure; or a departure that is not justified.',
         }),
         where: Type.String({ description: 'File and hunk or line, when the finding is about code. Empty otherwise.' }),
-        specLine: Type.String({ description: 'The spec line this is about, quoted exactly. Empty only for a bug no spec line covers.' }),
+        specLine: Type.String({
+          description:
+            'The spec line this is about, quoted exactly. Empty only for a bug no spec line covers. For a decision: the nearest spec line, or empty.',
+        }),
         detail: Type.String({ description: 'What is wrong, and how to fix it.' }),
       }),
       { description: 'Empty when the change does what the spec asks.' },

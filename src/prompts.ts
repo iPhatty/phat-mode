@@ -1,4 +1,4 @@
-import type { Agent, DoneReport, GrillQuestion, GrillRound, PlanReport } from './agents.ts';
+import type { Agent, Departure, DoneReport, GrillQuestion, GrillRound, PlanReport } from './agents.ts';
 import {
   type CodeReview,
   type CodeReviewSkill,
@@ -12,7 +12,8 @@ import type { ParentIssue, Spec } from './spec.ts';
 import type { FeatureResult, VerifySkill } from './verify.ts';
 import type { Comment, Issue } from './github.ts';
 import type { PinnedSkill } from './skills.ts';
-import { agreedSeams } from './messages.ts';
+import { agreedDecisions, agreedSeams, departureLines, silentDecisionLines } from './messages.ts';
+import type { DocChange } from './workspace.ts';
 
 const SHARED = `You are part of phat-mode, an automated pipeline that turns triaged GitHub issues into pull requests.
 
@@ -91,6 +92,7 @@ Finish each request by calling report_questions.`,
 Your role: planner. The issue was already triaged as ready for an agent; your job is to plan how to build it, not whether.
 Read the spec and explore the code (read files, ls, grep). Do not change any project files. Check whether the behaviour already exists.
 Use your standing codebase-design skill, in your system prompt, to decide the test seams: the public interfaces the tests go through. Report them in report_plan's seams field, each with its interface, what testing there catches and what it misses. The implementer tests only at those seams.
+Where the spec is silent, decide, and report each such decision in report_plan's silentDecisions, with its question, decision and why: every question the spec leaves open that your plan answers, including constraints from the ADRs and glossary changes listed as changed since the ticket was written. The implementer follows them or reports a departure, and the Spec reviewer checks them. If the spec settles everything, leave silentDecisions empty and say why in noSilentDecisionsReason.
 Research only as far as planning needs. Whatever you find that the implementer will need (sources, URLs, commands that worked, facts about the data or the code), put in report_plan's notes, and leave any files you download in the scratch folder named in the request, so the implementer does not redo your work.
 Decide:
 - proceed: the spec is clear. Give a short, concrete plan of steps, including the tests to add, and the seams. With no behaviour to test (e.g. docs only), leave seams empty and say why in noSeamsReason, not in notes.
@@ -103,6 +105,7 @@ Prefer proceed when a sensible reading exists. Finish by calling report_plan.`,
 Your role: implementer. Make the change the spec asks for, following the plan.
 - Keep changes focused. Do not refactor unrelated code or touch anything out of scope.
 - Add or update tests for every behaviour change, following your standing tdd skill, in your system prompt, with its overlay: the seams listed in your request are the agreed seams.
+- Follow the agreed decisions in your request: the planner's answers where the spec is silent. You may depart from one where the code shows it was wrong, but then list it in report_done's departures, with what the change does instead and why. Each report_done replaces the last, so every time list every agreed decision the change as a whole does not follow; leave departures empty when it follows them all.
 - Make sure every acceptance criterion is met.
 - Run the project's checks (\`${checkCommand}\`) and fix every failure before you finish.
 Finish by calling report_done.`,
@@ -161,8 +164,30 @@ const list = (items: readonly string[]) => items.map((item) => `- ${item}`).join
 const scratchNote = (scratch: string) =>
   `Scratch folder for this issue, shared by the planner and the implementer: ${scratch}. Put downloads and working files there, not in the project and not in /tmp. It is never committed.`;
 
-export function planPrompt(issue: Issue, spec: Spec, scratch: string): string {
-  return `Plan this change.\n\n${specBlock(issue, spec)}\n\n${scratchNote(scratch)}`;
+const docChangeLine = (change: DocChange) =>
+  `- \`${change.path}\`${change.title === undefined ? '' : ` (ADR "${change.title}")`}: ${change.kind} in ${change.sha} "${change.subject}"`;
+
+/**
+ * The ADRs and glossary changes made on the base branch since the spec was written: `undefined` when that time is not
+ * known (a run saved before it was recorded).
+ */
+function changesBlock(spec: Spec, changes: readonly DocChange[] | undefined): string {
+  if (changes === undefined || spec.writtenAt === undefined) {
+    return 'Changed since this ticket was written: unknown, as phat-mode could not tell when the spec was written. Check the ADRs and the glossary yourself.';
+  }
+  const since = `Changed since this ticket was written (${spec.writtenAt})`;
+  if (changes.length === 0) return `${since}: nothing. No ADR or glossary changed on the base branch since then.`;
+  return `${since}, on the base branch:
+${changes.map(docChangeLine).join('\n')}
+
+The ticket was written before these. Read each one:
+- Where a change adds a constraint or requirement the ticket does not mention, follow it and record it as a silent decision.
+- Where a change contradicts the ticket, do not choose between them: report needs_info and name the conflict.`;
+}
+
+/** `changes`: the ADRs and glossary changes since the spec was written; `undefined` when that time is unknown. */
+export function planPrompt(issue: Issue, spec: Spec, scratch: string, changes?: readonly DocChange[]): string {
+  return `Plan this change.\n\n${specBlock(issue, spec)}\n\n${changesBlock(spec, changes)}\n\n${scratchNote(scratch)}`;
 }
 
 export function implementPrompt(issue: Issue, spec: Spec, plan: PlanReport, scratch: string): string {
@@ -177,6 +202,8 @@ Plan:
 ${list(plan.plan)}
 
 ${agreedSeams(plan)}
+
+${agreedDecisions(plan)}
 ${
   notes
     ? `\nWhat the planner already found out. Build on it; do not redo this research unless something here turns out not to hold:\n\n${notes}\n`
@@ -274,15 +301,32 @@ Report by calling report_standards: one finding per item, kind "violation" for a
 export const BUG_HUNTING =
   'Also report bugs, broken edge cases and leftover debugging code anywhere in the diff, even where the spec says nothing.';
 
+/** The planner's silent decisions and the implementer's departures from them, for the Spec reviewer to judge. */
+function decisionsBlock(plan: PlanReport, departures: readonly Departure[] | undefined): string {
+  const decided = silentDecisionLines(plan);
+  const departed = departureLines({ departures });
+  if (!decided) return 'Silent decisions: none listed, so there are none to check.';
+  return `Silent decisions: where the spec was silent, the planner decided these, and the implementer agreed to follow them:
+${decided}
+
+Departures the implementer reported, from those decisions:${departed ? `\n${departed}` : ' none reported.'}
+
+Judge each silent decision: whether it is a reasonable reading of the spec (and fits the repo's docs, its ADRs and glossary), and whether the change follows it. A decision the change does not follow must be listed as a departure. Judge each departure: whether it is justified.`;
+}
+
 export function specReviewPrompt(options: {
   skill: CodeReviewSkill;
   issue: Issue;
   spec: Spec;
+  /** The plan, for its silent decisions. */
+  plan: PlanReport;
+  /** The departures the implementer last reported; `undefined` for a report from before departures existed. */
+  departures: readonly Departure[] | undefined;
   baseRef: string;
   diff: string;
   round: number;
 }): string {
-  const { skill, issue, spec, baseRef, diff, round } = options;
+  const { skill, issue, spec, plan, departures, baseRef, diff, round } = options;
   return `${roundNote(round)}Review this change on the Spec axis.
 
 ${changeBlock(baseRef, diff)}
@@ -290,6 +334,8 @@ ${changeBlock(baseRef, diff)}
 The spec:
 
 ${specBlock(issue, spec)}
+
+${decisionsBlock(plan, departures)}
 
 Your brief, ${fromSkill(skill)}:
 
@@ -299,7 +345,7 @@ Added by phat-mode, which runs unattended, so no human has looked at this code y
 
 > ${BUG_HUNTING}
 
-Report by calling report_spec: one finding per item, kind "missing" for (a), "unasked" for (b), "wrong" for (c), and "bug" for phat-mode's addition. Quote the spec line in specLine; leave it empty only for a bug no spec line covers. The summary is your report; worst is the worst issue on this axis.`;
+Report by calling report_spec: one finding per item, kind "missing" for (a), "unasked" for (b), "wrong" for (c), and "bug" for phat-mode's addition. Quote the spec line in specLine; leave it empty only for a bug no spec line covers. Use kind "decision" for a silent decision that is unreasonable or conflicts with the spec or the repo's docs, one the change does not follow that is not reported as a departure, or a departure that is not justified; in its specLine, quote the nearest spec line, or leave it empty. The summary is your report; worst is the worst issue on this axis.`;
 }
 
 export const NUDGE = (tool: string) =>
@@ -315,7 +361,7 @@ ${skill.text}
 How the skill applies here:
 - The skill mentions GLOSSARY.md: use the repo's domain glossary if it has one (GLOSSARY.md, CONTEXT.md or similar), otherwise the words the spec and the code use.
 - Evidence: there is no way to take screenshots here, so use execution-based evidence: the test that failed before and passes now (as pseudocode), and output you ran. Only evidence you actually observed; never invent output. phat-mode adds the result of its own check run and the verifier's evidence from the real app, so do not repeat those.
-- Leave out \`Closes #…\`, the acceptance criteria and the code review: phat-mode adds those.${
+- Leave out \`Closes #…\`, the acceptance criteria, the silent decisions and departures, and the code review: phat-mode adds those.${
     unresolved ? '\n- Some code review findings are still open. Let Merge Danger reflect them.' : ''
   }
 
