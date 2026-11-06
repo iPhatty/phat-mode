@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { access, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { branchFor } from './config.ts';
 import { CommandError, run, runShell, type RunResult } from './exec.ts';
 
@@ -56,7 +56,16 @@ export interface Workspaces {
   undoSnapshot(workspace: string): Promise<void>;
   /** Commit files to the evidence branch and push it. Returns the commit. */
   publishEvidence(files: readonly EvidenceFile[]): Promise<string>;
+  /**
+   * The ADRs and glossaries (`GLOSSARY.md`, `CONTEXT.md`) added or changed on the base branch after `since` (an ISO
+   * time), up to `base(workspace)`, oldest first. Only commits on the base branch's first-parent line count, each at its
+   * committer time, with the diff it brought in; deletions are left out, and a rename counts as added.
+   */
+  docChanges(workspace: string, since: string): Promise<DocChange[]>;
 }
+
+/** An ADR or glossary file a commit on the base branch added or changed. `title`: an ADR's first `# ` heading. */
+export type DocChange = { path: string; kind: 'added' | 'changed'; title?: string; sha: string; subject: string };
 
 /** The repo's install command failed: the repo's problem, not a passing one such as being offline. */
 export class InstallError extends Error {
@@ -70,6 +79,11 @@ export const EVIDENCE_BRANCH = 'phat-mode/evidence';
 const SNAPSHOT_MESSAGE = 'phat-mode: snapshot before verification';
 /** A line git writes around a conflict: `<<<<<<< ours` or `>>>>>>> theirs`. (`=======` alone is too common to count.) */
 const CONFLICT_MARKER = /^(<{7}|>{7})( |$)/m;
+
+/** An ADR: a Markdown file directly in a `docs/adr/` folder, at any depth (multi-context repos have one per context). */
+const isAdrPath = (path: string) => /(^|\/)docs\/adr\/[^/]+\.md$/.test(path) && basename(path) !== 'README.md';
+/** The files that count as changed domain docs: ADRs and glossaries. Other docs change in nearly every commit. */
+const isDocPath = (path: string) => isAdrPath(path) || ['GLOSSARY.md', 'CONTEXT.md'].includes(basename(path));
 
 /** `source`: a local file. `path`: where it goes on the evidence branch. */
 export type EvidenceFile = { source: string; path: string };
@@ -258,6 +272,37 @@ export class GitWorkspaces implements Workspaces {
 
   async base(workspace: string): Promise<string> {
     return (await this.#git(workspace, ['merge-base', 'HEAD', this.#base])).stdout.trim();
+  }
+
+  async docChanges(workspace: string, since: string): Promise<DocChange[]> {
+    const after = Date.parse(since);
+    const base = await this.base(workspace);
+    const log = await this.#git(workspace, [
+      'log', '--first-parent', '--diff-merges=first-parent', '--reverse', '--name-status', '--diff-filter=AMR',
+      '--format=%x00%H%x1f%h%x1f%cI%x1f%s', base, '--',
+      ':(glob)**/docs/adr/**', ':(glob)**/GLOSSARY.md', ':(glob)**/CONTEXT.md',
+    ]);
+    const changes: DocChange[] = [];
+    for (const entry of log.stdout.split('\0').slice(1)) {
+      const [header = '', ...files] = entry.split('\n');
+      const [full = '', sha = '', committed = '', subject = ''] = header.split('\x1f');
+      if (!(Date.parse(committed) > after)) continue;
+      for (const line of files) {
+        const [status = '', ...paths] = line.split('\t');
+        const path = paths.at(-1);
+        if (path === undefined || !isDocPath(path)) continue;
+        const kind = status.startsWith('M') ? 'changed' : 'added';
+        const title = isAdrPath(path) ? await this.#adrTitle(workspace, full, path) : undefined;
+        changes.push({ path, kind, ...(title === undefined ? {} : { title }), sha, subject });
+      }
+    }
+    return changes;
+  }
+
+  /** An ADR's title: its first `# ` heading, else its file name. */
+  async #adrTitle(workspace: string, commit: string, path: string): Promise<string> {
+    const shown = await this.#git(workspace, ['show', `${commit}:${path}`], true);
+    return /^# +(.+?)\s*$/m.exec(shown.stdout)?.[1] ?? basename(path, '.md');
   }
 
   async diff(workspace: string): Promise<string> {

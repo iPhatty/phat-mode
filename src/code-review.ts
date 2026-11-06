@@ -86,8 +86,15 @@ export type StandardsFinding = { kind: 'violation' | 'smell'; where: string; rul
 /**
  * missing: asked for but missing or partial. unasked: not asked for (scope creep). wrong: looks implemented, but
  * wrongly. bug: phat-mode's addition, a bug, broken edge case or leftover debugging code anywhere in the diff.
+ * decision: also phat-mode's, a silent decision that is unreasonable or not followed without a reported departure, or
+ * a departure that is not justified.
  */
-export type SpecFinding = { kind: 'missing' | 'unasked' | 'wrong' | 'bug'; where: string; specLine: string; detail: string };
+export type SpecFinding = {
+  kind: 'missing' | 'unasked' | 'wrong' | 'bug' | 'decision';
+  where: string;
+  specLine: string;
+  detail: string;
+};
 
 export type AxisReport<F> = { summary: string; worst: string; findings: F[] };
 export type StandardsReport = AxisReport<StandardsFinding>;

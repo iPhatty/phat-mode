@@ -17,6 +17,11 @@ export type Spec = {
   blockedBy: number[];
   /** The larger plan this issue is part of, when a trusted author wrote it: background, not the contract. */
   parent?: ParentIssue;
+  /**
+   * When the spec was written (ISO time): the Agent Brief comment's creation time, else the shaped-at time of a body
+   * shaping rewrote, else the issue's creation time. Optional: a run saved before it was recorded has none.
+   */
+  writtenAt?: string;
 };
 
 export type ParentIssue = { number: number; title: string; author: string; body: string };
@@ -79,11 +84,12 @@ export function parentRef(text: string, repo: string): number | undefined {
   return sectionRefs(text, 'Parent', repo)[0];
 }
 
-function specFrom(source: Spec['source'], author: string, text: string, repo: string): Spec {
+function specFrom(source: Spec['source'], author: string, text: string, repo: string, writtenAt: string): Spec {
   return {
     source,
     author,
     text,
+    writtenAt,
     acceptanceCriteria: listUnder(text, 'Acceptance criteria'),
     outOfScope: listUnder(text, 'Out of scope'),
     blockedBy: blockedBy(text, repo),
@@ -112,7 +118,7 @@ export function findAgentBrief(issue: Issue, trusted: readonly string[], repo = 
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     .at(-1);
   if (comment === undefined) return undefined;
-  return specFrom('brief', comment.author, comment.body.slice(comment.body.search(BRIEF_START)).trim(), repo);
+  return specFrom('brief', comment.author, comment.body.slice(comment.body.search(BRIEF_START)).trim(), repo, comment.createdAt);
 }
 
 /** The spec to build from, or undefined when nobody trusted has specified the issue. */
@@ -123,7 +129,11 @@ export function findSpec(issue: Issue, trusted: readonly string[], repo: string)
     const body = blockedBy(issue.body, repo);
     return { ...brief, blockedBy: [...new Set([...brief.blockedBy, ...body])].sort((a, b) => a - b) };
   }
-  if (trusted.includes(issue.author)) return specFrom('issue', issue.author, issue.body, repo);
+  if (trusted.includes(issue.author)) {
+    const shaped = shapedAt(issue.body);
+    const writtenAt = shaped === undefined ? issue.createdAt : new Date(shaped).toISOString();
+    return specFrom('issue', issue.author, issue.body, repo, writtenAt);
+  }
   return undefined;
 }
 

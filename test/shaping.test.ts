@@ -649,7 +649,7 @@ describe('shaping', () => {
             assert.match(text, /## Acceptance criteria[^]*## Original request/);
             assert.doesNotMatch(text, /<agent-brief/);
             assert.doesNotMatch(text, /OLD-BRIEF/);
-          }, call('report_plan', { decision: 'needs_human', summary: 'Greet.', plan: [], established: [], questions: [], reason: 'Test stop.', notes: '', seams: [], noSeamsReason: '' })),
+          }, call('report_plan', { decision: 'needs_human', summary: 'Greet.', plan: [], established: [], questions: [], reason: 'Test stop.', notes: '', seams: [], noSeamsReason: '', silentDecisions: [], noSilentDecisionsReason: '' })),
         ],
         'build',
       );
@@ -889,7 +889,7 @@ describe('shaping', () => {
             assert.match(text, /<parent-issue number="70" author="iPhatty">/);
             assert.ok(text.includes(parentBody.trim()), 'the parent’s rewritten body: the spec');
             assert.match(text, /## Problem Statement\n\nLearners open the app to silence\./);
-          }, call('report_plan', { decision: 'needs_human', summary: 'One.', plan: [], established: [], questions: [], reason: 'Test stop.', notes: '', seams: [], noSeamsReason: '' })),
+          }, call('report_plan', { decision: 'needs_human', summary: 'One.', plan: [], established: [], questions: [], reason: 'Test stop.', notes: '', seams: [], noSeamsReason: '', silentDecisions: [], noSilentDecisionsReason: '' })),
         ],
         'build',
       );

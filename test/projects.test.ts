@@ -70,6 +70,8 @@ const plan = (decision: 'proceed' | 'needs_info', questions: string[] = []) =>
     notes: '',
     seams: decision === 'proceed' ? [{ interface: 'hello.txt', catches: 'its content', misses: 'nothing else' }] : [],
     noSeamsReason: '',
+    silentDecisions: decision === 'proceed' ? [{ question: 'Which file?', decision: 'hello.txt', why: 'The issue names it.' }] : [],
+    noSilentDecisionsReason: '',
   });
 
 /** A model response that never comes, until the run is aborted or closed. `reached`: resolves when it is asked. */

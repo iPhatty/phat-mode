@@ -7,13 +7,13 @@ import { FileCredentialStore, importPiCredential } from '../src/credentials.ts';
 import { agentEnv } from '../src/exec.ts';
 import { planRejection, type PlanReport } from '../src/agents.ts';
 import { breakdownCriteria, evidence, planComment, pullRequestBody, shapedCriteria } from '../src/messages.ts';
-import { implementPrompt, roleInstructions } from '../src/prompts.ts';
+import { describePrompt, implementPrompt, planPrompt, roleInstructions, specReviewPrompt } from '../src/prompts.ts';
 import { describeResult, runStatus } from '../src/runs.ts';
 import { dependencyOrder } from '../src/shaping.ts';
 
 const ROLE_INSTRUCTIONS = roleInstructions('npm run check');
 
-const issue = { number: 7, title: 'Save progress', body: '', author: 'iPhatty', state: 'OPEN' as const, url: '', labels: [], comments: [] };
+const issue = { number: 7, title: 'Save progress', body: '', author: 'iPhatty', state: 'OPEN' as const, url: '', labels: [], comments: [], createdAt: '2026-09-01T00:00:00Z' };
 const spec = { source: 'issue' as const, author: 'iPhatty', text: '', acceptanceCriteria: [], outOfScope: [], blockedBy: [] };
 const plan = { decision: 'proceed' as const, summary: 'Save lesson progress.', plan: ['Add storage', 'Test it'], established: [], questions: [], reason: '' };
 
@@ -47,7 +47,7 @@ describe('pullRequestBody', () => {
       },
     });
     const headings = [...body.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
-    assert.deepEqual(headings, ['Summary', 'Evidence', 'Merge Danger', 'Acceptance criteria', 'Code review']);
+    assert.deepEqual(headings, ['Summary', 'Evidence', 'Merge Danger', 'Acceptance criteria', 'Decided where the ticket was silent', 'Code review']);
     assert.match(body, /^## Summary\n\n```text\non\(lessonComplete\)\n  save progress\n```/);
     // Multi-line evidence stays inside its list item.
     assert.match(
@@ -86,6 +86,42 @@ describe('pullRequestBody', () => {
     );
     assert.match(body, /Standards: no report\. Spec: 2 findings \(worst: progress lost after an app update\)\./);
     assert.doesNotMatch(body, /Nothing that must be fixed/);
+  });
+
+  test('lists the silent decisions, then the departures, after the acceptance criteria and before the code review', () => {
+    const body = pullRequestBody({
+      ...details,
+      plan: {
+        ...plan,
+        silentDecisions: [{ question: 'Where is progress kept?', decision: 'On the device.', why: 'There is no server.' }],
+        noSilentDecisionsReason: '',
+      },
+      done: {
+        ...details.done,
+        departures: [{ decision: 'On the device.', instead: 'In iCloud key-value storage.', why: 'AsyncStorage is wiped on reinstall.' }],
+      },
+      spec: { ...spec, acceptanceCriteria: ['Progress survives a restart'] },
+      review: { round: 1, standards: null, spec: null },
+    });
+    const headings = [...body.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+    assert.deepEqual(headings.slice(3), ['Acceptance criteria', 'Decided where the ticket was silent', 'Departures', 'Code review']);
+    assert.ok(
+      body.includes(
+        '## Decided where the ticket was silent\n\nThe planner decided these where the spec was silent; the implementer agreed to follow them.\n\n' +
+          '- **Where is progress kept?** On the device. _Why:_ There is no server.\n\n' +
+          '## Departures\n\nAgreed decisions the change does not follow, as the implementer reported them.\n\n' +
+          '- **On the device.** Instead: In iCloud key-value storage. _Why:_ AsyncStorage is wiped on reinstall.',
+      ),
+      body,
+    );
+  });
+
+  test('no departures section when the change follows every decision; a run from before either existed still renders', () => {
+    const followed = pullRequestBody({ ...details, done: { ...details.done, departures: [] } });
+    assert.doesNotMatch(followed, /## Departures/);
+    const legacy = pullRequestBody(details);
+    assert.match(legacy, /## Decided where the ticket was silent\n\n[^]*none listed/);
+    assert.doesNotMatch(legacy, /## Departures|undefined/);
   });
 
   test('without a description or a review: plain summary, implementer’s testing as evidence', () => {
@@ -201,10 +237,30 @@ describe('test seams', () => {
     const seam = { interface: 'save()', catches: 'lost progress', misses: 'the UI' };
     assert.match(planRejection({ decision: 'proceed', seams: [], noSeamsReason: '' }) ?? '', /^Rejected: /);
     assert.match(planRejection({ decision: 'proceed', seams: [], noSeamsReason: '  \n ' }) ?? '', /^Rejected: /);
-    assert.equal(planRejection({ decision: 'proceed', seams: [], noSeamsReason: 'Docs only.' }), undefined);
-    assert.equal(planRejection({ decision: 'proceed', seams: [seam], noSeamsReason: '' }), undefined);
+    const decided = { silentDecisions: [], noSilentDecisionsReason: 'The spec settles everything.' };
+    assert.equal(planRejection({ decision: 'proceed', seams: [], noSeamsReason: 'Docs only.', ...decided }), undefined);
+    assert.equal(planRejection({ decision: 'proceed', seams: [seam], noSeamsReason: '', ...decided }), undefined);
     assert.equal(planRejection({ decision: 'needs_info', seams: [], noSeamsReason: '' }), undefined);
     assert.equal(planRejection({ decision: 'needs_human', seams: [], noSeamsReason: '' }), undefined);
+  });
+
+  test('a proceed plan needs silent decisions or a reason; handing back needs neither', () => {
+    const seam = { interface: 'save()', catches: 'lost progress', misses: 'the UI' };
+    const decision = { question: 'Where is progress kept?', decision: 'On the device.', why: 'No server exists.' };
+    const proceed = { decision: 'proceed', seams: [seam], noSeamsReason: '' };
+    const rejected = planRejection({ ...proceed, silentDecisions: [], noSilentDecisionsReason: '' }) ?? '';
+    assert.match(rejected, /^Rejected: /);
+    assert.match(rejected, /silentDecisions[^]*noSilentDecisionsReason/);
+    assert.doesNotMatch(rejected, /test seams/);
+    assert.match(planRejection({ ...proceed, silentDecisions: [], noSilentDecisionsReason: ' \n ' }) ?? '', /^Rejected: /);
+    assert.equal(planRejection({ ...proceed, silentDecisions: [decision], noSilentDecisionsReason: '' }), undefined);
+    assert.equal(planRejection({ ...proceed, silentDecisions: [], noSilentDecisionsReason: 'The spec settles everything.' }), undefined);
+    // Both missing: one message names both, so the planner fixes them at once.
+    const both = planRejection({ decision: 'proceed', seams: [], noSeamsReason: '', silentDecisions: [], noSilentDecisionsReason: '' }) ?? '';
+    assert.match(both, /^Rejected: [^]*test seams[^]*silentDecisions/);
+    for (const handBack of ['needs_info', 'needs_human']) {
+      assert.equal(planRejection({ decision: handBack, seams: [], noSeamsReason: '', silentDecisions: [], noSilentDecisionsReason: '' }), undefined);
+    }
   });
 
   test('a plan recorded before seams existed still renders, for a resumed run', () => {
@@ -216,6 +272,142 @@ describe('test seams', () => {
     const prompt = implementPrompt(issue, spec, legacy, '/scratch');
     assert.match(prompt, /Agreed seams: none listed/);
     assert.doesNotMatch(prompt, /undefined/);
+  });
+
+  test('a plan recorded before silent decisions existed still renders, for a resumed run', () => {
+    const legacy = { ...plan, notes: '', seams: [{ interface: 'save()', catches: 'lost progress', misses: 'the UI' }] } as PlanReport;
+    assert.equal('silentDecisions' in legacy, false);
+    const comment = planComment(legacy);
+    assert.match(comment, /\*\*Decided where the ticket was silent\*\*\nnone listed/);
+    assert.doesNotMatch(comment, /undefined/);
+    const prompt = implementPrompt(issue, spec, legacy, '/scratch');
+    assert.match(prompt, /Agreed decisions: none listed/);
+    assert.doesNotMatch(prompt, /undefined/);
+  });
+});
+
+describe('silent decisions and departures', () => {
+  const seams = [{ interface: 'save()', catches: 'lost progress', misses: 'the UI' }];
+  const decided = {
+    ...plan,
+    seams,
+    noSeamsReason: '',
+    silentDecisions: [
+      { question: 'Does a right answer move the item’s box?', decision: 'No, the box stays.', why: 'Spacing must not break (ADR 0003).' },
+    ],
+    noSilentDecisionsReason: '',
+  };
+
+  test('the plan comment lists them under "Decided where the ticket was silent", after the test seams', () => {
+    const comment = planComment(decided);
+    assert.ok(
+      comment.includes(
+        '**Test seams**\n- `save()`: catches lost progress; misses the UI\n\n' +
+          '**Decided where the ticket was silent**\n' +
+          '- **Does a right answer move the item’s box?** No, the box stays. _Why:_ Spacing must not break (ADR 0003).',
+      ),
+      comment,
+    );
+  });
+
+  test('the plan comment gives the planner’s reason when there are none', () => {
+    const comment = planComment({ ...decided, silentDecisions: [], noSilentDecisionsReason: 'The spec settles everything.' });
+    assert.ok(comment.includes('**Decided where the ticket was silent**\nnone. The planner says: The spec settles everything.'), comment);
+  });
+
+  test('the implementer gets them as agreed decisions, next to the agreed seams, to follow or report a departure', () => {
+    const prompt = implementPrompt(issue, spec, decided, '/scratch');
+    assert.ok(
+      prompt.includes(
+        '- `save()`: catches lost progress; misses the UI\n\n' +
+          'Agreed decisions (follow each one, or report it in report_done\'s departures with what you did instead and why):\n' +
+          '- **Does a right answer move the item’s box?** No, the box stays. _Why:_ Spacing must not break (ADR 0003).',
+      ),
+      prompt,
+    );
+    assert.match(ROLE_INSTRUCTIONS.implement, /Follow the agreed decisions[^]*depart[^]*report_done's departures/);
+  });
+});
+
+describe('the Spec reviewer checks the silent decisions and departures', () => {
+  const skill = { source: 'mattpocock/skills@49dd158', smellBaseline: '', standardsBrief: '', specBrief: 'Report: (a) …' };
+  const decided = {
+    ...plan,
+    silentDecisions: [{ question: 'Does a right answer move the box?', decision: 'No, the box stays.', why: 'Spacing.' }],
+    noSilentDecisionsReason: '',
+  };
+  const review = (fields: Partial<Parameters<typeof specReviewPrompt>[0]>) =>
+    specReviewPrompt({ skill, issue, spec, plan: decided, departures: [], baseRef: 'abc', diff: '+x', round: 1, ...fields });
+
+  test('lists the silent decisions and the departures, and asks for a judgement on each', () => {
+    const prompt = review({
+      departures: [{ decision: 'No, the box stays.', instead: 'The box moves up.', why: 'The scheduler needs it.' }],
+    });
+    assert.ok(
+      prompt.includes(
+        'Silent decisions: where the spec was silent, the planner decided these, and the implementer agreed to follow them:\n' +
+          '- **Does a right answer move the box?** No, the box stays. _Why:_ Spacing.\n\n' +
+          'Departures the implementer reported, from those decisions:\n' +
+          '- **No, the box stays.** Instead: The box moves up. _Why:_ The scheduler needs it.',
+      ),
+      prompt,
+    );
+    assert.match(prompt, /whether it is a reasonable reading of the spec[^]*whether the change follows it[^]*whether (each|it) is justified/);
+    assert.match(prompt, /kind "decision"[^]*specLine[^]*nearest spec line, or leave it empty/);
+  });
+
+  test('says none were reported when the change departs from nothing; an older run still renders', () => {
+    assert.match(review({}), /Departures the implementer reported, from those decisions: none reported\./);
+    const legacy = review({ plan, departures: undefined });
+    assert.match(legacy, /Silent decisions: none listed/);
+    assert.doesNotMatch(legacy, /undefined/);
+  });
+
+  test('phat-mode adds the silent decisions and departures to the PR itself', () => {
+    assert.match(describePrompt({ source: 'x', text: 'pr skill' }, false), /the silent decisions and departures/);
+  });
+});
+
+describe('the plan request: what changed since the spec was written', () => {
+  const written = { ...spec, writtenAt: '2026-09-01T00:00:00Z' };
+  const changes = [
+    { path: 'docs/adr/0005-hosting-check.md', kind: 'added' as const, title: 'Post-deploy checks serve every page', sha: 'abc1234', subject: 'Add ADR 0005' },
+    { path: 'GLOSSARY.md', kind: 'changed' as const, sha: 'def5678', subject: 'Define Page path' },
+  ];
+
+  test('lists each ADR (with its title) and glossary change, with the commit’s short sha and subject', () => {
+    const prompt = planPrompt(issue, written, '/scratch', changes);
+    assert.ok(
+      prompt.includes(
+        'Changed since this ticket was written (2026-09-01T00:00:00Z), on the base branch:\n' +
+          '- `docs/adr/0005-hosting-check.md` (ADR "Post-deploy checks serve every page"): added in abc1234 "Add ADR 0005"\n' +
+          '- `GLOSSARY.md`: changed in def5678 "Define Page path"',
+      ),
+      prompt,
+    );
+  });
+
+  test('tells the planner to follow later constraints as silent decisions, and to hand back a contradiction', () => {
+    const prompt = planPrompt(issue, written, '/scratch', changes);
+    assert.match(prompt, /Where a change adds a constraint or requirement the ticket does not mention, follow it and record it as a silent decision\./);
+    assert.match(prompt, /Where a change contradicts the ticket, do not choose between them: report needs_info and name the conflict\./);
+  });
+
+  test('says nothing changed when nothing did', () => {
+    const prompt = planPrompt(issue, written, '/scratch', []);
+    assert.match(prompt, /Changed since this ticket was written \(2026-09-01T00:00:00Z\): nothing\. No ADR or glossary changed on the base branch since then\./);
+    assert.doesNotMatch(prompt, /Where a change contradicts/);
+  });
+
+  test('a run saved before the time was recorded: says it could not tell, never lists everything', () => {
+    const prompt = planPrompt(issue, spec, '/scratch', undefined);
+    assert.match(prompt, /Changed since this ticket was written: unknown, as phat-mode could not tell when the spec was written\./);
+    assert.doesNotMatch(prompt, /undefined/);
+  });
+
+  test('the planner reports its silent decisions, or why there are none, in report_plan', () => {
+    assert.match(ROLE_INSTRUCTIONS.plan, /report_plan's silentDecisions[^]*question, decision and why/);
+    assert.match(ROLE_INSTRUCTIONS.plan, /noSilentDecisionsReason/);
   });
 });
 
