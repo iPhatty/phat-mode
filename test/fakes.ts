@@ -1,4 +1,4 @@
-import { type Config, defaultMachineConfig, repoConfig } from '../src/config.ts';
+import { branchFor, type Config, defaultMachineConfig, repoConfig } from '../src/config.ts';
 import type { GitHub, Issue, LabelChange, PullRequest, PullRequestState, PullRequestStatus, SubIssue } from '../src/github.ts';
 
 /** A repo's full settings, as phat-mode would build them from a .phat-mode.json with npm commands. */
@@ -193,7 +193,11 @@ export class FakeGitHub implements GitHub {
   openIssues = new Set<number>();
   native = new Map<number, number[]>();
   async openBlockers(issue: number, mentioned: readonly number[]) {
-    return [...new Set([...(this.native.get(issue) ?? []), ...mentioned])].filter((n) => this.openIssues.has(n)).sort();
+    return [...new Set([...(this.native.get(issue) ?? []), ...mentioned])]
+      .filter((n) => this.openIssues.has(n))
+      // As the real one: a blocker whose phat-mode pull request has merged is finished, however long GitHub takes to close its issue.
+      .filter((n) => this.prs.filter((pr) => pr.branch === branchFor(n)).at(-1)?.state !== 'MERGED')
+      .sort();
   }
   async editLabels(number: number, change: LabelChange) {
     this.writes++;

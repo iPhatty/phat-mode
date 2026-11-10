@@ -39,6 +39,11 @@ else if (a === 'api' && path.endsWith('/parent')) {
   process.stdout.write(parent + '\\n');
 } else if (a === 'api' && path.endsWith('/dependencies/blocked_by')) process.stdout.write(JSON.stringify(state.blockedBy[path.split('/')[4]] ?? []));
 else if (a === 'api' && /\\/issues\\/\\d+$/.test(path) && flag('--jq') === '.id') process.stdout.write(state.ids[path.split('/')[4]] + '\\n');
+else if (a === 'api' && /\\/issues\\/\\d+$/.test(path) && flag('--jq') === '.state') {
+  const issueState = state.issueStates[path.split('/')[4]];
+  if (issueState === undefined) { process.stderr.write('HTTP 404: Not Found'); process.exit(1); }
+  process.stdout.write(issueState + '\\n');
+}
 else if (a === 'pr' && b === 'list') {
   // Like GitHub, --head matches the branch name, whichever repo the branch is in.
   const status = flag('--state');
@@ -81,11 +86,12 @@ async function gitHubWith(state: {
   ids?: Record<string, number>;
   parents?: Record<string, number>;
   blockedBy?: Record<string, { number: number; state: string }[]>;
+  issueStates?: Record<string, 'open' | 'closed'>;
   subIssuePages?: { number: number; title: string; state: string }[][];
 }) {
   await writeFile(
     join(dir, 'state.json'),
-    JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], views: {}, issues: [], ids: {}, parents: {}, blockedBy: {}, subIssuePages: [], ...state }),
+    JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], views: {}, issues: [], ids: {}, parents: {}, blockedBy: {}, issueStates: {}, subIssuePages: [], ...state }),
   );
   await writeFile(join(dir, 'log.jsonl'), '');
 }
@@ -310,6 +316,34 @@ describe('GhGitHub, on a public repo', () => {
     assert.deepEqual(await writes(), [
       { post: 'repos/iPhatty/phat-mode/issues/33/dependencies/blocked_by', field: 'issue_id=9001' },
     ]);
+  });
+
+  test('openBlockers: an open blocker whose newest phat-mode pull request merged no longer stands in the way', async () => {
+    await gitHubWith({
+      // Native edges for #50; #43 is closed already.
+      blockedBy: {
+        50: [
+          { number: 40, state: 'open' },
+          { number: 41, state: 'open' },
+          { number: 42, state: 'open' },
+          { number: 43, state: 'closed' },
+        ],
+      },
+      // `Blocked by` lines; #49 does not resolve.
+      issueStates: { 44: 'open', 45: 'open', 46: 'open', 47: 'open' },
+      prs: [
+        pr(100, { headRefName: 'phat-mode/issue-40', state: 'MERGED' }), // merged, GitHub has not closed #40 yet
+        pr(101, { headRefName: 'phat-mode/issue-41', state: 'OPEN' }), // waiting for merge
+        pr(102, { headRefName: 'phat-mode/issue-42', state: 'CLOSED' }), // closed without merging: with a human
+        pr(103, { headRefName: 'phat-mode/issue-44', state: 'MERGED' }),
+        pr(104, { headRefName: 'phat-mode/issue-44', state: 'OPEN' }), // the newest one decides
+        pr(105, { headRefName: 'phat-mode/issue-46', state: 'MERGED', isCrossRepository: true }), // a fork's is never phat-mode's
+        pr(106, { headRefName: 'phat-mode/issue-47', state: 'MERGED' }), // merged, through a `Blocked by` line
+      ],
+    });
+    // #45: a human's issue, with no phat-mode branch.
+    assert.deepEqual(await github.openBlockers(50, [44, 45, 46, 47, 49]), [41, 42, 44, 45, 46]);
+    assert.deepEqual(await writes(), []);
   });
 
   test('listSubIssues: every page, with GitHub’s state as OPEN or CLOSED, lowest number first', async () => {

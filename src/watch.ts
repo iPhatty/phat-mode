@@ -13,7 +13,8 @@ import { yoloMerge } from './yolo.ts';
  * On each look: shaped parents whose tickets are all closed are closed. Then shaping comes first: the lowest-numbered
  * `agent-mode` issue that may be shaped is, even while a phat-mode pull request is open (its tickets are then ready by
  * the time building can go on). Builds go one issue at a time: while a phat-mode pull request is open, nothing new is
- * built. Merging it closes its issue (`Closes #N`), which also unblocks the issues that wait for it.
+ * built. Merging it also unblocks the issues that wait for it, whether or not GitHub has closed its issue yet
+ * (`Closes #N`); see `openBlockers`.
  */
 export type WatchStep =
   /**
@@ -156,7 +157,7 @@ export async function nextStep(
         const progress = progressOf(listed);
         text =
           progress === 'done'
-            ? 'its pull request is merged, GitHub has not closed it yet'
+            ? 'its pull request was closed without merging; now with a human'
             : progress === 'working'
               ? PROGRESS_LABELS.working.name
               : 'ready-for-agent, but blocked itself';

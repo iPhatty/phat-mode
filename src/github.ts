@@ -1,4 +1,4 @@
-import { DEFAULT_LABELS, type Labels } from './config.ts';
+import { branchFor, DEFAULT_LABELS, type Labels } from './config.ts';
 import { run } from './exec.ts';
 
 export type Comment = {
@@ -117,7 +117,10 @@ export interface GitHub {
   updatePullRequestBody(pr: number, body: string): Promise<void>;
   /** Change labels on an issue or pull request. Missing labels are created; existing ones are never edited. */
   editLabels(number: number, change: LabelChange): Promise<void>;
-  /** Which of `mentioned`, and of the issue's native "blocked by" dependencies, are still open. */
+  /**
+   * Which of `mentioned`, and of the issue's native "blocked by" dependencies, still stand in the way: an open issue
+   * whose phat-mode pull request has merged is finished, however long GitHub takes to close it (`Closes #N`).
+   */
   openBlockers(issue: number, mentioned: readonly number[]): Promise<number[]>;
   /** The issue's native parent (sub-issues), if it has one. */
   parentIssue(issue: number): Promise<number | undefined>;
@@ -481,7 +484,13 @@ export class GhGitHub implements GitHub {
       // A reference that does not resolve cannot block.
       if (result.code === 0 && result.stdout.trim() === 'open') open.add(number);
     }
-    return [...open].sort((a, b) => a - b);
+    // An open blocker whose phat-mode pull request has merged is finished: GitHub closes its issue in its own time.
+    const inTheWay: number[] = [];
+    for (const number of [...open].sort((a, b) => a - b)) {
+      if ((await this.latestPullRequest(branchFor(number)))?.state === 'MERGED') continue;
+      inTheWay.push(number);
+    }
+    return inTheWay;
   }
 
   async parentIssue(issue: number): Promise<number | undefined> {

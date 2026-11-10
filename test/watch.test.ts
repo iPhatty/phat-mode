@@ -125,13 +125,14 @@ describe('watch', () => {
     assert.deepEqual(await step(github), { kind: 'start', issue: 9, title: 'Issue 9' });
   });
 
-  test('a done issue whose pull request merged is not started again while GitHub closes it', async () => {
+  test('a blocker whose pull request merged stops blocking before GitHub closes its issue', async () => {
     const github = repo({ 2: {}, 3: { blockedBy: [2] } });
     opened(github, 2);
+    // As in iPhatty/phatty-lingo: GitHub left #103 open for 12 hours after its pull request merged.
     github.prs[0]!.state = 'MERGED';
-    const idle = await step(github);
-    assert.equal(idle.kind, 'idle');
-    assert.match(describeStep(idle), /#3 is blocked by #2 \(its pull request is merged, GitHub has not closed it yet\)/);
+    // #2 itself is still `done`, so it is not started again; #3 no longer waits for GitHub to close #2.
+    assert.deepEqual(await step(github), { kind: 'start', issue: 3, title: 'Issue 3' });
+    assert.equal(github.writes, 0, 'nothing written on GitHub');
   });
 
   test('a pull request closed without merging hands its issue to a human, and the queue moves on', async () => {
@@ -143,6 +144,17 @@ describe('watch', () => {
     const comment = github.comments.find((candidate) => candidate.issue === 2)!;
     assert.equal(comment.marker, MARKER_HANDED_BACK);
     assert.match(comment.body, /closed without merging[^]*label it `ready-for-agent`/);
+  });
+
+  test('a blocker whose pull request was closed without merging still blocks: it is with a human now', async () => {
+    const github = repo({ 2: {}, 3: { blockedBy: [2] } });
+    opened(github, 2);
+    github.prs[0]!.state = 'CLOSED';
+    const idle = await step(github);
+    assert.equal(idle.kind, 'idle');
+    assert.match(describeStep(idle), /#3 is blocked by #2 \(its pull request was closed without merging; now with a human\)/);
+    assert.deepEqual(github.labels(2), ['ready-for-human']);
+    assert.match(describeStep(await step(github)), /#3 is blocked by #2 \(ready-for-human\)/);
   });
 
   test('relabelled ready-for-agent after a failure or a hand-back: tried again', async () => {

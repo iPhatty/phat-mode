@@ -1156,6 +1156,18 @@ describe('pipeline', () => {
     assert.match(github.prs[0]!.body, /From the issue\. For the human reviewer to tick off:\n\n- \[ \] hello\.txt says hello/);
   });
 
+  test('a blocker whose pull request merged no longer stops it, while GitHub has not closed its issue yet', async () => {
+    const { github, runIssue } = await fixture();
+    github.addIssue(16, { body: '## What to build\n\nA hello file.\n\n## Blocked by\n\n- #22' });
+    github.native.set(16, [23]);
+    github.openIssues = new Set([22, 23]);
+    github.addPullRequest({ branch: 'phat-mode/issue-22', state: 'MERGED' });
+    github.addPullRequest({ branch: 'phat-mode/issue-23', state: 'MERGED' });
+
+    const { outcome } = await runIssue(16, [plan(), write('hello.txt', 'hello'), done(), ...approve(), describePr()]);
+    assert.equal(result(outcome).status, 'pr_opened');
+  });
+
   test('ignores issues that are not ready-for-agent, labelled agent-mode, or not specified by someone trusted, without touching GitHub', async () => {
     const { github, runIssue } = await fixture();
     github.addIssue(10, { labels: ['needs-triage'] });
