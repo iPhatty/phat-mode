@@ -395,8 +395,9 @@ Set the environment variable **`PHAT_MODE_HOME`** to move that home (config.json
 
 ## How it works
 
-- `src/shaping.ts`: shaping, a second durable task with the same patterns (prepare, triage, grill, spec, tickets, publish, fail). `src/task-kit.ts`: what both tasks share (asking an agent with a fixed request ID, reading its report, per-repo services). `src/runs.ts`: how `run` and `status` describe either kind of run.
+- `src/shaping.ts`: shaping, a second durable task with the same patterns (prepare, triage, grill, spec, tickets, publish, fail). `src/task-kit.ts`: what every task shares (the `Services` each gets per repo, asking an agent with a fixed request ID, reading its report). `src/runs.ts`: how `run` and `status` describe either kind of run.
 - `src/pipeline.ts`: the build pipeline's durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again. Each run uses the settings and services of its own repo, so one process works on any number of repos.
+- `src/build-steps.ts`: the build's finishing steps (implement, check, code review, verify, describe, update, publish), shared code the build pipeline runs after planning. Another durable task can start them at any one of them, given the work so far, and they run the same loop to the same pull request description and verdict.
 - `src/config.ts` / `src/repos.ts`: your settings and each repo's `.phat-mode.json` (read from GitHub), and which repo an issue reference means. `src/init.ts`: what `phat-mode init` detects, installs and reports.
 - `src/spec.ts`: finds the spec (Agent Brief or issue body), its acceptance criteria and blockers, and decides eligibility.
 - `src/verify.ts`: finds the repo's verify skill, protects it, collects evidence, and decides what blocks.
