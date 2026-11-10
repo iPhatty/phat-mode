@@ -1,18 +1,31 @@
 import type { Context } from '@earendil-works/chord/context';
 import type { ConversationId, TaskId, TaskRuntime } from '@earendil-works/pi-durable';
 import { type Report, type ReportData, ReportsDoc } from './agents.ts';
+import type { Config } from './config.ts';
+import type { GitHub } from './github.ts';
 import type { Logger } from './log.ts';
 import { NUDGE } from './prompts.ts';
+import type { Checks, Workspaces } from './workspace.ts';
 
 /**
- * What every durable task of phat-mode shares: the build pipeline (src/pipeline.ts) and shaping (src/shaping.ts).
+ * What every durable task of phat-mode shares: the build pipeline (src/pipeline.ts), shaping (src/shaping.ts) and the
+ * build's finishing steps (src/build-steps.ts).
  */
+
+/** What every task gets for the repo it runs on. */
+export type Services = {
+  config: Config;
+  github: GitHub;
+  workspaces: Workspaces;
+  checks: Checks;
+  logger: Logger;
+};
 
 /** A failure a task reports on the issue, instead of a crash. */
 export class StepFailure extends Error {}
 
 /** What asking an agent needs from a task's runtime; the same for every kind of task. */
-type AgentRuntime = Pick<TaskRuntime<unknown, unknown, unknown, object>, 'conversation' | 'snapshot'>;
+export type AgentRuntime = Pick<TaskRuntime<unknown, unknown, unknown, object>, 'conversation' | 'snapshot'>;
 
 /** Send one request to an agent and wait for its answer. Same request id after a restart: same request. */
 export async function ask(
