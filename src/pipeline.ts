@@ -1,12 +1,11 @@
 import type { Context } from '@earendil-works/chord/context';
-import { configure, defineExtension, defineTask, type Extension, type RunningTask, type TaskRuntime } from '@earendil-works/pi-durable';
-import { AGENTS, modelRole, ROLE_TOOLS, RoleDoc } from './agents.ts';
+import { defineExtension, defineTask, type Extension, type RunningTask, type TaskRuntime } from '@earendil-works/pi-durable';
 import { eligibility, type ParentIssue, parentRef } from './spec.ts';
 import { mkdir } from 'node:fs/promises';
 import { modelFor } from './config.ts';
 import { commentMarker, type Issue, mergeLabels, progressChange } from './github.ts';
 import { failedComment, needsHumanComment, needsInfoComment, planComment } from './messages.ts';
-import { implementPrompt, planPrompt, roleInstructions } from './prompts.ts';
+import { implementPrompt, planPrompt } from './prompts.ts';
 import {
   askForReport,
   failureGuard,
@@ -20,7 +19,7 @@ import { scratchFor } from './workspace.ts';
 import {
   type BuildStepsState,
   buildSteps,
-  type Conversations,
+  createConversations,
   type FailState,
   RESULT_MARKER,
   type Setup,
@@ -160,20 +159,7 @@ function repoPhases(services: Services) {
         logger.step(number, `Workspace ready: ${workspace}`);
 
         await runtime.commit(async (tx) => {
-          const conversations = {} as Conversations;
-          for (const role of AGENTS) {
-            const model = modelFor(config, modelRole(role));
-            const created = await tx.createConversation({ ownership: { kind: 'task', taskId: runtime.taskId } });
-            await configure(tx, created.id, {
-              model: { provider: model.provider, modelId: model.modelId },
-              thinkingLevel: model.thinkingLevel,
-              tools: ROLE_TOOLS[role],
-              instructions: roleInstructions(config.checkCommand)[role],
-              cwd: workspace,
-            });
-            Object.assign(await tx.doc(RoleDoc, created.id), { role, repo: config.repo, issue: number, workspace });
-            conversations[role] = created.id;
-          }
+          const conversations = await createConversations(tx, { taskId: runtime.taskId, config, issue: number, workspace });
           return { status: 'running', checkpoint: { phase: 'plan', issue, spec, workspace, conversations } };
         }, context);
       }),

@@ -305,7 +305,7 @@ describe('labels', () => {
 
   test('requiredLabels: the triage labels, agent-mode and every progress label, as the repo names them', () => {
     const names = requiredLabels(DEFAULT_LABELS).map((label) => label.name);
-    for (const name of ['ready-for-agent', 'agent-mode', 'phat-mode:working', 'phat-mode:shaped']) assert.ok(names.includes(name), name);
+    for (const name of ['ready-for-agent', 'agent-mode', 'phat-mode:working', 'phat-mode:shaped', 'phat-mode:stuck']) assert.ok(names.includes(name), name);
     const renamed = requiredLabels({ ...DEFAULT_LABELS, agentMode: 'shape-me' }).map((label) => label.name);
     assert.ok(renamed.includes('shape-me'));
     assert.equal(renamed.includes('agent-mode'), false);

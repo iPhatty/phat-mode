@@ -38,7 +38,25 @@ export type PullRequestStatus = {
   head: { sha: string; committedAt: string };
   /** Check runs (GitHub Actions and other apps) and commit statuses, by name. */
   checks: { name: string; state: CheckState }[];
+  /** Whether it merges into its base branch without conflicts, as GitHub last worked out. */
+  mergeable: Mergeable;
+  /**
+   * GitHub's `mergeStateStatus`: BEHIND (behind its base branch, which must be up to date to merge), BLOCKED, CLEAN,
+   * DIRTY (conflicts), DRAFT, HAS_HOOKS, UNKNOWN or UNSTABLE.
+   */
+  mergeState: string;
+  labels: string[];
+  /** Every review, oldest first. */
+  reviews: Review[];
 };
+
+export type Mergeable = 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
+
+/** A review of a pull request. `state`: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED or PENDING. */
+export type Review = { author: string; state: string; submittedAt: string };
+
+/** A comment phat-mode posted, with its marker. */
+export type PostedComment = { body: string; createdAt: string };
 
 /** An open issue as listed: labels only, no body or comments. */
 export type ListedIssue = { number: number; title: string; labels: string[] };
@@ -52,11 +70,13 @@ export const PROGRESS_LABELS = {
   done: { name: 'phat-mode:done', color: '0E8A16', description: 'phat-mode opened a pull request' },
   failed: { name: 'phat-mode:failed', color: 'B60205', description: 'phat-mode could not finish' },
   shaped: { name: 'phat-mode:shaped', color: '5319E7', description: 'phat-mode shaped this into tickets' },
+  /** On a pull request: repair gave up on it. Only a human removes it, which gives it a fresh repair budget. */
+  stuck: { name: 'phat-mode:stuck', color: 'D93F0B', description: 'phat-mode gave up repairing this pull request' },
 } as const;
 
 /**
  * The progress of a run: one at a time, each replacing the others. `shaped` is not one of them: it stays on a Parent
- * while its Tickets are built.
+ * while its Tickets are built; nor is `stuck`, which is on a pull request, not an issue.
  */
 export const RUN_PROGRESS = ['working', 'done', 'failed'] as const;
 export type Progress = (typeof RUN_PROGRESS)[number];
@@ -124,8 +144,13 @@ export interface GitHub {
   openBlockers(issue: number, mentioned: readonly number[]): Promise<number[]>;
   /** The issue's native parent (sub-issues), if it has one. */
   parentIssue(issue: number): Promise<number | undefined>;
-  /** A pull request's description, head commit and the checks on it. */
+  /** A pull request's description, head commit and the checks on it, mergeability, labels and reviews. */
   pullRequestStatus(pr: number): Promise<PullRequestStatus>;
+  /**
+   * The comments on an issue or pull request posted by the `gh` user only, oldest first: on a public repo anyone can
+   * post one carrying phat-mode's markers.
+   */
+  phatModeComments(number: number): Promise<PostedComment[]>;
   /**
    * Squash-merge the pull request and delete its branch, only if its head is still `sha`. Never bypasses branch
    * protection. Throws with GitHub's reason when it refuses.
@@ -337,12 +362,19 @@ export class GhGitHub implements GitHub {
 
   async pullRequestStatus(pr: number): Promise<PullRequestStatus> {
     const raw = JSON.parse(
-      await this.#gh(['pr', 'view', String(pr), '-R', this.#repo, '--json', 'body,headRefOid,commits,statusCheckRollup']),
+      await this.#gh([
+        'pr', 'view', String(pr), '-R', this.#repo,
+        '--json', 'body,headRefOid,commits,statusCheckRollup,mergeable,mergeStateStatus,labels,reviews',
+      ]),
     ) as {
       body: string;
       headRefOid: string;
       commits: { oid: string; committedDate: string }[];
       statusCheckRollup: RolledUpCheck[] | null;
+      mergeable?: Mergeable;
+      mergeStateStatus?: string;
+      labels?: { name: string }[];
+      reviews?: { author: { login: string } | null; state: string; submittedAt: string }[];
     };
     const head = raw.commits.find((commit) => commit.oid === raw.headRefOid) ?? raw.commits.at(-1);
     if (head === undefined) throw new Error(`Pull request #${pr} has no commits`);
@@ -350,7 +382,27 @@ export class GhGitHub implements GitHub {
       body: raw.body,
       head: { sha: raw.headRefOid, committedAt: head.committedDate },
       checks: (raw.statusCheckRollup ?? []).map(checkState),
+      mergeable: raw.mergeable ?? 'UNKNOWN',
+      mergeState: raw.mergeStateStatus ?? 'UNKNOWN',
+      labels: (raw.labels ?? []).map((label) => label.name),
+      reviews: (raw.reviews ?? []).map((review) => ({
+        author: review.author?.login ?? 'ghost',
+        state: review.state,
+        submittedAt: review.submittedAt,
+      })),
     };
+  }
+
+  async phatModeComments(number: number): Promise<PostedComment[]> {
+    const pages = JSON.parse(
+      await this.#gh(['api', '--paginate', '--slurp', `repos/${this.#repo}/issues/${number}/comments`]),
+    ) as { body: string; created_at: string; user: { login: string } | null }[][];
+    const me = await this.#me();
+    return pages
+      .flat()
+      .filter((comment) => comment.user?.login === me)
+      .map((comment) => ({ body: comment.body, createdAt: comment.created_at }))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async mergePullRequest(pr: number, sha: string): Promise<void> {

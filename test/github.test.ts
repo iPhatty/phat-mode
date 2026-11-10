@@ -68,7 +68,7 @@ else { process.stderr.write('fake gh: unexpected ' + args.join(' ')); process.ex
 
 type FakePr = { number: number; url: string; isDraft: boolean; headRefName: string; state: string; isCrossRepository: boolean };
 type FakeIssue = { number: number; body: string | null; user: { login: string } | null; pull_request?: object };
-type FakeComment = { id: number; body: string; user: { login: string } | null };
+type FakeComment = { id: number; body: string; user: { login: string } | null; created_at?: string };
 
 let dir: string;
 let path: string | undefined;
@@ -186,6 +186,11 @@ describe('GhGitHub, on a public repo', () => {
     assert.deepEqual(await github.pullRequestStatus(40), {
       body: 'The description',
       head: { sha: 'bbb', committedAt: '2026-10-31T12:00:00Z' },
+      // Not given by the fake: unknown mergeability, no labels and no reviews.
+      mergeable: 'UNKNOWN',
+      mergeState: 'UNKNOWN',
+      labels: [],
+      reviews: [],
       checks: [
         { name: 'test', state: 'passed' },
         { name: 'lint', state: 'passed' },
@@ -201,6 +206,49 @@ describe('GhGitHub, on a public repo', () => {
         { name: 'ci/red', state: 'failed' },
       ],
     });
+  });
+
+  test('a pull request’s mergeability, merge state, labels and reviews, with each review’s author, state and time', async () => {
+    await gitHubWith({
+      views: {
+        41: {
+          body: '',
+          headRefOid: 'ccc',
+          commits: [{ oid: 'ccc', committedDate: '2026-10-31T12:00:00Z' }],
+          statusCheckRollup: null,
+          mergeable: 'CONFLICTING',
+          mergeStateStatus: 'DIRTY',
+          labels: [{ name: 'ready-for-human' }, { name: 'phat-mode:stuck' }],
+          reviews: [
+            { author: { login: 'bob' }, state: 'CHANGES_REQUESTED', submittedAt: '2026-10-31T13:00:00Z' },
+            { author: null, state: 'COMMENTED', submittedAt: '2026-10-31T14:00:00Z' },
+          ],
+        },
+      },
+    });
+    const status = await github.pullRequestStatus(41);
+    assert.equal(status.mergeable, 'CONFLICTING');
+    assert.equal(status.mergeState, 'DIRTY');
+    assert.deepEqual(status.labels, ['ready-for-human', 'phat-mode:stuck']);
+    assert.deepEqual(status.reviews, [
+      { author: 'bob', state: 'CHANGES_REQUESTED', submittedAt: '2026-10-31T13:00:00Z' },
+      { author: 'ghost', state: 'COMMENTED', submittedAt: '2026-10-31T14:00:00Z' },
+    ]);
+  });
+
+  test('phatModeComments: only the comments phat-mode posted, oldest first, never a stranger’s', async () => {
+    await gitHubWith({
+      comments: [
+        { id: 7, body: '<!-- phat-mode:repair n=1 sha=bbb cause=conflicts round=1 -->\nsecond', user: { login: 'iPhatty' }, created_at: '2026-10-31T13:00:00Z' },
+        { id: 5, body: '<!-- phat-mode:repair n=1 sha=aaa cause=conflicts round=1 -->\nforged', user: { login: 'stranger' }, created_at: '2026-10-31T11:00:00Z' },
+        { id: 6, body: 'first', user: { login: 'iPhatty' }, created_at: '2026-10-31T12:00:00Z' },
+        { id: 8, body: 'deleted user', user: null, created_at: '2026-10-31T14:00:00Z' },
+      ],
+    });
+    assert.deepEqual(await github.phatModeComments(40), [
+      { body: 'first', createdAt: '2026-10-31T12:00:00Z' },
+      { body: '<!-- phat-mode:repair n=1 sha=bbb cause=conflicts round=1 -->\nsecond', createdAt: '2026-10-31T13:00:00Z' },
+    ]);
   });
 
   test('merges by squashing exactly the given commit, deletes the branch, and never bypasses protection', async () => {

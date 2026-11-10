@@ -179,9 +179,9 @@ const YOLO_WARNING =
 
 /**
  * Work through the ready and `agent-mode` issues of `repos` until Ctrl-C: up to `maxParallelRuns` runs at once, at most
- * one per project (src/scheduler.ts). Each project keeps its own queue: finish a run left interrupted, then shape or
- * start its next issue (src/watch.ts). Within a repo, shaping goes ahead while a phat-mode pull request is open, but no
- * new build starts; waiting for that pull request takes no slot.
+ * one per project (src/scheduler.ts). Each project keeps its own queue: finish a run left interrupted, then repair a
+ * stuck pull request, shape, or start its next issue (src/watch.ts). Within a repo, repairing and shaping go ahead
+ * while a phat-mode pull request is open, but no new build starts; waiting for that pull request takes no slot.
  */
 async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Promise<number> {
   const configFor = repoConfigs(machine);
@@ -238,9 +238,10 @@ async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Pr
       const config = await configFor(repo);
       const step = await nextStep(new GhGitHub(repo), config, consoleLoggerFor(repo), { yolo });
       say(repo, describeStep(step));
-      if (step.kind !== 'start' && step.kind !== 'shape') return undefined;
+      if (step.kind !== 'start' && step.kind !== 'shape' && step.kind !== 'repair') return undefined;
       resumeOnce(phat);
-      const { taskId } = await phat.start({ repo, issue: step.issue }, context, step.kind === 'shape' ? 'shape' : 'build');
+      const kind: RunKind = step.kind === 'start' ? 'build' : step.kind;
+      const { taskId } = await phat.start({ repo, issue: step.issue }, context, kind);
       return waitFor(phat, `${repo}#${step.issue}`, taskId);
     },
   });

@@ -44,6 +44,7 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 | `phat-mode:working` / `phat-mode:done` / `phat-mode:failed` | phat-mode | its own progress; one at a time |
 | `agent-mode` | you | shape this vague issue into tickets ([agent mode](#agent-mode)); never built itself (name configurable under `labels`) |
 | `phat-mode:shaped` | phat-mode | [agent mode](#agent-mode) shaped this issue: it marks the Parent (or a single shaped ticket) and stays on while the tickets are built; `watch` closes the Parent once all its sub-issues are closed |
+| `phat-mode:stuck` | phat-mode, on a PR | [repair](#repair) gave up on this PR: it is yours. Only you remove it, which gives the PR a fresh repair budget |
 
 `phat-mode init` creates any of these the repo is missing, with a colour and description, under the names in `labels`; it never changes a label that is already there. Creating labels needs write access: if it cannot, `init` names the labels and GitHub's reason, and exits 1. Run it again after renaming labels.
 
@@ -53,6 +54,7 @@ Acceptance criteria, out-of-scope lists and `Blocked by` references are read fro
 | Spec has gaps | `needs-info`, with triage notes in the skills' format |
 | Not for an agent | `ready-for-human`, with the reason |
 | Gave up (e.g. checks keep failing) | `ready-for-human` + `phat-mode:failed`, with the reason |
+| [Repair](#repair) gave up on its PR | `ready-for-human` + `phat-mode:failed`, with the reason (the PR gets `phat-mode:stuck` and a summary of every attempt) |
 
 To retry, label the issue `ready-for-agent` again and run it. Agent mode's outcomes are listed under [Agent mode](#agent-mode).
 
@@ -97,7 +99,7 @@ Every outcome except a refusal removes `agent-mode`; a refused issue keeps all i
 
 ### How `watch` schedules shaping
 
-Each time [`watch`](#watch) looks at a repo, after finishing any run still going, it first closes finished Parents (every sub-issue closed), then shapes the lowest-numbered `agent-mode` issue that may be shaped, even while a phat-mode PR waits for you to merge it, and only then builds. Shaping takes a run slot like building does; waiting for a PR to be merged takes none (see [Parallel runs](#parallel-runs)).
+Each time [`watch`](#watch) looks at a repo, after finishing any run still going, it first closes finished Parents (every sub-issue closed), then [repairs](#repair) a stuck PR, then shapes the lowest-numbered `agent-mode` issue that may be shaped, even while a phat-mode PR waits for you to merge it, and only then builds. Shaping takes a run slot like building does; waiting for a PR to be merged takes none (see [Parallel runs](#parallel-runs)).
 
 ## Watch
 
@@ -108,10 +110,11 @@ Up to [`maxParallelRuns`](#parallel-runs) runs at once (default 1: one at a time
 1. removes the [workspaces](#workspaces) nothing needs any more (closed issues, shaped issues), holding the repo's lock, and logs each one with the space freed, e.g. `lingo#72  ▸ removed workspace (785 MB)`;
 2. finishes any run left interrupted (e.g. by a crash or Ctrl-C);
 3. closes every open `phat-mode:shaped` Parent whose sub-issues (its tickets) are all closed, with a summary comment listing them. A shaped issue with no sub-issues (shaped into one ticket) closes when its own PR merges;
-4. [shapes](#agent-mode) the **lowest-numbered `agent-mode` issue that may be shaped**, before any build and even while a PR waits for you to merge it, so its tickets are ready by the time building can go on. An `agent-mode` issue that cannot be shaped is said among the waiting lines, once; one that is refused (already shaped, or also carrying a triage state label) also gets the same comment as `run` posts, once;
-5. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge (with [`--yolo`](#yolo), it merges the ones it can first, lowest issue first, and says why it does not merge the others);
-6. hands an issue to a human if its PR was closed without merging (`ready-for-human`, with a comment; label it `ready-for-agent` again to retry);
-7. starts the **lowest-numbered issue that is ready and not blocked**: open, `ready-for-agent`, not `agent-mode`, specified by a trusted author, no blockers still standing (a blocker whose phat-mode PR has merged is finished, even while GitHub has not closed its issue yet), and not `phat-mode:working` or `phat-mode:done`. `phat-mode:failed` with `ready-for-agent` again means: try again.
+4. [repairs](#repair) the stuck PR of the **lowest-numbered issue** (one that conflicts with its base branch, or is behind it where GitHub requires it up to date), before shaping or building anything; a repair takes a run slot;
+5. [shapes](#agent-mode) the **lowest-numbered `agent-mode` issue that may be shaped**, before any build and even while a PR waits for you to merge it, so its tickets are ready by the time building can go on. An `agent-mode` issue that cannot be shaped is said among the waiting lines, once; one that is refused (already shaped, or also carrying a triage state label) also gets the same comment as `run` posts, once;
+6. waits while a PR from a `phat-mode/issue-*` branch is open: that one is waiting for you to merge (with [`--yolo`](#yolo), it merges the ones it can first, lowest issue first, and says why it does not merge the others). The waiting line also says why repair leaves a PR alone, e.g. `(repair paused: changes requested by @bob)` or `(phat-mode:stuck: waiting for you)`;
+7. hands an issue to a human if its PR was closed without merging (`ready-for-human`, with a comment; label it `ready-for-agent` again to retry);
+8. starts the **lowest-numbered issue that is ready and not blocked**: open, `ready-for-agent`, not `agent-mode`, specified by a trusted author, no blockers still standing (a blocker whose phat-mode PR has merged is finished, even while GitHub has not closed its issue yet), and not `phat-mode:working` or `phat-mode:done`. `phat-mode:failed` with `ready-for-agent` again means: try again.
 
 Merging a PR unblocks the issues that wait for it at once, whether or not GitHub has closed its issue yet (`Closes #N`), so blockers set up as GitHub issue dependencies or `Blocked by` lines give the order. When nothing can start, it says why, once: e.g. `#9 is blocked by #18 (ready-for-human)`.
 
@@ -119,13 +122,39 @@ It polls rather than using GitHub webhooks: a webhook needs a public address for
 
 ### Parallel runs
 
-`maxParallelRuns` in your [config.json](#yours-phat-modeconfigjson) caps how many runs one watch does at once (default 1). A run is building an issue or shaping an `agent-mode` issue; waiting for a PR to be merged is not a run, so it takes no slot. A project never has two runs at once, whatever the cap, and the cap is per watch process: two watches each have their own.
+`maxParallelRuns` in your [config.json](#yours-phat-modeconfigjson) caps how many runs one watch does at once (default 1). A run is building an issue, shaping an `agent-mode` issue, or repairing a stuck PR; waiting for a PR to be merged is not a run, so it takes no slot. A project never has two runs at once, whatever the cap, and the cap is per watch process: two watches each have their own.
 
 - When more projects have work than there are free slots, they start in the order of the watch's list, and a slot that frees up goes to the next project **after the one that last started** (wrapping round), so no project starves even when the first one always has work.
 - A run that fails or is aborted frees only its own slot: the other projects' runs carry on. So does a look that fails (offline, GitHub down).
 - Every log line of a run names it: steps and agents' tool lines show `name#12`, and the watch's own lines `owner/name`, so interleaved output stays readable.
 
 Parallel runs mean parallel verifications. Each project's [verify skill](#verification) must keep them from colliding: no fixed ports, simulators, devices or paths shared with another project's runs (pick a free port, a dedicated simulator, a per-workspace folder).
+
+### Repair
+
+phat-mode **repairs** its own stuck pull requests before handing them to you. Repair is a third durable task kind, next to building and shaping: it survives crashes and Ctrl-C, and `status`, `resume` and `abort` cover it (`status` says e.g. `repairing: running (update)`, and for a held project `doing #12 repair (update)`). Only `watch` starts repairs; `"repair": false` in your [config.json](#yours-phat-modeconfigjson) turns it off. Why it works this way: [ADR 0006](docs/adr/0006-repair-is-its-own-task-kind.md).
+
+So far it repairs **conflicts**: a phat-mode PR that conflicts with its base branch, or is behind it where GitHub won't merge it until it's updated. The repair resets the issue's workspace to the PR's head, merges the base branch in, and gives any conflicts to a fresh implementer, told the spec, the PR's description, the plan's agreed decisions and the build's departures (read back from that description). Then check, code review and verification run again, as for a build, the implementer writes the description again, and the PR gets the new description and a new verdict for its new head, so [`--yolo`](#yolo) merges it as usual once it is clean and green. Each repair posts one comment on the PR, saying what failed, the cause and the outcome. Failed checks and a `not-clean` verdict are reported as stuck but not repaired yet: those PRs wait as before.
+
+Repair never overrides you. It leaves a PR alone when:
+
+- it is not phat-mode's: not a `phat-mode/issue-<n>` branch in the repo, or no verdict marker in its description;
+- you pushed commits to it (its head is not the commit phat-mode judged);
+- you submitted a "changes requested" review after phat-mode's last push (it is paused; a plain comment or an approval does not pause it);
+- it is labelled `phat-mode:stuck`.
+
+It checks this again while it runs (before starting, before merging, before publishing and before giving up, also after a resume), and stops when you act meanwhile, without labelling the PR stuck or failing the issue; its outcome then says `stopped: …`. It only ever pushes over the head it started from, so a commit you push during a repair is never overwritten.
+
+The count lives on the PR, in each repair comment's hidden marker (`<!-- phat-mode:repair n=1 sha=<head> cause=conflicts round=1 -->`), so it survives losing phat-mode's home folder. Only comments by the `gh` user count, a repair counts at most once per head commit, and a head commit is never repaired twice. After `limits.maxRepairs` repairs (default 3) without success, or when a repair cannot get the PR past the conflict (e.g. the checks keep failing after the merge), repair gives up: the PR gets `phat-mode:stuck` and a comment listing each attempt's cause and outcome, and the issue gets `ready-for-human` + `phat-mode:failed`. A stuck PR still holds up its repo's build queue. Remove `phat-mode:stuck` to give it a fresh budget: only repairs after the last give-up count.
+
+```console
+$ phat-mode status
+owner/x
+  owner/x#12  repairing: running (update), run `phat-mode resume` to continue
+  owner/x#9  repairing: 🔧 Repaired: https://github.com/owner/x/pull/31
+owner/y
+  held by pid 123 (`phat-mode watch`, since 10:04:12): doing #7 repair (implement)
+```
 
 ### Several watches
 
@@ -267,7 +296,7 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 | `phat-mode watch [--yolo] [repo…]` | Shape the `agent-mode` issues and work through the ready ones, up to `maxParallelRuns` runs at once (default 1), one per project, until Ctrl-C. In a set-up repo, asks: this repo or all. Skips projects another watch holds and takes them over when it stops. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
 | `phat-mode run [--yolo] <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. `--yolo` then waits and merges the PR. See [Yolo](#yolo). |
 | `phat-mode resume` | Continue every interrupted run, building or shaping, in every project no other process holds (a held one is named and skipped, and the exit code is 1). |
-| `phat-mode status` | List every project (your `repos`, and any other with runs) and its runs: shaping or building, and where they are. For a project another process holds, what that process is doing, from its lock file. |
+| `phat-mode status` | List every project (your `repos`, and any other with runs) and its runs: shaping, building or repairing, and where they are (e.g. `repairing: running (update)`). For a project another process holds, what that process is doing, from its lock file. |
 | `phat-mode abort <issue>` | Stop a run. |
 | `phat-mode clean [--dry-run] [repo…]` | Remove the [workspaces](#workspaces) nothing needs any more, in the named projects or every known one (your `repos`, and any other with runs). Prints each removal and the total space freed; lists folders it does not know and leaves them alone. A project another process holds is named and skipped (exit 1). `--dry-run` prints the same plan and removes nothing. |
 | `phat-mode doctor [repo]` | Check git, gh, the Copilot login, the models, and each repo's settings, access and labels. |
@@ -280,7 +309,7 @@ Ctrl-C is always safe: progress is saved, and `run` or `resume` continues from t
 
 Each project (repo) has its own **lock** (`locks/<owner>__<name>.lock` in phat-mode's home) and its own **durable database** (`state/<owner>__<name>.sqlite`). Pi Durable storage has no cross-process locking, so a process opens a project's database only while it holds that project's lock: different phat-mode processes can work on different projects at once, never on the same one. A `watch` skips the projects another process holds and takes them over when it stops ([Several watches](#several-watches)); `run`, `resume`, `abort` and `clean` on a project another process holds exit 1 with e.g. ``owner/x is held by pid 123 (`phat-mode watch`, since 10:04:12)``. A lock left by a crashed process is taken over automatically (a lock is a small folder of holder files; never edit it while phat-mode runs). Why: [ADR 0004](docs/adr/0004-one-lock-and-one-durable-database-per-project.md).
 
-The lock file says who holds the project (pid, command, since when) and what it is doing right now (issue, build or shaping, phase), kept current as the run moves on. That is what `status` shows for a held project, e.g. `held by pid 123 (…): doing #12 build (implement)`, without opening its database.
+The lock file says who holds the project (pid, command, since when) and what it is doing right now (issue, build, shaping or repair, phase), kept current as the run moves on. That is what `status` shows for a held project, e.g. `held by pid 123 (…): doing #12 build (implement)` or `doing #12 repair (update)`, without opening its database.
 
 Writes to `auth.json` (Copilot token refreshes) are locked across processes too, and each re-reads the file first, so one process never overwrites a newer token with an older one.
 
@@ -346,15 +375,18 @@ Optional; anything left out uses the defaults in [`src/config.ts`](src/config.ts
 {
   "repos": ["iPhatty/phatty-lingo"],
   "allowedAuthors": ["iPhatty"],
-  "limits": { "maxCheckFixes": 3, "maxReviewRounds": 5 },
+  "limits": { "maxCheckFixes": 3, "maxReviewRounds": 5, "maxRepairs": 3 },
   "watchIntervalMs": 120000,
-  "maxParallelRuns": 1
+  "maxParallelRuns": 1,
+  "repair": true
 }
 ```
 
 - `repos`: what `watch` works on when no repos are named (inside a set-up repo, it asks: that one or all). `init` adds to it.
 - `allowedAuthors`: trusted on every repo that does not list its own. Default: you, the `gh` user.
-- `maxParallelRuns`: how many runs (builds and shapings, not waiting for a merge) one `watch` does at once, at most one per project. Default 1: one at a time. A whole number of 1 or more; the cap is per watch process. Each project's verify skill must keep parallel runs from colliding (ports, simulators, fixed paths): see [Parallel runs](#parallel-runs).
+- `repair`: whether `watch` [repairs](#repair) phat-mode's stuck PRs. Default `true`; `false` keeps them waiting for you, as before.
+- `limits.maxRepairs`: repairs of one PR before phat-mode gives up and labels it `phat-mode:stuck`. Default 3; removing the label gives a fresh budget.
+- `maxParallelRuns`: how many runs (builds, shapings and repairs, not waiting for a merge) one `watch` does at once, at most one per project. Default 1: one at a time. A whole number of 1 or more; the cap is per watch process. Each project's verify skill must keep parallel runs from colliding (ports, simulators, fixed paths): see [Parallel runs](#parallel-runs).
 - Repo settings (`checkCommand`, `repo`, …) here are an error, pointing to `.phat-mode.json`.
 
 #### Models
@@ -395,7 +427,7 @@ Set the environment variable **`PHAT_MODE_HOME`** to move that home (config.json
 
 ## How it works
 
-- `src/shaping.ts`: shaping, a second durable task with the same patterns (prepare, triage, grill, spec, tickets, publish, fail). `src/task-kit.ts`: what every task shares (the `Services` each gets per repo, asking an agent with a fixed request ID, reading its report). `src/runs.ts`: how `run` and `status` describe either kind of run.
+- `src/shaping.ts`: shaping, a second durable task with the same patterns (prepare, triage, grill, spec, tickets, publish, fail). `src/task-kit.ts`: what every task shares (the `Services` each gets per repo, asking an agent with a fixed request ID, reading its report). `src/repair.ts`: Repair, a third durable task (look, prepare, then the build's finishing steps from `update`, fail, give-up); `src/stuck.ts`: why a PR is stuck, decided from GitHub alone, and the repair markers. `src/runs.ts`: how `run` and `status` describe each kind of run.
 - `src/pipeline.ts`: the build pipeline's durable task, one phase per step. Each phase saves a checkpoint before the next one starts. Agent requests have fixed IDs, so after a restart they reattach to the same request instead of asking again. Each run uses the settings and services of its own repo, so one process works on any number of repos.
 - `src/build-steps.ts`: the build's finishing steps (implement, check, code review, verify, describe, update, publish), shared code the build pipeline runs after planning. Another durable task can start them at any one of them, given the work so far, and they run the same loop to the same pull request description and verdict.
 - `src/config.ts` / `src/repos.ts`: your settings and each repo's `.phat-mode.json` (read from GitHub), and which repo an issue reference means. `src/init.ts`: what `phat-mode init` detects, installs and reports.

@@ -1,19 +1,42 @@
+import { PROGRESS_LABELS } from './github.ts';
+import type { RunKind } from './harness.ts';
 import type { PipelineResult } from './pipeline.ts';
+import { REPAIR_TASK, type RepairResult } from './repair.ts';
 import { SHAPING_TASK, type ShapingResult } from './shaping.ts';
 
 /**
- * How the CLI describes runs, of either kind: building an issue into a pull request (`phat.pipeline`), or shaping an
- * `agent-mode` issue (`phat.shape`). `taskKind`: the task definition's name, from the task record.
+ * How the CLI describes runs, of any kind: building an issue into a pull request (`phat.pipeline`), shaping an
+ * `agent-mode` issue (`phat.shape`), or repairing an issue's stuck pull request (`phat.repair`). `taskKind`: the task
+ * definition's name, from the task record.
  */
 
 export const isShaping = (taskKind: string | undefined) => taskKind === SHAPING_TASK;
 
-/** "shaping" or "building". */
-export const runVerb = (taskKind: string | undefined) => (isShaping(taskKind) ? 'shaping' : 'building');
+/** How each kind of run is named: "building", "shaping" or "repairing". */
+const RUN_VERBS: Record<RunKind, string> = { build: 'building', shape: 'shaping', repair: 'repairing' };
+
+/** The kind of run a task definition's name is; any other task is a build (`phat.pipeline`). */
+export const kindOfTask = (taskKind: string | undefined): RunKind =>
+  taskKind === SHAPING_TASK ? 'shape' : taskKind === REPAIR_TASK ? 'repair' : 'build';
+
+/** "building", "shaping" or "repairing", for a run's kind. */
+export const verbFor = (kind: RunKind) => RUN_VERBS[kind];
+
+/** The verb for a task definition's name. */
+export const runVerb = (taskKind: string | undefined) => verbFor(kindOfTask(taskKind));
 
 /** One line on how a finished run ended. */
-export function describeResult(result: PipelineResult | ShapingResult, taskKind?: string): string {
+export function describeResult(result: PipelineResult | ShapingResult | RepairResult, taskKind?: string): string {
   if (result.status === 'ignored') return `⏭️  Ignored: ${result.reason}`;
+  if (taskKind === REPAIR_TASK) {
+    const repair = result as RepairResult;
+    switch (repair.status) {
+      case 'repaired':
+        return `🔧 Repaired: ${repair.url}`;
+      case 'stuck':
+        return `🛑 Gave up on ${repair.url}: ${repair.reason.replace(/\.$/, '')}. It is labelled ${PROGRESS_LABELS.stuck.name}; remove the label to let phat-mode repair it again.`;
+    }
+  }
   if (isShaping(taskKind)) {
     const shaping = result as ShapingResult;
     switch (shaping.status) {
@@ -61,7 +84,9 @@ export function runStatus(record: RunRecord | undefined): string {
   const { state } = record;
   if (state.status === 'terminal' && 'outcome' in state) {
     const { outcome } = state;
-    if (outcome.status === 'completed') return `${verb}: ${describeResult(outcome.result as PipelineResult | ShapingResult, record.kind)}`;
+    if (outcome.status === 'completed') {
+      return `${verb}: ${describeResult(outcome.result as PipelineResult | ShapingResult | RepairResult, record.kind)}`;
+    }
     return `${verb}: ${outcome.status}${outcome.status === 'failed' && outcome.error ? `: ${outcome.error.message.split('\n')[0]}` : ''}`;
   }
   const phase = 'checkpoint' in state ? (state.checkpoint as { phase?: string } | undefined)?.phase : undefined;

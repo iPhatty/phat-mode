@@ -36,7 +36,8 @@ const noSeams = (plan: Pick<PlanReport, 'noSeamsReason'>) => {
 export function silentDecisionLines(plan: Pick<PlanReport, 'silentDecisions'>): string {
   return list(
     (plan.silentDecisions ?? []).map(
-      (decided) => `**${item(decided.question)}** ${item(decided.decision)}${decided.why.trim() ? ` _Why:_ ${item(decided.why)}` : ''}`,
+      (decided) =>
+        `${decided.question.trim() ? `**${item(decided.question)}** ` : ''}${item(decided.decision)}${decided.why.trim() ? ` _Why:_ ${item(decided.why)}` : ''}`,
     ),
   );
 }
@@ -62,6 +63,54 @@ export function departureLines(done: { departures?: readonly Departure[] } | und
         `**${item(departure.decision)}** Instead: ${item(departure.instead)}${departure.why.trim() ? ` _Why:_ ${item(departure.why)}` : ''}`,
     ),
   );
+}
+
+/** The text of a section phat-mode wrote in a pull request description, after its first paragraph (the intro). */
+function descriptionSection(body: string, heading: string): string | undefined {
+  const start = body.indexOf(`\n## ${heading}\n\n`);
+  const from = start === -1 ? (body.startsWith(`## ${heading}\n\n`) ? 0 : -1) : start + 1;
+  if (from === -1) return undefined;
+  const rest = body.slice(from + `## ${heading}\n\n`.length);
+  const end = rest.search(/\n\n## |\n\n---\n|\n\n<!-- phat-mode:/);
+  const text = end === -1 ? rest : rest.slice(0, end);
+  return text.split('\n\n').slice(1).join('\n\n').trim();
+}
+
+const listItems = (text: string) =>
+  text
+    .split('\n')
+    .filter((line) => line.startsWith('- '))
+    .map((line) => line.slice(2).trim());
+
+const SILENT_LINE = /^\*\*(.+?)\*\* (.*?)(?: _Why:_ (.*))?$/;
+const DEPARTURE_LINE = /^\*\*(.+?)\*\* Instead: (.*?)(?: _Why:_ (.*))?$/;
+
+/**
+ * The plan's silent decisions, read back from the "Decided where the ticket was silent" section phat-mode wrote in a
+ * pull request description, so a later run (a Repair) keeps them. A line that does not parse is kept whole, as a
+ * decision.
+ */
+export function silentDecisionsFrom(body: string): Pick<PlanReport, 'silentDecisions' | 'noSilentDecisionsReason'> {
+  const text = descriptionSection(body, 'Decided where the ticket was silent');
+  if (text === undefined || text === '' || text === 'none listed') return { silentDecisions: [] };
+  const none = /^none\. The planner says: ([^]*)$/.exec(text);
+  if (none) return { silentDecisions: [], noSilentDecisionsReason: none[1]!.trim() };
+  return {
+    silentDecisions: listItems(text).map((line) => {
+      const match = SILENT_LINE.exec(line);
+      return match ? { question: match[1]!, decision: match[2]!, why: match[3] ?? '' } : { question: '', decision: line, why: '' };
+    }),
+  };
+}
+
+/** The departures, read back from the "Departures" section of a pull request description; none without one. */
+export function departuresFrom(body: string): Departure[] {
+  const text = descriptionSection(body, 'Departures');
+  if (text === undefined) return [];
+  return listItems(text).map((line) => {
+    const match = DEPARTURE_LINE.exec(line);
+    return match ? { decision: match[1]!, instead: match[2]!, why: match[3] ?? '' } : { decision: line, instead: '', why: '' };
+  });
 }
 
 /** The implementer's agreed decisions, as its request lists them. */
@@ -356,6 +405,70 @@ export function pullRequestBody(details: PullRequestDetails): string {
     `---\nCloses #${issue.number}\n\n🤖 Opened by phat-mode. Description written following the [pr @ ${MATTPOCOCK_SKILLS.short}](${MATTPOCOCK_SKILLS.url('pr')}) skill. A human must review and merge it.`,
   );
   return sections.join('\n\n');
+}
+
+// ─── Repair ─────────────────────────────────────────────────────────────────
+
+/** The first seven characters of a commit, as GitHub shows it. */
+export const shortSha = (sha: string) => sha.slice(0, 7);
+
+const REPAIR_CAUSES: Record<string, string> = {
+  conflicts: 'conflicts with the base branch',
+  checks: 'failed checks',
+  'not-clean': "phat-mode's verdict is not clean",
+};
+
+/** The comment of one repair on the pull request; its `Outcome` line is updated as the repair ends. */
+export function repairComment(repair: { n: number; maxRepairs: number; reason: string; cause: string; outcome: string }): string {
+  return `🤖 **phat-mode repair ${repair.n} of ${repair.maxRepairs}** on this pull request.
+
+**What failed:** ${item(repair.reason)}
+**Cause:** ${REPAIR_CAUSES[repair.cause] ?? repair.cause}
+**Outcome:** ${item(repair.outcome)}`;
+}
+
+const OUTCOME_LINE = /^\*\*Outcome:\*\* (.*)$/m;
+
+/** A repair comment as posted (`posted`, with its `marker` line), with a new outcome; without the marker line. */
+export function withOutcome(posted: string, marker: string, outcome: string): string {
+  const body = posted.startsWith(`${marker}\n`) ? posted.slice(marker.length + 1) : posted;
+  const line = `**Outcome:** ${item(outcome)}`;
+  return OUTCOME_LINE.test(body) ? body.replace(OUTCOME_LINE, () => line) : `${body}\n${line}`;
+}
+
+/** A repair comment's outcome; undefined without one. */
+export const outcomeOf = (body: string) => OUTCOME_LINE.exec(body)?.[1]?.trim();
+
+/** On the pull request, when repair gives up: why, and each attempt of this round with its cause and outcome. */
+export function repairGaveUpSummary(options: {
+  reason: string;
+  attempts: readonly { n: number; sha: string; cause: string; outcome?: string }[];
+  maxRepairs: number;
+  stuckLabel: string;
+}): string {
+  const attempts =
+    options.attempts.length === 0
+      ? 'No repair ran.'
+      : options.attempts
+          .map((attempt) => `- Repair ${attempt.n} on ${shortSha(attempt.sha)} (${attempt.cause}): ${attempt.outcome ?? 'no outcome recorded'}`)
+          .join('\n');
+  return `🤖 **phat-mode gave up repairing this pull request** and labelled it \`${options.stuckLabel}\`. It is yours now.
+
+${options.reason.trim()}
+
+**Attempts:**
+${attempts}
+
+To give phat-mode a fresh round of ${options.maxRepairs} repairs, remove the \`${options.stuckLabel}\` label.`;
+}
+
+/** On the issue, when repair gives up on its pull request: as a failed build. */
+export function repairGaveUpComment(prUrl: string, reason: string, labels: { readyForHuman: string }, stuckLabel: string): string {
+  return `🤖 **phat-mode gave up repairing the pull request for this issue** (${prUrl}), so it moved this to \`${labels.readyForHuman}\`.
+
+${reason.trim()}
+
+The pull request is labelled \`${stuckLabel}\`, with every attempt listed on it. To let phat-mode repair it again, remove that label.`;
 }
 
 // ─── Shaping ────────────────────────────────────────────────────────────────

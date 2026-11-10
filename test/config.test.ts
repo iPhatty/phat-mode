@@ -185,3 +185,23 @@ describe('repoConfig', () => {
     assert.equal(renamed.labels.agentMode, 'shape-me');
   });
 });
+
+describe('repair settings', () => {
+  test('repair is on by default, with at most 3 repairs per pull request', async () => {
+    const config = await withConfig(undefined);
+    assert.equal(config.repair, true);
+    assert.equal(config.limits.maxRepairs, 3);
+  });
+
+  test('"repair": false turns repair off; limits.maxRepairs changes the budget and keeps the other limits', async () => {
+    const config = await withConfig({ repair: false, limits: { maxRepairs: 5 } });
+    assert.equal(config.repair, false);
+    assert.equal(config.limits.maxRepairs, 5);
+    assert.equal(config.limits.maxCheckFixes, 3);
+  });
+
+  test('"repair" must be true or false; unknown keys are still errors', async () => {
+    await assert.rejects(withConfig({ repair: 'no' }), /"repair" must be true or false/);
+    await assert.rejects(withConfig({ repairs: false }), /unknown setting\(s\) repairs/);
+  });
+});

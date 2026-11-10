@@ -433,6 +433,18 @@ describe('run status', () => {
     assert.equal(runStatus(failed), 'shaping: failed: No report.');
     assert.equal(describeResult({ status: 'already_implemented' }, 'phat.shape').includes('ready-for-human'), true);
   });
+
+  test('repairs: where a repair is, and how it ended', () => {
+    const live = { kind: 'phat.repair', state: { status: 'running', checkpoint: { phase: 'update' } } };
+    assert.equal(runStatus(live), 'repairing: running (update), run `phat-mode resume` to continue');
+    const done = (result: unknown) => ({ kind: 'phat.repair', state: { status: 'terminal', outcome: { status: 'completed', result } } });
+    assert.equal(runStatus(done({ status: 'repaired', url: 'https://github.test/pull/100' })), 'repairing: 🔧 Repaired: https://github.test/pull/100');
+    assert.equal(
+      runStatus(done({ status: 'stuck', url: 'https://github.test/pull/100', reason: 'gave up: 3 repairs spent' })),
+      'repairing: 🛑 Gave up on https://github.test/pull/100: gave up: 3 repairs spent. It is labelled phat-mode:stuck; remove the label to let phat-mode repair it again.',
+    );
+    assert.equal(runStatus(done({ status: 'ignored', reason: 'phat-mode:stuck: waiting for you' })), 'repairing: ⏭️  Ignored: phat-mode:stuck: waiting for you');
+  });
 });
 
 describe('shaping instructions', () => {

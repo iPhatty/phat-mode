@@ -38,6 +38,11 @@ export type Limits = {
    * review and verification again. After that, the pull request opens behind the base branch.
    */
   maxBranchUpdates: number;
+  /**
+   * Repairs of one pull request before phat-mode gives up on it and labels it `phat-mode:stuck`. Counted on the pull
+   * request itself; removing the label gives a fresh budget.
+   */
+  maxRepairs: number;
   checkTimeoutMs: number;
   installTimeoutMs: number;
 };
@@ -54,10 +59,12 @@ export type MachineConfig = {
   /** How often `phat-mode watch` looks at GitHub when it has nothing to do. */
   watchIntervalMs: number;
   /**
-   * How many runs (builds and shapings) one `phat-mode watch` does at once, at most one per project. Waiting for a pull
+   * How many runs (builds, shapings and repairs) one `phat-mode watch` does at once, at most one per project. Waiting for a pull
    * request to be merged is not a run. Per process: two watches each have their own.
    */
   maxParallelRuns: number;
+  /** Whether `phat-mode watch` repairs its own stuck pull requests (conflicts with the base branch). Default: true. */
+  repair: boolean;
   /** Repos `phat-mode watch` works on ("owner/name"), when none are named on the command line. */
   repos: string[];
   /** GitHub users trusted on every repo, unless the repo's own settings list them. Default: the `gh` user. */
@@ -131,18 +138,20 @@ export function defaultMachineConfig(home = DEFAULT_HOME): MachineConfig {
       maxVerifyRounds: 2,
       maxImplementRuns: 8,
       maxBranchUpdates: 3,
+      maxRepairs: 3,
       checkTimeoutMs: 10 * 60_000,
       installTimeoutMs: 15 * 60_000,
     },
     watchIntervalMs: 2 * 60_000,
     maxParallelRuns: 1,
+    repair: true,
     repos: [],
   };
 }
 
 /** Settings that belong in each repo's .phat-mode.json, not in config.json. */
 const REPO_KEYS = ['repo', 'baseBranch', 'installCommand', 'checkCommand', 'labels'];
-const MACHINE_KEYS = ['defaultModel', 'models', 'limits', 'watchIntervalMs', 'maxParallelRuns', 'repos', 'allowedAuthors'];
+const MACHINE_KEYS = ['defaultModel', 'models', 'limits', 'watchIntervalMs', 'maxParallelRuns', 'repair', 'repos', 'allowedAuthors'];
 
 /** Defaults, overridden by `<home>/config.json` when it exists. */
 export async function loadMachineConfig(home = DEFAULT_HOME): Promise<MachineConfig> {
@@ -171,6 +180,9 @@ export async function loadMachineConfig(home = DEFAULT_HOME): Promise<MachineCon
   }
   if ('maxParallelRuns' in overrides && !(Number.isInteger(overrides.maxParallelRuns) && overrides.maxParallelRuns! >= 1)) {
     throw new Error(`${file}: "maxParallelRuns" must be a whole number of 1 or more`);
+  }
+  if ('repair' in overrides && typeof overrides.repair !== 'boolean') {
+    throw new Error(`${file}: "repair" must be true or false`);
   }
   if (overrides.allowedAuthors !== undefined && !isStringList(overrides.allowedAuthors)) {
     throw new Error(`${file}: "allowedAuthors" must be a non-empty list of GitHub user names`);

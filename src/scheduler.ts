@@ -1,6 +1,7 @@
 /**
  * How one `phat-mode watch` shares its runs between its projects: up to `maxParallelRuns` at once, at most one per
- * project. A run is a build or a shaping; waiting for a pull request to be merged is not. See "Parallel runs" in the README.
+ * project. A run is a build, a shaping or a repair; waiting for a pull request to be merged is not. See "Parallel runs"
+ * in the README.
  */
 
 /** One project of a watch, as the scheduler sees it. */

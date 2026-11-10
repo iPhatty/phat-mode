@@ -1,0 +1,439 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, test } from 'node:test';
+import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
+import type { FauxResponseFactory, FauxResponseStep } from '@earendil-works/pi-ai/providers/faux';
+import { setToolLogger } from '../src/agents.ts';
+import { branchFor, paths } from '../src/config.ts';
+import { run } from '../src/exec.ts';
+import { type RunResult, RunsDoc } from '../src/harness.ts';
+import { readLock } from '../src/lock.ts';
+import { silentLogger } from '../src/log.ts';
+import type { RepairResult } from '../src/repair.ts';
+import { giveUpMarker, readRepairMarker, repairMarker } from '../src/stuck.ts';
+import { readYoloMarker } from '../src/yolo.ts';
+import type { FakeStatus } from './fakes.ts';
+import { call, expectLast, fixture, textOf } from './fixture.ts';
+
+const context = BACKGROUND_CONTEXT;
+setToolLogger(silentLogger);
+
+// ─── Scripted model ─────────────────────────────────────────────────────────
+
+const DECISION = { question: 'Does hello.txt end with a newline?', decision: 'Yes, one trailing newline.', why: 'Every text file does.' };
+const DEPARTURE = { decision: 'Does hello.txt end with a newline?', instead: 'No newline.', why: 'The greeter strips it anyway.' };
+
+const plan = () =>
+  call('report_plan', {
+    decision: 'proceed',
+    summary: 'Add a hello file.',
+    plan: ['Create hello.txt'],
+    established: [],
+    questions: [],
+    reason: '',
+    notes: '',
+    seams: [{ interface: 'hello.txt', catches: 'its content', misses: 'nothing else' }],
+    noSeamsReason: '',
+    silentDecisions: [DECISION],
+    noSilentDecisionsReason: '',
+  });
+const write = (path: string, content: string) => call('write', { path, content });
+const done = (departures: (typeof DEPARTURE)[] = []) =>
+  call('report_done', { summary: 'Added hello.txt.', testing: 'Ran the checks.', departures });
+const describePr = (summary = 'Adds hello.txt.') =>
+  call('report_pr', {
+    summary,
+    evidence: [{ before: 'No hello.txt.', after: '`cat hello.txt` prints `hello`.' }],
+    door: 'two-way',
+    doorNote: '',
+    blastRadius: 'tiny',
+    blastNote: '',
+  });
+/** Both reviewers approve; they run in parallel, so each answer works out which one is asking. */
+const approve = (): FauxResponseFactory[] => {
+  const answer: FauxResponseFactory = (request) => {
+    const axis = textOf(request.messages.at(-1) as { content: unknown }).includes('on the Standards axis') ? 'standards' : 'spec';
+    return call(`report_${axis}`, { summary: `${axis} looks good.`, worst: '', findings: [] });
+  };
+  return [answer, answer];
+};
+/** A request that never answers, until the process "dies". */
+const hangUntilClosed = () => {
+  let reached!: () => void;
+  const started = new Promise<void>((resolve) => (reached = resolve));
+  const hang: FauxResponseFactory = (_request, options) =>
+    new Promise((_resolve, reject) => {
+      reached();
+      options?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    });
+  return { started, hang };
+};
+
+const repaired = (outcome: { status: string; result?: RunResult }) => {
+  assert.equal(outcome.status, 'completed', JSON.stringify(outcome));
+  return outcome.result as RepairResult;
+};
+
+// ─── Setup ──────────────────────────────────────────────────────────────────
+
+/**
+ * Issue 1 built into pull request #100, as phat-mode leaves it: hello.txt, with a departure from the plan. GitHub then
+ * reports it as `status` says, at the commit phat-mode pushed.
+ */
+async function openedPullRequest(status: Partial<FakeStatus> = {}, files: Record<string, string> = {}) {
+  const setup = await fixture(files);
+  const { github, runIssue, remote } = setup;
+  github.addIssue(1);
+  const built = await runIssue(1, [plan(), write('hello.txt', 'hello\n'), done([DEPARTURE]), ...approve(), describePr()]);
+  assert.equal(built.outcome.status, 'completed');
+  const pr = github.prs[0]!;
+  const head = await branchHead(remote, 1);
+  github.statuses.set(pr.number, { head: { sha: head, committedAt: '2026-10-31T11:00:00Z' }, checks: [], ...status });
+  return { ...setup, pr, head };
+}
+
+const branchHead = async (remote: string, issue: number) =>
+  (await run('git', ['--git-dir', remote, 'rev-parse', branchFor(issue)])).stdout.trim();
+const isAncestor = async (remote: string, commit: string, issue: number) =>
+  (await run('git', ['--git-dir', remote, 'merge-base', '--is-ancestor', commit, branchFor(issue)], { allowFailure: true })).code === 0;
+
+/** A human pushes a commit to the issue's branch on the remote; returns it. */
+async function humanPushes(remote: string, issue: number) {
+  const dir = await mkdtemp(join(tmpdir(), 'phat-human-'));
+  const git = (args: string[]) => run('git', ['-c', 'user.name=Human', '-c', 'user.email=h@h', ...args], { cwd: dir });
+  await run('git', ['clone', '--quiet', '--branch', branchFor(issue), remote, dir]);
+  await writeFile(join(dir, 'human.txt'), 'mine\n');
+  await git(['add', '.']);
+  await git(['commit', '--quiet', '-m', 'a human change']);
+  await git(['push', '--quiet', 'origin', `HEAD:${branchFor(issue)}`]);
+  return (await git(['rev-parse', 'HEAD'])).stdout.trim();
+}
+
+/** Both reviewers approve, after `effect` runs once, before the first answer. */
+const approveAfter = (effect: () => Promise<void>): FauxResponseFactory[] => {
+  let ran = false;
+  return approve().map((answer) => async (...args: Parameters<FauxResponseFactory>) => {
+    if (!ran) {
+      ran = true;
+      await effect();
+    }
+    return answer(...args);
+  });
+};
+
+/** A section of a pull request description, up to the next one. */
+const section = (body: string, heading: string) => new RegExp(`## ${heading}\\n\\n[^]*?(?=\\n\\n## |\\n\\n---)`).exec(body)?.[0];
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+describe('repair, conflicts', () => {
+  test('behind main: main is merged in, checked, reviewed and verified again, with a new description, verdict and one repair comment', async () => {
+    const { github, checks, runIssue, remote, remoteFile, advanceMain, pr, head } = await openedPullRequest({ mergeState: 'BEHIND' });
+    const before = pr.body;
+    const main = await advanceMain({ 'other.txt': 'from main\n' });
+    const checked = checks.runs;
+
+    const { outcome, faux } = await runIssue(1, [...approve(), describePr('Adds hello.txt, now with main.')], 'repair');
+
+    assert.deepEqual(repaired(outcome), { status: 'repaired', url: pr.url });
+    assert.equal(faux.getPendingResponseCount(), 0, 'reviewed and described again');
+    assert.equal(checks.runs, checked + 1, 'checked again');
+    assert.ok(await isAncestor(remote, main, 1), 'main is merged into the branch');
+    assert.equal(await remoteFile(1, 'other.txt'), 'from main\n');
+    assert.equal(await remoteFile(1, 'hello.txt'), 'hello\n');
+    const pushed = await branchHead(remote, 1);
+    assert.notEqual(pushed, head);
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'clean', sha: pushed }, 'the verdict is for the new head');
+    assert.match(pr.body, /^## Summary\n\nAdds hello\.txt, now with main\./);
+    // The plan's decisions and the build's departures are kept, as phat-mode wrote them.
+    assert.equal(section(pr.body, 'Decided where the ticket was silent'), section(before, 'Decided where the ticket was silent'));
+    assert.equal(section(pr.body, 'Departures'), section(before, 'Departures'));
+    assert.ok(section(pr.body, 'Decided where the ticket was silent')?.includes('**Does hello.txt end with a newline?** Yes, one trailing newline.'));
+    assert.ok(section(pr.body, 'Departures')?.includes('Instead: No newline.'));
+
+    const comments = github.comments.filter((comment) => comment.issue === pr.number);
+    assert.equal(comments.length, 1, 'one repair comment');
+    assert.equal(comments[0]!.marker, repairMarker({ n: 1, sha: head, cause: 'conflicts', round: 1 }));
+    assert.match(comments[0]!.body, /behind main, which must be up to date to merge/);
+    assert.match(comments[0]!.body, new RegExp(`\\*\\*Outcome:\\*\\* repaired: pushed ${pushed.slice(0, 7)}, verdict clean`));
+    assert.deepEqual(github.labels(pr.number), ['ready-for-human']);
+  });
+
+  test('conflicts: the implementer resolves them, then the change is checked, reviewed and described again', async () => {
+    const { github, runIssue, remote, remoteFile, advanceMain, pr } = await openedPullRequest({ mergeable: 'CONFLICTING' });
+    const main = await advanceMain({ 'hello.txt': 'hi\n' });
+
+    const { outcome, faux } = await runIssue(
+      1,
+      [
+        expectLast((message) => {
+          const text = textOf(message);
+          assert.match(text, /merged origin\/main into the branch; these files have conflicts:\n\n- hello\.txt/);
+        }, write('hello.txt', 'hello\nhi\n')),
+        done(),
+        ...approve(),
+        describePr(),
+      ],
+      'repair',
+    );
+
+    assert.deepEqual(repaired(outcome), { status: 'repaired', url: pr.url });
+    assert.equal(faux.getPendingResponseCount(), 0);
+    assert.equal(await remoteFile(1, 'hello.txt'), 'hello\nhi\n');
+    assert.ok(await isAncestor(remote, main, 1));
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'clean', sha: await branchHead(remote, 1) });
+    assert.equal(github.comments.filter((comment) => comment.issue === pr.number).length, 1);
+  });
+
+  test('a crash in the middle of a repair resumes from its phase, without a second repair comment or count', async () => {
+    const { github, config, open, remote, remoteFile, advanceMain, pr, head } = await openedPullRequest({ mergeable: 'CONFLICTING' });
+    await advanceMain({ 'hello.txt': 'hi\n' });
+
+    // First process: the implementer's request hangs until the process "dies".
+    const { started, hang } = hangUntilClosed();
+    const first = await open([hang]);
+    const { taskId } = await first.phat.start({ repo: config.repo, issue: 1 }, context, 'repair');
+    first.phat.harness.resume();
+    await started;
+    assert.deepEqual((await readLock(paths.projectLock(config.home, config.repo)))?.doing, { issue: 1, kind: 'repair', phase: 'implement' });
+    const runs = (await first.phat.harness.snapshot(RunsDoc, first.phat.root.id, context))?.runs[`${config.repo}#1`];
+    assert.equal(runs?.at(-1)?.kind, 'repair');
+    await first.phat.close(context);
+
+    // Second process: the same run goes on.
+    const second = await open([write('hello.txt', 'hello\nhi\n'), done(), ...approve(), describePr()]);
+    const again = await second.phat.start({ repo: config.repo, issue: 1 }, context, 'repair');
+    assert.deepEqual(again, { taskId, resumed: true });
+    second.phat.harness.resume();
+    const { outcome } = (await second.phat.harness.waitForTask(taskId, context)).state;
+    await second.phat.close(context);
+
+    assert.deepEqual(repaired(outcome as { status: string; result?: RunResult }), { status: 'repaired', url: pr.url });
+    assert.equal(await remoteFile(1, 'hello.txt'), 'hello\nhi\n');
+    const comments = github.comments.filter((comment) => comment.issue === pr.number);
+    assert.equal(comments.length, 1, 'one repair comment');
+    assert.deepEqual(readRepairMarker(comments[0]!.marker), { n: 1, sha: head, cause: 'conflicts', round: 1 });
+    assert.notEqual(await branchHead(remote, 1), head);
+  });
+
+  test('a repair that cannot get the pull request past the conflict gives up: stuck, with a summary, and the issue failed', async () => {
+    const { github, checks, config, runIssue, advanceMain, pr, head } = await openedPullRequest({ mergeState: 'BEHIND' });
+    await advanceMain({ 'other.txt': 'from main\n' });
+    config.limits.maxCheckFixes = 0;
+    checks.results = [{ passed: false, output: 'main broke the build' }];
+
+    const { outcome } = await runIssue(1, [], 'repair');
+
+    const result = repaired(outcome);
+    assert.equal(result.status, 'stuck');
+    assert.deepEqual(github.labels(pr.number), ['phat-mode:stuck', 'ready-for-human']);
+    const onPr = github.comments.filter((comment) => comment.issue === pr.number);
+    assert.equal(onPr.length, 2, 'the repair comment and the summary');
+    assert.match(onPr[0]!.body, /\*\*Outcome:\*\* failed: `npm run check` still fails/);
+    assert.equal(onPr[1]!.marker, giveUpMarker(1));
+    assert.match(onPr[1]!.body, new RegExp(`- Repair 1 on ${head.slice(0, 7)} \\(conflicts\\): failed: \`npm run check\` still fails`));
+    assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:failed', 'ready-for-human']);
+    const result1 = github.comments.find((comment) => comment.issue === 1 && comment.marker === '<!-- phat-mode:result -->')!;
+    assert.match(result1.body, /gave up repairing/);
+    assert.ok(result1.body.includes(pr.url));
+  });
+
+  test('budget spent: gives up at once, listing every attempt, without asking any agent', async () => {
+    const { github, runIssue, pr } = await openedPullRequest({ mergeable: 'CONFLICTING' });
+    for (const [n, sha] of [[1, 'aaa1111'], [2, 'bbb2222'], [3, 'ccc3333']] as const) {
+      await github.upsertComment(pr.number, repairMarker({ n, sha, cause: 'conflicts', round: 1 }), `Repair ${n}.\n\n**Outcome:** repaired: pushed ${n}`);
+    }
+    const responses: FauxResponseStep[] = [];
+    const { outcome } = await runIssue(1, responses, 'repair');
+
+    assert.deepEqual(repaired(outcome), { status: 'stuck', url: pr.url, reason: 'gave up: 3 repairs spent' });
+    assert.deepEqual(github.labels(pr.number), ['phat-mode:stuck', 'ready-for-human']);
+    const summary = github.comments.find((comment) => comment.marker === giveUpMarker(1))!;
+    assert.match(summary.body, /- Repair 1 on aaa1111 \(conflicts\): repaired: pushed 1\n- Repair 2 on bbb2222 \(conflicts\): repaired: pushed 2\n- Repair 3 on ccc3333 \(conflicts\): repaired: pushed 3/);
+    assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:failed', 'ready-for-human']);
+  });
+
+  test('a human pushes while a repair runs: the repair stops before publishing, and their commit stays', async () => {
+    const { github, runIssue, remote, advanceMain, pr, head } = await openedPullRequest({ mergeState: 'BEHIND' });
+    await advanceMain({ 'other.txt': 'from main\n' });
+    let human = '';
+    const { outcome } = await runIssue(
+      1,
+      [
+        ...approveAfter(async () => {
+          human = await humanPushes(remote, 1);
+          github.statuses.get(pr.number)!.head = { sha: human, committedAt: '2026-10-31T11:30:00Z' };
+        }),
+        describePr(),
+      ],
+      'repair',
+    );
+    assert.deepEqual(repaired(outcome), { status: 'ignored', reason: 'commits added after phat-mode' });
+    assert.equal(await branchHead(remote, 1), human, 'their commit is still the head');
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'clean', sha: head }, 'the description is untouched');
+    const [comment] = github.comments.filter((candidate) => candidate.issue === pr.number);
+    assert.match(comment!.body, /\*\*Outcome:\*\* stopped: commits added after phat-mode/);
+    assert.deepEqual(github.labels(pr.number), ['ready-for-human'], 'not stuck: a human took it over');
+  });
+
+  test('a human pushes just before publishing, before GitHub shows it: the push never overwrites their commit', async () => {
+    const { github, runIssue, remote, advanceMain, pr } = await openedPullRequest({ mergeState: 'BEHIND' });
+    await advanceMain({ 'other.txt': 'from main\n' });
+    let human = '';
+    const { outcome } = await runIssue(1, [...approveAfter(async () => void (human = await humanPushes(remote, 1))), describePr()], 'repair');
+    assert.deepEqual(repaired(outcome), { status: 'ignored', reason: 'commits added after phat-mode' });
+    assert.equal(await branchHead(remote, 1), human);
+    assert.deepEqual(github.labels(pr.number), ['ready-for-human']);
+  });
+
+  test('changes requested while a repair runs: it stops, paused', async () => {
+    const { github, runIssue, remote, advanceMain, pr, head } = await openedPullRequest({ mergeState: 'BEHIND' });
+    await advanceMain({ 'other.txt': 'from main\n' });
+    const { outcome } = await runIssue(
+      1,
+      [
+        ...approveAfter(async () => {
+          github.statuses.get(pr.number)!.reviews = [{ author: 'bob', state: 'CHANGES_REQUESTED', submittedAt: '2026-10-31T11:30:00Z' }];
+        }),
+        describePr(),
+      ],
+      'repair',
+    );
+    assert.deepEqual(repaired(outcome), { status: 'ignored', reason: 'repair paused: changes requested by @bob' });
+    assert.equal(await branchHead(remote, 1), head, 'nothing pushed');
+  });
+
+  test('a human pushes while the repair runs, then it fails: left alone, never labelled stuck nor the issue failed', async () => {
+    const { github, checks, config, runIssue, remote, advanceMain, pr } = await openedPullRequest({ mergeState: 'BEHIND' });
+    await advanceMain({ 'other.txt': 'from main\n' });
+    config.limits.maxCheckFixes = 0;
+    let human = '';
+    checks.run = async () => {
+      human = await humanPushes(remote, 1);
+      github.statuses.get(pr.number)!.head = { sha: human, committedAt: '2026-10-31T11:30:00Z' };
+      return { passed: false, output: 'main broke the build' };
+    };
+
+    const { outcome } = await runIssue(1, [], 'repair');
+
+    assert.deepEqual(repaired(outcome), { status: 'ignored', reason: 'commits added after phat-mode' });
+    assert.equal(await branchHead(remote, 1), human);
+    assert.deepEqual(github.labels(pr.number), ['ready-for-human']);
+    assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:done', 'ready-for-agent']);
+    const onPr = github.comments.filter((comment) => comment.issue === pr.number);
+    assert.equal(onPr.length, 1, 'no give-up summary');
+    assert.match(onPr[0]!.body, /\*\*Outcome:\*\* stopped: commits added after phat-mode/);
+  });
+
+  describe('giving up, interrupted', () => {
+    /** A budget-spent pull request whose give-up dies after labelling it stuck, before its summary. */
+    async function interruptedGiveUp() {
+      const setup = await openedPullRequest({ mergeable: 'CONFLICTING' });
+      const { github, config, open, pr } = setup;
+      for (const [n, sha] of [[1, 'aaa1111'], [2, 'bbb2222'], [3, 'ccc3333']] as const) {
+        await github.upsertComment(pr.number, repairMarker({ n, sha, cause: 'conflicts', round: 1 }), `Repair ${n}.\n\n**Outcome:** repaired`);
+      }
+      const upsert = github.upsertComment.bind(github);
+      let reached!: () => void;
+      const started = new Promise<void>((resolve) => (reached = resolve));
+      let die!: () => void;
+      github.upsertComment = (issue, marker, body) =>
+        marker === giveUpMarker(1)
+          ? new Promise<void>((_resolve, reject) => {
+              reached();
+              die = () => reject(new Error('the process died'));
+            })
+          : upsert(issue, marker, body);
+      const first = await open([]);
+      const { taskId } = await first.phat.start({ repo: config.repo, issue: 1 }, context, 'repair');
+      first.phat.harness.resume();
+      await started;
+      const closing = first.phat.close(context);
+      die();
+      await closing;
+      github.upsertComment = upsert;
+      assert.deepEqual(github.labels(pr.number), ['phat-mode:stuck', 'ready-for-human'], 'labelled before it died');
+      const resume = async () => {
+        const second = await open([]);
+        const again = await second.phat.start({ repo: config.repo, issue: 1 }, context, 'repair');
+        assert.deepEqual(again, { taskId, resumed: true });
+        second.phat.harness.resume();
+        const { outcome } = (await second.phat.harness.waitForTask(taskId, context)).state;
+        await second.phat.close(context);
+        return repaired(outcome as { status: string; result?: RunResult });
+      };
+      return { ...setup, resume };
+    }
+
+    test('interrupted before its first change, then a human labels it stuck: resumed, it leaves the pull request and issue alone', async () => {
+      const { github, config, open, pr } = await openedPullRequest({ mergeable: 'CONFLICTING' });
+      for (const [n, sha] of [[1, 'aaa1111'], [2, 'bbb2222'], [3, 'ccc3333']] as const) {
+        await github.upsertComment(pr.number, repairMarker({ n, sha, cause: 'conflicts', round: 1 }), `Repair ${n}.\n\n**Outcome:** repaired`);
+      }
+      // The first look (in `look`) answers; the give-up's own look hangs until the process dies.
+      const find = github.findPullRequest.bind(github);
+      let looks = 0;
+      let reached!: () => void;
+      const started = new Promise<void>((resolve) => (reached = resolve));
+      let die!: () => void;
+      github.findPullRequest = (branch) =>
+        ++looks === 1
+          ? find(branch)
+          : new Promise((_resolve, reject) => {
+              reached();
+              die = () => reject(new Error('the process died'));
+            });
+      const first = await open([]);
+      const { taskId } = await first.phat.start({ repo: config.repo, issue: 1 }, context, 'repair');
+      first.phat.harness.resume();
+      await started;
+      const closing = first.phat.close(context);
+      die();
+      await closing;
+      github.findPullRequest = find;
+      const writes = github.writes;
+
+      pr.labels.push('phat-mode:stuck');
+      const second = await open([]);
+      await second.phat.start({ repo: config.repo, issue: 1 }, context, 'repair');
+      second.phat.harness.resume();
+      const { outcome } = (await second.phat.harness.waitForTask(taskId, context)).state;
+      await second.phat.close(context);
+
+      assert.deepEqual(repaired(outcome as { status: string; result?: RunResult }), {
+        status: 'ignored',
+        reason: 'phat-mode:stuck: waiting for you',
+      });
+      assert.equal(github.writes, writes, 'nothing written');
+      assert.equal(github.comments.filter((comment) => comment.marker === giveUpMarker(1)).length, 0);
+      assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:done', 'ready-for-agent']);
+    });
+
+    test('resumed, it finishes giving up once, despite the stuck label it set itself', async () => {
+      const { github, resume, pr } = await interruptedGiveUp();
+      assert.deepEqual(await resume(), { status: 'stuck', url: pr.url, reason: 'gave up: 3 repairs spent' });
+      assert.equal(github.comments.filter((comment) => comment.marker === giveUpMarker(1)).length, 1);
+      assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:failed', 'ready-for-human']);
+    });
+
+    test('a human took over meanwhile: resumed, it stops without a summary or failing the issue', async () => {
+      const { github, resume, remote, pr } = await interruptedGiveUp();
+      const human = await humanPushes(remote, 1);
+      github.statuses.get(pr.number)!.head = { sha: human, committedAt: '2026-10-31T11:30:00Z' };
+      assert.deepEqual(await resume(), { status: 'ignored', reason: 'commits added after phat-mode' });
+      assert.equal(github.comments.filter((comment) => comment.marker === giveUpMarker(1)).length, 0);
+      assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:done', 'ready-for-agent']);
+    });
+  });
+
+  test('a pull request repair does not handle is left alone', async () => {
+    const { github, runIssue, pr } = await openedPullRequest({ mergeable: 'CONFLICTING' });
+    pr.labels.push('phat-mode:stuck');
+    const writes = github.writes;
+    const { outcome } = await runIssue(1, [], 'repair');
+    assert.deepEqual(repaired(outcome), { status: 'ignored', reason: 'phat-mode:stuck: waiting for you' });
+    assert.equal(github.writes, writes);
+  });
+});

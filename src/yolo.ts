@@ -83,7 +83,7 @@ export const SETTLE_MS = 60_000;
 const SETTLE_SLACK_MS = 1_000;
 
 /** Local time, as HH:MM. */
-const clock = (time: Date) =>
+export const clock = (time: Date) =>
   `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
 
 /** GitHub's reason, without the command that failed; its first line. */
