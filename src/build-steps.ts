@@ -1,10 +1,20 @@
 import type { Context } from '@earendil-works/chord/context';
-import type { ConversationId, NextTaskState, RunningTask, TaskRuntime, Tx } from '@earendil-works/pi-durable';
-import { type BuildAgent, type DoneReport, type PlanReport, type PrReport, ReportsDoc } from './agents.ts';
+import { configure, type ConversationId, type NextTaskState, type RunningTask, type TaskId, type Tx } from '@earendil-works/pi-durable';
+import {
+  AGENTS,
+  type BuildAgent,
+  type DoneReport,
+  modelRole,
+  type PlanReport,
+  type PrReport,
+  ReportsDoc,
+  ROLE_TOOLS,
+  RoleDoc,
+} from './agents.ts';
 import { type AxisReport, type CodeReview, loadCodeReviewSkill, mustFix, needsFixes, standardsSources } from './code-review.ts';
 import type { Spec } from './spec.ts';
 import { join, relative } from 'node:path';
-import { branchFor, modelFor, paths } from './config.ts';
+import { branchFor, type Config, modelFor, paths } from './config.ts';
 import { prSkill } from './pr.ts';
 import {
   changedFeatureMap,
@@ -23,13 +33,14 @@ import {
   fixReviewPrompt,
   fixVerificationPrompt,
   resolveConflictsPrompt,
+  roleInstructions,
   specReviewPrompt,
   standardsReviewPrompt,
   verifyPrompt,
 } from './prompts.ts';
 import { type AgentRuntime, askForReport, failureGuard, type Services, StepFailure } from './task-kit.ts';
 import { EVIDENCE_BRANCH, tail } from './workspace.ts';
-import { verdictFor, yoloMarker } from './yolo.ts';
+import { verdictFor, yoloMarker, type YoloVerdict } from './yolo.ts';
 
 /**
  * The build's finishing steps: implement, check, code review, verify, describe, update and publish. The build pipeline
@@ -58,6 +69,16 @@ export type Work = Setup & {
   base?: string;
   /** Times the base branch was merged into the branch (`limits.maxBranchUpdates`). Absent: none yet. */
   updates?: number;
+  /**
+   * The work has not been checked in this run yet: `update` goes on to check even if the base branch did not move, and
+   * check clears it once the checks pass. Set by a task that enters the steps at `update` (a Repair); never by a build.
+   */
+  unchecked?: true;
+  /**
+   * The commit the branch must still be at on origin to be pushed over: the pull request's head as a Repair found it.
+   * Publish pushes only over it, so it never overwrites commits pushed since. Absent (a build): pushed as before.
+   */
+  lease?: string;
 };
 
 /** The outcome of the code review, carried to the pull request. */
@@ -124,16 +145,63 @@ const work = <S extends Work>(state: S): Work => ({
   done: state.done,
   base: state.base,
   updates: state.updates,
+  ...(state.unchecked ? { unchecked: true as const } : {}),
+  ...(state.lease === undefined ? {} : { lease: state.lease }),
 });
 
 /**
+ * A fresh conversation for each build agent, in `workspace`, configured for its role. `instructions`: a role's own
+ * instructions instead of the standard ones, e.g. the implementer's in a Repair.
+ */
+export async function createConversations(
+  tx: Tx,
+  options: {
+    taskId: TaskId;
+    config: Config;
+    issue: number;
+    workspace: string;
+    instructions?: Partial<Record<BuildAgent, string>>;
+  },
+): Promise<Conversations> {
+  const { taskId, config, issue, workspace } = options;
+  const conversations = {} as Conversations;
+  for (const role of AGENTS) {
+    const model = modelFor(config, modelRole(role));
+    const created = await tx.createConversation({ ownership: { kind: 'task', taskId } });
+    await configure(tx, created.id, {
+      model: { provider: model.provider, modelId: model.modelId },
+      thinkingLevel: model.thinkingLevel,
+      tools: ROLE_TOOLS[role],
+      instructions: options.instructions?.[role] ?? roleInstructions(config.checkCommand)[role],
+      cwd: workspace,
+    });
+    Object.assign(await tx.doc(RoleDoc, created.id), { role, repo: config.repo, issue, workspace });
+    conversations[role] = created.id;
+  }
+  return conversations;
+}
+
+/** What publish did: the pull request, the commit it pushed, and the verdict it wrote for that commit. */
+export type Published = { number: number; url: string; head: string; verdict: YoloVerdict };
+
+/**
+ * A task's guard on going on, asked before `update` and before `publish` (also after a resume): `check` says why the
+ * task must stop, if it must (e.g. a human pushed to the pull request), and `stopped` gives the task's result then.
+ * Publish also stops, with `commits added after phat-mode`, when origin moved on from `Work.lease`.
+ */
+export type StepsGuard<Result> = {
+  check(state: Work): Promise<string | undefined>;
+  stopped(state: Work, reason: string): Promise<Result>;
+};
+
+/**
  * The finishing steps, for one repo. `published`: the task's result once publish has opened or updated the pull
- * request. Returns the steps' phase handlers, keyed by phase name, for the task's `defineTask`, and `start`, which moves
+ * request, worked out before the task ends (so it may do more on GitHub first, which is repeated after a crash). Returns the steps' phase handlers, keyed by phase name, for the task's `defineTask`, and `start`, which moves
  * a running task to any one step. A StepFailure in a step goes to the task's `fail` phase.
  */
 export function buildSteps<Result>(
   services: Services,
-  { published }: { published: (pr: { number: number; url: string }) => Result },
+  { published, guard }: { published: (pr: Published) => Result | Promise<Result>; guard?: StepsGuard<Result> },
 ) {
   const { config, github, workspaces, checks, logger } = services;
   const { limits, labels } = config;
@@ -165,6 +233,17 @@ export function buildSteps<Result>(
   const guarded = failureGuard<Runtime>(logger, (runtime, issue, reason, context) =>
     go(runtime, { phase: 'fail', issue, reason }, context),
   );
+
+  /** End the task with the guard's result when it says stop. Returns whether it stopped. */
+  async function stopped(runtime: Runtime, state: Work, context: Context, reason?: string): Promise<boolean> {
+    if (guard === undefined) return false;
+    const why = reason ?? (await guard.check(state));
+    if (why === undefined) return false;
+    logger.step(state.issue.number, `Stopping: ${why}`);
+    const result = await guard.stopped(state, why);
+    await runtime.commit(() => ({ status: 'terminal', outcome: { status: 'completed', result } }), context);
+    return true;
+  }
 
   /** Move a running task to the step `entry` names, adding the step's bookkeeping. */
   async function start(runtime: Runtime, entry: BuildStepsEntry, context: Context): Promise<void> {
@@ -275,7 +354,8 @@ export function buildSteps<Result>(
       if (result.passed) {
         logger.step(number, 'Checks pass');
         const base = await workspaces.base(state.workspace);
-        await start(runtime, { ...work(state), base, phase: 'review' }, context);
+        const { unchecked: _checked, ...checked } = work(state);
+        await start(runtime, { ...checked, base, phase: 'review' }, context);
         return;
       }
       logger.step(number, `Checks fail (fix attempt ${state.checkFixes + 1} of ${limits.maxCheckFixes})`);
@@ -498,10 +578,12 @@ export function buildSteps<Result>(
       const state = task.state.checkpoint;
       const { issue, workspace } = state;
       const updates = state.updates ?? 0;
+      if (await stopped(runtime, state, context)) return;
       const toPublish = () => go(runtime, { ...state, phase: 'publish' }, context);
       if (updates >= limits.maxBranchUpdates) {
         logger.step(issue.number, `Not merging ${baseBranch} again after ${updates} merges; opening the pull request as it is`);
-        await toPublish();
+        if (state.unchecked) await go(runtime, { ...work(state), phase: 'check' }, context);
+        else await toPublish();
         return;
       }
       // A crash during verification can leave its local snapshot commit behind.
@@ -525,6 +607,11 @@ export function buildSteps<Result>(
         await go(runtime, { ...next, phase: 'check' }, context);
         return;
       }
+      if (state.unchecked) {
+        logger.step(issue.number, 'Checking, reviewing and verifying');
+        await go(runtime, { ...next, phase: 'check' }, context);
+        return;
+      }
       await toPublish();
     }),
 
@@ -534,12 +621,20 @@ export function buildSteps<Result>(
       const branch = branchFor(issue.number);
       // A crash during verification can leave its local snapshot commit behind.
       await workspaces.undoSnapshot(workspace);
+      if (await stopped(runtime, state, context)) return;
       logger.step(issue.number, `Committing and pushing ${branch}`);
       await workspaces.commitAll(workspace, commitMessage(issue));
       if ((await workspaces.commitsAhead(workspace)) === 0) {
         throw new StepFailure('There are no changes to open a pull request with.');
       }
-      const pushed = await workspaces.push(workspace, issue.number);
+      const pushed =
+        state.lease === undefined
+          ? await workspaces.push(workspace, issue.number)
+          : await workspaces.pushOver(workspace, issue.number, state.lease);
+      if (pushed === undefined) {
+        if (await stopped(runtime, state, context, 'commits added after phat-mode')) return;
+        throw new StepFailure(`${branch} moved on while phat-mode worked; nothing was pushed.`);
+      }
 
       const evidenceUrls = await publishEvidence(issue.number, state.verification);
       const described = pullRequestBody({
@@ -554,7 +649,8 @@ export function buildSteps<Result>(
         unresolved: state.unresolved,
         checkCommand: config.checkCommand,
       });
-      const body = `${described}\n\n${yoloMarker(verdictFor(pushed, state))}`;
+      const verdict = verdictFor(pushed, state);
+      const body = `${described}\n\n${yoloMarker(verdict)}`;
       let pr = await github.findPullRequest(branch);
       if (pr === undefined) {
         pr = await github.createPullRequest({ branch, base: config.baseBranch, title: pullRequestTitle(issue), body });
@@ -569,10 +665,8 @@ export function buildSteps<Result>(
       // The issue keeps ready-for-agent until the PR closes it; phat-mode:done shows an agent already did it.
       await github.editLabels(issue.number, progressChange('done'));
       logger.step(issue.number, `Pull request: ${pr.url}`);
-      await runtime.commit(
-        () => ({ status: 'terminal', outcome: { status: 'completed', result: published(pr) } }),
-        context,
-      );
+      const result = await published({ number: pr.number, url: pr.url, head: pushed, verdict });
+      await runtime.commit(() => ({ status: 'terminal', outcome: { status: 'completed', result } }), context);
     }),
   };
 

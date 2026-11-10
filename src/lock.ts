@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 /** What a lock's holder is doing right now: a run of an issue, and its phase. */
-export type Doing = { issue: number; kind: 'build' | 'shape'; phase: string };
+export type Doing = { issue: number; kind: 'build' | 'shape' | 'repair'; phase: string };
 
 export type LockInfo = {
   pid: number;

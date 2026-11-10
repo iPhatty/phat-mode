@@ -43,3 +43,7 @@ _Avoid_: Assumption, gap, plan note
 **Departure**:
 A silent decision the change does not follow, reported by the implementer in `report_done` with what the change does instead and why; the Spec reviewer judges whether it is justified.
 _Avoid_: Deviation, override, exception
+
+**Repair**:
+A durable run on one of phat-mode's own open pull requests that is stuck (failed checks, conflicts, or not clean), ending in a new verdict or a hand-off: the pull request labelled `phat-mode:stuck`. Its state lives in markers on the pull request. See ADR 0006.
+_Avoid_: Rescue, fix-up, retry ("retry" already means labelling an issue `ready-for-agent` again)

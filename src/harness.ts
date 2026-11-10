@@ -19,14 +19,18 @@ import { FileCredentialStore } from './credentials.ts';
 import { agentEnv } from './exec.ts';
 import { acquireLock, type Doing } from './lock.ts';
 import { createPipeline, type PipelineInput, type PipelineResult, type Services } from './pipeline.ts';
+import { createRepair, type RepairResult } from './repair.ts';
 import { createShaping, type ShapingResult } from './shaping.ts';
 import { Skills } from './standing-skills.ts';
 
-/** What a run is: building an issue into a pull request, or shaping an agent-mode issue into tickets. */
-export type RunKind = 'build' | 'shape';
+/**
+ * What a run is: building an issue into a pull request, shaping an agent-mode issue into tickets, or repairing the
+ * issue's stuck pull request.
+ */
+export type RunKind = 'build' | 'shape' | 'repair';
 
 /** What any run ends with. */
-export type RunResult = PipelineResult | ShapingResult;
+export type RunResult = PipelineResult | ShapingResult | RepairResult;
 
 /**
  * Every run phat-mode started, newest last per issue. Stored on the root conversation. `kind`: missing in records from
@@ -57,7 +61,7 @@ export type PhatMode = {
   root: Conversation;
   /**
    * Start a run for an issue of this project, or return the one still running for it, whatever its kind. `kind`: build
-   * (default) or shape. Rejects an issue of another project.
+   * (default), shape or repair. Rejects an issue of another project.
    */
   start(input: PipelineInput, context: Context, kind?: RunKind): Promise<{ taskId: TaskId<RunResult>; resumed: boolean }>;
   close(context: Context): Promise<void>;
@@ -107,12 +111,14 @@ export async function openHarness(setup: HarnessSetup, context: Context) {
   const { onPhase } = setup;
   const { Pipeline, extension } = createPipeline(setup.servicesFor, onPhase && ((input, phase, id, signal) => onPhase(input, 'build', phase, id, signal)));
   const shaping = createShaping(setup.servicesFor, onPhase && ((input, phase, id, signal) => onPhase(input, 'shape', phase, id, signal)));
+  const repair = createRepair(setup.servicesFor, onPhase && ((input, phase, id, signal) => onPhase(input, 'repair', phase, id, signal)));
   const registry = createRegistry();
   registry.install(Tools);
   registry.install(guardFor(setup.repo));
   registry.install(Skills);
   registry.install(extension);
   registry.install(shaping.extension);
+  registry.install(repair.extension);
 
   const models = setup.models ?? createCopilotModels(new FileCredentialStore(paths.credentials({ home: setup.home })));
   const shellEnv = agentEnv();
@@ -130,7 +136,7 @@ export async function openHarness(setup: HarnessSetup, context: Context) {
   );
   try {
     const root = await harness.root(context);
-    return { harness, root, Pipeline, Shaping: shaping.Shaping };
+    return { harness, root, Pipeline, Shaping: shaping.Shaping, Repair: repair.Repair };
   } catch (error) {
     await harness.close(context).catch(() => {});
     throw error;
@@ -210,7 +216,7 @@ export async function openPhatMode(setup: Setup, context: Context, options: Open
     await lock?.release();
     throw error;
   }
-  const { harness, root, Pipeline, Shaping } = opened;
+  const { harness, root, Pipeline, Shaping, Repair } = opened;
 
   async function start(input: PipelineInput, context: Context, kind: RunKind = 'build') {
     if (input.repo !== repo) throw new Error(`This is ${repo}'s state; ${input.repo} has its own.`);
@@ -227,7 +233,11 @@ export async function openPhatMode(setup: Setup, context: Context, options: Open
       // Background: runs for different issues never block each other or the root conversation.
       const options = { ownership: { kind: 'conversation' as const }, background: true };
       const id = (
-        kind === 'shape' ? await tx.createTask(Shaping, input, options) : await tx.createTask(Pipeline, input, options)
+        kind === 'shape'
+          ? await tx.createTask(Shaping, input, options)
+          : kind === 'repair'
+            ? await tx.createTask(Repair, input, options)
+            : await tx.createTask(Pipeline, input, options)
       ) as TaskId<RunResult>;
       const doc = await tx.doc(RunsDoc, root.id);
       // Assign a new list: documents track assignments, not mutations of a detached array.

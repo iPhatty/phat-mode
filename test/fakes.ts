@@ -1,6 +1,10 @@
 import { branchFor, type Config, defaultMachineConfig, repoConfig } from '../src/config.ts';
 import type { GitHub, Issue, LabelChange, PullRequest, PullRequestState, PullRequestStatus, SubIssue } from '../src/github.ts';
 
+/** What a test sets of a pull request's status: its head and checks; mergeability and reviews when they matter. */
+export type FakeStatus = Omit<PullRequestStatus, 'body' | 'labels' | 'mergeable' | 'mergeState' | 'reviews'> &
+  Partial<Pick<PullRequestStatus, 'mergeable' | 'mergeState' | 'reviews'>>;
+
 /** A repo's full settings, as phat-mode would build them from a .phat-mode.json with npm commands. */
 export const testConfig = (home: string, repo = 'test/repo', settings: Partial<Config> = {}): Config => ({
   ...repoConfig(
@@ -15,7 +19,21 @@ export const testConfig = (home: string, repo = 'test/repo', settings: Partial<C
 /** GitHub in memory. */
 export class FakeGitHub implements GitHub {
   issues = new Map<number, Issue>();
-  comments: { issue: number; marker: string; body: string }[] = [];
+  /** `author`: the `gh` user (`viewer`) unless a test adds someone else's; `createdAt`: in the order they were posted. */
+  comments: { issue: number; marker: string; body: string; author: string; createdAt: string }[] = [];
+  #posted = 0;
+  #now() {
+    return new Date(Date.UTC(2026, 0, 2) + 1_000 * this.#posted++).toISOString();
+  }
+  /** Someone else's comment, e.g. one forging phat-mode's marker. */
+  addComment(issue: number, body: string, author = 'stranger') {
+    this.comments.push({ issue, marker: '', body, author, createdAt: this.#now() });
+  }
+  async phatModeComments(number: number) {
+    return this.comments
+      .filter((comment) => comment.issue === number && comment.author === this.viewer)
+      .map((comment) => ({ body: comment.marker === '' ? comment.body : `${comment.marker}\n${comment.body}`, createdAt: comment.createdAt }));
+  }
   /** Every call that changes something on GitHub. */
   writes = 0;
   prs: (PullRequest & {
@@ -32,12 +50,12 @@ export class FakeGitHub implements GitHub {
   async parentIssue(issue: number) {
     return this.parents.get(issue);
   }
-  /** Head commit and checks, by pull request number. */
-  statuses = new Map<number, Omit<PullRequestStatus, 'body'>>();
-  async pullRequestStatus(number: number) {
+  /** Head commit and checks, by pull request number; mergeable and clean, with no reviews, unless a test says otherwise. */
+  statuses = new Map<number, FakeStatus>();
+  async pullRequestStatus(number: number): Promise<PullRequestStatus> {
     const pr = this.prs.find((candidate) => candidate.number === number)!;
     const status = this.statuses.get(number) ?? { head: { sha: 'unknown', committedAt: '1970-01-01T00:00:00Z' }, checks: [] };
-    return structuredClone({ body: pr.body, ...status });
+    return structuredClone({ mergeable: 'MERGEABLE', mergeState: 'CLEAN', reviews: [], ...status, labels: [...pr.labels], body: pr.body });
   }
   /** Merges done, and pull requests GitHub refuses to merge, with its reason. */
   merges: { pr: number; sha: string }[] = [];
@@ -45,6 +63,7 @@ export class FakeGitHub implements GitHub {
   async mergePullRequest(number: number, sha: string) {
     const refused = this.refuseMerge.get(number);
     if (refused !== undefined) throw new Error(`gh pr merge exited with 1: ${refused}`);
+    if (this.statuses.get(number)?.mergeable === 'CONFLICTING') throw new Error('gh pr merge exited with 1: Pull request is not mergeable');
     const head = this.statuses.get(number)?.head.sha;
     if (head !== sha) throw new Error(`gh pr merge exited with 1: head is ${head}, not ${sha}`);
     this.writes++;
@@ -137,9 +156,9 @@ export class FakeGitHub implements GitHub {
   }
   async upsertComment(issue: number, marker: string, body: string) {
     this.writes++;
-    const existing = this.comments.find((comment) => comment.issue === issue && comment.marker === marker);
+    const existing = this.comments.find((comment) => comment.issue === issue && comment.marker === marker && comment.author === this.viewer);
     if (existing) existing.body = body;
-    else this.comments.push({ issue, marker, body });
+    else this.comments.push({ issue, marker, body, author: this.viewer, createdAt: this.#now() });
   }
   async findPullRequest(branch: string) {
     return this.prs.find((pr) => pr.branch === branch && pr.state === 'OPEN');

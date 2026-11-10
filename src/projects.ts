@@ -6,7 +6,7 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { paths } from './config.ts';
 import { type OpenOptions, openHarness, openPhatMode, type PhatMode, type RunKind, type RunResult, RunsDoc } from './harness.ts';
 import { acquireLock, isAlive, LockedError, type LockInfo, readLock } from './lock.ts';
-import { type RunRecord, runStatus } from './runs.ts';
+import { type RunRecord, runStatus, verbFor } from './runs.ts';
 
 /**
  * Each project has its own lock (`<home>/locks/<owner>__<name>.lock`) and durable database
@@ -171,7 +171,7 @@ async function unfinishedRuns(home: string, database: string, context: Context):
 /** What to tell the user about runs left in the old shared database, and how to finish them. */
 export function describeUnfinished(runs: readonly UnfinishedRun[], home: string): string {
   const lines = runs.map(
-    (run) => `  - ${run.repo}#${run.issue}: ${run.kind === 'shape' ? 'shaping' : 'building'}${run.phase ? ` (${run.phase})` : ''}`,
+    (run) => `  - ${run.repo}#${run.issue}: ${verbFor(run.kind)}${run.phase ? ` (${run.phase})` : ''}`,
   );
   return [
     `${paths.legacyState(home)}, the database of earlier phat-mode versions, has unfinished runs:`,

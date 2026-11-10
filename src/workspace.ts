@@ -28,6 +28,11 @@ export interface Workspaces {
    * resumed run keeps the workspace it made), so nothing an earlier run left carries over.
    */
   prepare(issue: number): Promise<string>;
+  /**
+   * As `prepare`, but the issue's branch starts at `sha`, the head of its pull request as fetched from origin, instead
+   * of the base branch: a fresh workspace for repairing the pull request.
+   */
+  checkout(issue: number, sha: string): Promise<string>;
   /** Every entry directly in the project's workspaces folder, by kind. Empty when there is none. */
   folders(): Promise<WorkspaceFolder[]>;
   /**
@@ -52,6 +57,14 @@ export interface Workspaces {
   commitsAhead(workspace: string): Promise<number>;
   /** Push the issue branch. Returns the commit pushed. */
   push(workspace: string, issue: number): Promise<string>;
+  /**
+   * Push the issue branch only over `lease`, the commit the branch must still be at on origin (never over anything
+   * pushed since, whatever the clone last fetched). Returns the commit pushed; also when origin already has it (pushed
+   * before a crash). Undefined when the branch has moved on from `lease`: nothing is pushed.
+   */
+  pushOver(workspace: string, issue: number, lease: string): Promise<string | undefined>;
+  /** The commit checked out in the workspace. */
+  head(workspace: string): Promise<string>;
   /**
    * Bring the branch up to date with the base branch, as GitHub's "Update branch" does: commit everything with
    * `message`, fetch, and merge `origin/<base>` in. Returns the files with conflicts, left with conflict markers and the
@@ -414,6 +427,15 @@ export class GitWorkspaces implements Workspaces {
   }
 
   async prepare(issue: number): Promise<string> {
+    return this.#freshWorkspace(issue, this.#base);
+  }
+
+  async checkout(issue: number, sha: string): Promise<string> {
+    return this.#freshWorkspace(issue, sha);
+  }
+
+  /** The issue's workspace, fresh, on its branch starting at `start`. The clone is fetched first. */
+  async #freshWorkspace(issue: number, start: string): Promise<string> {
     const cloneDir = await this.#ensureClone();
 
     const workspace = this.#options.workspaceDir(issue);
@@ -421,7 +443,7 @@ export class GitWorkspaces implements Workspaces {
     await this.remove({ kind: 'build', issue });
     await mkdir(dirname(workspace), { recursive: true });
     await this.#git(cloneDir, ['worktree', 'prune']);
-    await this.#git(cloneDir, ['worktree', 'add', '-B', branchFor(issue), workspace, this.#base]);
+    await this.#git(cloneDir, ['worktree', 'add', '-B', branchFor(issue), workspace, start]);
     await this.#install(workspace);
     return workspace;
   }
@@ -493,6 +515,29 @@ export class GitWorkspaces implements Workspaces {
     const head = (await this.#git(workspace, ['rev-parse', 'HEAD'])).stdout.trim();
     await this.#git(workspace, ['push', '--force-with-lease', '--set-upstream', 'origin', `${head}:refs/heads/${branch}`]);
     return head;
+  }
+
+  async pushOver(workspace: string, issue: number, lease: string): Promise<string | undefined> {
+    const branch = branchFor(issue);
+    const head = await this.head(workspace);
+    const onOrigin = async () =>
+      (await this.#git(workspace, ['ls-remote', 'origin', `refs/heads/${branch}`])).stdout.split('\t')[0]!.trim();
+    const before = await onOrigin();
+    if (before === head) return head;
+    if (before !== lease) return undefined;
+    const pushed = await this.#git(
+      workspace,
+      ['push', `--force-with-lease=refs/heads/${branch}:${lease}`, 'origin', `${head}:refs/heads/${branch}`],
+      true,
+    );
+    if (pushed.code === 0) return head;
+    // Someone pushed between the look and the push: theirs stays.
+    if ((await onOrigin()) !== lease) return undefined;
+    throw new Error(`Could not push ${branch}: ${`${pushed.stdout}\n${pushed.stderr}`.trim()}`);
+  }
+
+  async head(workspace: string): Promise<string> {
+    return (await this.#git(workspace, ['rev-parse', 'HEAD'])).stdout.trim();
   }
 
   async #merging(workspace: string): Promise<boolean> {

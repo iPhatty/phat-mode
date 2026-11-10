@@ -5,6 +5,7 @@ import type { CheckState } from '../src/github.ts';
 import { silentLogger } from '../src/log.ts';
 import { MARKER_SHAPE_REFUSED } from '../src/spec.ts';
 import { describeStep, MARKER_HANDED_BACK, MARKER_PARENT_CLOSED, nextStep } from '../src/watch.ts';
+import { repairMarker } from '../src/stuck.ts';
 import { yoloMarker, type YoloVerdict } from '../src/yolo.ts';
 import { FakeGitHub, testConfig } from './fakes.ts';
 
@@ -202,6 +203,120 @@ describe('watch', () => {
 
   test('nothing ready at all', async () => {
     assert.equal(describeStep(await step(new FakeGitHub())), 'Nothing labelled ready-for-agent or agent-mode. Waiting for new issues.');
+  });
+});
+
+describe('watch, repair', () => {
+  /** A phat-mode pull request that conflicts with main. */
+  const conflicting = (github: FakeGitHub, issue: number) => {
+    const pr = judged(github, issue);
+    github.statuses.get(pr.number)!.mergeable = 'CONFLICTING';
+    return pr;
+  };
+
+  test('repairs a pull request that conflicts with main, before shaping or building anything', async () => {
+    const github = repo({ 2: {}, 3: {}, 5: { labels: ['agent-mode'] } });
+    const pr = conflicting(github, 2);
+    const repair = await step(github);
+    assert.deepEqual(repair, { kind: 'repair', issue: 2, url: pr.url, reason: 'conflicts with main' });
+    assert.equal(describeStep(repair), `Repairing next: #2 (conflicts with main): ${pr.url}`);
+    assert.equal(github.writes, 0, 'the run does the work, not the look');
+  });
+
+  test('behind main where GitHub requires it up to date: repaired too', async () => {
+    const github = repo({ 2: {} });
+    const pr = judged(github, 2);
+    github.statuses.get(pr.number)!.mergeState = 'BEHIND';
+    assert.deepEqual(await step(github), { kind: 'repair', issue: 2, url: pr.url, reason: 'behind main, which must be up to date to merge' });
+  });
+
+  test('several stuck pull requests: the lowest issue first, one at a time', async () => {
+    const github = repo({ 4: {}, 3: {} });
+    conflicting(github, 4);
+    const lowest = conflicting(github, 3);
+    assert.deepEqual(await step(github), { kind: 'repair', issue: 3, url: lowest.url, reason: 'conflicts with main' });
+  });
+
+  test('a shaped parent is closed before repairing', async () => {
+    const github = repo({ 2: {}, 10: { labels: ['phat-mode:shaped'] }, 11: {} });
+    github.parents.set(11, 10);
+    github.issues.get(11)!.state = 'CLOSED';
+    conflicting(github, 2);
+    assert.equal((await step(github)).kind, 'repair');
+    assert.deepEqual(github.closed, [10]);
+  });
+
+  test('budget spent: a Repair run starts, to give up on it', async () => {
+    const github = repo({ 2: {} });
+    const pr = conflicting(github, 2);
+    for (const [n, sha] of [[1, 'aaa'], [2, 'bbb'], [3, 'ccc']] as const) {
+      await github.upsertComment(pr.number, repairMarker({ n, sha, cause: 'conflicts', round: 1 }), 'Repair.');
+    }
+    assert.deepEqual(await step(github), { kind: 'repair', issue: 2, url: pr.url, reason: 'gave up: 3 repairs spent' });
+  });
+
+  test('"repair": false: a conflicting pull request waits as before', async () => {
+    const github = repo({ 2: {} });
+    const pr = conflicting(github, 2);
+    const off = await nextStep(github, { ...config, repair: false }, silentLogger);
+    assert.deepEqual(off, { kind: 'wait_for_merge', prs: [{ issue: 2, url: pr.url }] });
+  });
+
+  test('changes requested after phat-mode’s push: repair is paused, and the waiting line says so', async () => {
+    const github = repo({ 2: {} });
+    const pr = conflicting(github, 2);
+    github.statuses.get(pr.number)!.reviews = [{ author: 'bob', state: 'CHANGES_REQUESTED', submittedAt: '2026-10-31T11:30:00Z' }];
+    const waiting = await step(github);
+    assert.deepEqual(waiting, {
+      kind: 'wait_for_merge',
+      prs: [{ issue: 2, url: pr.url, repair: 'repair paused: changes requested by @bob' }],
+    });
+    assert.equal(describeStep(waiting), `Waiting for you to merge #2: ${pr.url} (repair paused: changes requested by @bob)`);
+  });
+
+  test('a comment or an approval does not pause repair', async () => {
+    const github = repo({ 2: {} });
+    const pr = conflicting(github, 2);
+    github.statuses.get(pr.number)!.reviews = [
+      { author: 'bob', state: 'COMMENTED', submittedAt: '2026-10-31T11:30:00Z' },
+      { author: 'carol', state: 'APPROVED', submittedAt: '2026-10-31T11:31:00Z' },
+    ];
+    assert.equal((await step(github)).kind, 'repair');
+  });
+
+  test('labelled phat-mode:stuck: left alone, and the waiting line says it waits for you', async () => {
+    const github = repo({ 2: {} });
+    const pr = conflicting(github, 2);
+    pr.labels.push('phat-mode:stuck');
+    const waiting = await yoloStep(github);
+    assert.equal(waiting.kind, 'wait_for_merge');
+    assert.match(describeStep(waiting), /^Waiting for you to merge #2: .* \(not merging: .*\) \(phat-mode:stuck: waiting for you\)$/);
+  });
+
+  test('failed checks and not clean are not repaired yet: they wait as today', async () => {
+    const github = repo({ 2: {}, 3: {} });
+    const failed = judged(github, 2, 'clean', [{ name: 'test', state: 'failed' }]);
+    const findings = judged(github, 3, { verdict: 'not-clean', sha: 'cafe3', reason: 'code review has open findings' });
+    assert.deepEqual(await step(github), {
+      kind: 'wait_for_merge',
+      prs: [
+        { issue: 2, url: failed.url },
+        { issue: 3, url: findings.url },
+      ],
+    });
+  });
+
+  test('not phat-mode’s to repair: another branch, human commits, or no verdict', async () => {
+    const github = repo({ 2: {}, 3: {} });
+    const other = github.addPullRequest({ branch: 'feature/other' });
+    other.body = yoloMarker({ verdict: 'clean', sha: 'cafe' });
+    github.statuses.set(other.number, { head: { sha: 'cafe', committedAt: '2026-10-31T11:00:00Z' }, checks: [], mergeable: 'CONFLICTING' });
+    const human = conflicting(github, 2);
+    github.statuses.get(human.number)!.head.sha = 'beef';
+    opened(github, 3);
+    github.statuses.set(github.prs.at(-1)!.number, { head: { sha: 'cafe', committedAt: '2026-10-31T11:00:00Z' }, checks: [], mergeable: 'CONFLICTING' });
+    assert.equal((await step(github)).kind, 'wait_for_merge');
+    assert.equal(github.writes, 0);
   });
 });
 
