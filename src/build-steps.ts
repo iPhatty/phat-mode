@@ -79,6 +79,12 @@ export type Work = Setup & {
    * Publish pushes only over it, so it never overwrites commits pushed since. Absent (a build): pushed as before.
    */
   lease?: string;
+  /**
+   * Verify even when the review left must-fix findings, so the implementer gets the review's findings and the
+   * verification's failures in one request; verify clears it. Set only by a Repair of a pull request that is not clean
+   * because of verification; never by a build.
+   */
+  verifyFirst?: true;
 };
 
 /** The outcome of the code review, carried to the pull request. */
@@ -146,6 +152,7 @@ const work = <S extends Work>(state: S): Work => ({
   base: state.base,
   updates: state.updates,
   ...(state.unchecked ? { unchecked: true as const } : {}),
+  ...(state.verifyFirst ? { verifyFirst: true as const } : {}),
   ...(state.lease === undefined ? {} : { lease: state.lease }),
 });
 
@@ -435,7 +442,8 @@ export function buildSteps<Result>(
         number,
         `Review: Standards ${axisCount(review.standards)}, Spec ${axisCount(review.spec)}; ${fix.standards.length + fix.spec.length} must fix`,
       );
-      if (!needsFixes(review) || round >= limits.maxReviewRounds) {
+      // verifyFirst: the findings wait for the verification, and go to the implementer with its failures.
+      if (!needsFixes(review) || round >= limits.maxReviewRounds || state.verifyFirst) {
         await start(
           runtime,
           { ...work(state), phase: 'verify', review, unresolved: needsFixes(review) },
@@ -450,12 +458,23 @@ export function buildSteps<Result>(
       const state = task.state.checkpoint;
       const number = state.issue.number;
       const round = state.verifyRounds;
+      // Only one verification comes first: from here on, the steps run as in a build.
+      const { verifyFirst, ...verified } = work(state);
+      const reviewed: Work & Reviewed = { ...verified, review: state.review, unresolved: state.unresolved };
+      /** verifyFirst: the review's must-fix findings that wait for a fix, while review rounds are left. */
+      const pendingReview = verifyFirst && state.unresolved && state.review !== null && state.reviewRounds < limits.maxReviewRounds
+        ? state.review
+        : undefined;
       const baseRef = await baseOf(state);
       const skills = await findVerifySkills(state.workspace, baseRef);
       const skill = skills[0];
       if (skill === undefined) {
         logger.step(number, 'No verification skill in this repo; skipping verification in the app');
-        await toDescribe(runtime, state, { kind: 'skipped', reason: NO_VERIFY_SKILL }, context);
+        if (pendingReview !== undefined) {
+          await start(runtime, { ...verified, phase: 'implement', prompt: fixReviewPrompt(pendingReview, config.checkCommand) }, context);
+          return;
+        }
+        await toDescribe(runtime, reviewed, { kind: 'skipped', reason: NO_VERIFY_SKILL }, context);
         return;
       }
       if (skills.length > 1) logger.step(number, `Several verification skills; using ${skill.name}`);
@@ -512,10 +531,19 @@ export function buildSteps<Result>(
             ? `Verification could not run: ${report.couldNotRun}`
             : `Verification: ${report.features.map((result) => `${result.feature} ${result.status}`).join(', ') || 'no features'}`,
       );
+      if (pendingReview !== undefined) {
+        // verifyFirst: the review's findings and the verification's failures, in one request.
+        const prompt = [
+          fixReviewPrompt(pendingReview, config.checkCommand),
+          ...(failures.length > 0 ? [fixVerificationPrompt(failures, config.checkCommand)] : []),
+        ].join('\n\n');
+        await start(runtime, { ...verified, phase: 'implement', prompt }, context);
+        return;
+      }
       if (failures.length > 0 && round < limits.maxVerifyRounds) {
         await start(
           runtime,
-          { ...work(state), phase: 'implement', prompt: fixVerificationPrompt(failures, config.checkCommand) },
+          { ...verified, phase: 'implement', prompt: fixVerificationPrompt(failures, config.checkCommand) },
           context,
         );
         return;
@@ -529,7 +557,7 @@ export function buildSteps<Result>(
         featureMapChanged,
         unresolved: failures.length > 0,
       };
-      await toDescribe(runtime, state, verification, context);
+      await toDescribe(runtime, reviewed, verification, context);
     }),
 
     describe: guarded<Phase<'describe', Result>>(async (task, runtime, context) => {

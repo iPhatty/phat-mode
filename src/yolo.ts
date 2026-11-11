@@ -47,18 +47,38 @@ export function verdictFor(sha: string, run: RunFindings): YoloVerdict {
   return reason === undefined ? { verdict: 'clean', sha } : { verdict: 'not-clean', sha, reason };
 }
 
+/** Why phat-mode judged a pull request not clean: the reasons its verdict marker carries. */
+export const NOT_CLEAN = {
+  reviewerSilent: 'a code reviewer did not report',
+  openFindings: 'code review has open findings',
+  skillChanged: 'the implementer changed the verification skill',
+  verificationFailed: 'verification found failures this change caused',
+  verifierSilent: 'the verifier did not report',
+  couldNotRun: 'verification could not run',
+} as const;
+
+const VERIFICATION_REASONS: readonly string[] = [
+  NOT_CLEAN.skillChanged,
+  NOT_CLEAN.verificationFailed,
+  NOT_CLEAN.verifierSilent,
+  NOT_CLEAN.couldNotRun,
+];
+
+/** Whether a not-clean verdict's reason was verification, rather than the code review. */
+export const verificationWasTheReason = (reason: string) => VERIFICATION_REASONS.includes(reason);
+
 /**
  * Anything that went wrong in this run. A repo without a verification skill chose not to have one, so skipped
  * verification is fine; so are smells, pre-existing failures and feature map edits, which never block a PR either.
  */
 function notCleanBecause({ review, unresolved, verification }: RunFindings): string | undefined {
-  if (review === null || review.standards === null || review.spec === null) return 'a code reviewer did not report';
-  if (unresolved) return 'code review has open findings';
+  if (review === null || review.standards === null || review.spec === null) return NOT_CLEAN.reviewerSilent;
+  if (unresolved) return NOT_CLEAN.openFindings;
   if (verification.kind === 'skipped') return undefined;
-  if (verification.reverted.length > 0) return 'the implementer changed the verification skill';
-  if (verification.unresolved) return 'verification found failures this change caused';
-  if (verification.report === null) return 'the verifier did not report';
-  if (verification.report.couldNotRun.trim()) return 'verification could not run';
+  if (verification.reverted.length > 0) return NOT_CLEAN.skillChanged;
+  if (verification.unresolved) return NOT_CLEAN.verificationFailed;
+  if (verification.report === null) return NOT_CLEAN.verifierSilent;
+  if (verification.report.couldNotRun.trim()) return NOT_CLEAN.couldNotRun;
   return undefined;
 }
 

@@ -13,7 +13,7 @@ import { readLock } from '../src/lock.ts';
 import { silentLogger } from '../src/log.ts';
 import type { RepairResult } from '../src/repair.ts';
 import { giveUpMarker, lookAtPullRequest, readBaseRedMarker, readRepairMarker, repairMarker, rerunMarker } from '../src/stuck.ts';
-import { readYoloMarker } from '../src/yolo.ts';
+import { readYoloMarker, yoloMerge, yoloMarker } from '../src/yolo.ts';
 import type { FakeStatus } from './fakes.ts';
 import { call, expectLast, fixture, textOf } from './fixture.ts';
 
@@ -82,11 +82,11 @@ const repaired = (outcome: { status: string; result?: RunResult }) => {
  * Issue 1 built into pull request #100, as phat-mode leaves it: hello.txt, with a departure from the plan. GitHub then
  * reports it as `status` says, at the commit phat-mode pushed.
  */
-async function openedPullRequest(status: Partial<FakeStatus> = {}, files: Record<string, string> = {}) {
+async function openedPullRequest(status: Partial<FakeStatus> = {}, files: Record<string, string> = {}, verified: FauxResponseStep[] = []) {
   const setup = await fixture(files);
   const { github, runIssue, remote } = setup;
   github.addIssue(1);
-  const built = await runIssue(1, [plan(), write('hello.txt', 'hello\n'), done([DEPARTURE]), ...approve(), describePr()]);
+  const built = await runIssue(1, [plan(), write('hello.txt', 'hello\n'), done([DEPARTURE]), ...approve(), ...verified, describePr()]);
   assert.equal(built.outcome.status, 'completed');
   const pr = github.prs[0]!;
   const head = await branchHead(remote, 1);
@@ -780,5 +780,267 @@ describe('repair, failed checks', () => {
 
     assert.deepEqual(repaired(outcome as { status: string; result?: RunResult }), { status: 'stuck', url: pr.url, reason: 'out of reach: needs a secret' });
     assert.deepEqual(github.reruns, [77, 78], 'not rerun again');
+  });
+});
+
+// ─── Not clean ──────────────────────────────────────────────────────────────
+
+/** A repo verification skill, as in test/pipeline.test.ts. */
+const VERIFY_SKILL_FILES = {
+  '.gitignore': '/.verify/\n',
+  '.agents/skills/verify-app/SKILL.md': '---\nname: verify-app\ndescription: "Drive the app."\n---\n\n# Verify App\n\nRun `scripts/launch.sh`.\n',
+  '.agents/skills/verify-app/scripts/launch.sh': 'echo launch\n',
+  '.agents/skills/verify-app/features/README.md': '# App verification map\n\n- [Hello](./hello.md)\n',
+  '.agents/skills/verify-app/features/hello.md': '# Hello\n',
+};
+const verificationReport = (feature: { status?: string; detail?: string } = {}) =>
+  call('report_verification', {
+    summary: 'Drove the hello feature.',
+    beforeNote: '',
+    features: [
+      {
+        feature: 'hello',
+        subFeatures: ['hello-shown'],
+        status: 'verified',
+        preExisting: false,
+        detail: 'hello.txt says hello.',
+        checks: ['ok: expect.sh label "hello"'],
+        before: [],
+        after: [],
+        ...feature,
+      },
+    ],
+    drift: [],
+    couldNotRun: '',
+  });
+
+/** Both reviewers' answers for one round: the Spec reviewer reports `detail` as a must-fix finding. */
+const specFinding = (detail: string): FauxResponseFactory[] => {
+  const answer: FauxResponseFactory = (request) => {
+    const axis = textOf(request.messages.at(-1) as { content: unknown }).includes('on the Standards axis') ? 'standards' : 'spec';
+    if (axis === 'standards') return call('report_standards', { summary: 'standards looks good.', worst: '', findings: [] });
+    return call('report_spec', {
+      summary: 'spec has problems.',
+      worst: detail,
+      findings: [{ kind: 'wrong', where: 'hello.txt', specLine: 'A hello.txt file says hello.', detail }],
+    });
+  };
+  return [answer, answer];
+};
+
+/** Everything a request shows the model: its instructions and every message. */
+const everything = (request: { messages: readonly unknown[] }) => JSON.stringify(request.messages);
+
+/** What the original run's review found, as written in the description. The repair must not trust it. */
+const OLD_FINDING = 'Stale finding: hello.txt must say goodbye.';
+const FRESH_FINDING = 'hello.txt must greet the world.';
+
+/**
+ * Pull request #100 as phat-mode judged it not clean, for `reason`, with a finding of the original run's in its Code
+ * review section. `verify`: the repo has a verification skill.
+ */
+async function notCleanPullRequest(reason: string, { verify = false } = {}) {
+  const setup = await openedPullRequest({}, verify ? VERIFY_SKILL_FILES : {}, verify ? [verificationReport()] : []);
+  const { pr, head } = setup;
+  pr.body = pr.body
+    .replace(/<!-- phat-mode:yolo [^]*?-->/, yoloMarker({ verdict: 'not-clean', sha: head, reason }))
+    .replace('## Code review\n\n', `## Code review\n\n${OLD_FINDING}\n\n`);
+  assert.ok(pr.body.includes(OLD_FINDING));
+  return setup;
+}
+
+describe('repair, not clean', () => {
+  test('open findings: a fresh review comes first, only its must-fix findings go to the implementer, and the fix is published with a new verdict', async () => {
+    const { github, checks, runIssue, remote, remoteFile, pr, head } = await notCleanPullRequest('code review has open findings', { verify: true });
+    const checked = checks.runs;
+    let asked = '';
+    const { outcome, faux } = await runIssue(
+      1,
+      [
+        ...specFinding(FRESH_FINDING),
+        // Next comes the implementer, not the verifier: verification was not the reason.
+        (request) => {
+          asked = everything(request);
+          return write('hello.txt', 'hello, world\n');
+        },
+        done(),
+        ...approve(),
+        verificationReport(),
+        describePr('Adds hello.txt, greeting the world.'),
+      ],
+      'repair',
+    );
+
+    assert.deepEqual(repaired(outcome), { status: 'repaired', url: pr.url });
+    assert.equal(faux.getPendingResponseCount(), 0);
+    assert.ok(asked.includes(FRESH_FINDING), 'the fresh finding goes to the implementer');
+    assert.ok(!asked.includes(OLD_FINDING), 'the original run’s findings do not');
+    assert.equal(checks.runs, checked + 1, 'checked once, after the fix');
+    assert.equal(await remoteFile(1, 'hello.txt'), 'hello, world\n');
+    const pushed = await branchHead(remote, 1);
+    assert.notEqual(pushed, head);
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'clean', sha: pushed });
+    assert.match(pr.body, /^## Summary\n\nAdds hello\.txt, greeting the world\./);
+    assert.ok(!pr.body.includes(OLD_FINDING), 'the description is written again');
+    const comments = repairComments(github, pr.number);
+    assert.equal(comments.length, 1, 'one repair comment');
+    assert.equal(comments[0]!.marker, repairMarker({ n: 1, sha: head, cause: 'not-clean', round: 1 }));
+    assert.match(comments[0]!.body, new RegExp(`\\*\\*Outcome:\\*\\* repaired: pushed ${pushed.slice(0, 7)}, verdict clean`));
+  });
+
+  test('a fresh review that finds nothing must-fix: clean on the same head, with no new commit, and yolo merges it', async () => {
+    const { github, checks, runIssue, remote, pr, head } = await notCleanPullRequest('code review has open findings');
+    const checked = checks.runs;
+    const { outcome, faux } = await runIssue(1, [...approve(), describePr('Adds hello.txt.')], 'repair');
+
+    assert.deepEqual(repaired(outcome), { status: 'repaired', url: pr.url });
+    assert.equal(faux.getPendingResponseCount(), 0, 'no implementer run');
+    assert.equal(checks.runs, checked, 'nothing changed to check');
+    assert.equal(await branchHead(remote, 1), head, 'no new commit');
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'clean', sha: head });
+    const comments = repairComments(github, pr.number);
+    assert.equal(comments.length, 1);
+    assert.equal(comments[0]!.marker, repairMarker({ n: 1, sha: head, cause: 'not-clean', round: 1 }));
+    assert.match(comments[0]!.body, /\*\*Outcome:\*\* repaired: no new commit, verdict clean/);
+
+    assert.deepEqual(await yoloMerge(github, { ...pr, issue: 1 }, { command: 'watch', now: new Date('2026-10-31T12:00:00Z') }), { merged: true });
+    assert.deepEqual(github.merges, [{ pr: pr.number, sha: head }]);
+  });
+
+  test('verification was the reason: a fresh review and a fresh verification both run before the implementer, who gets both', async () => {
+    const { runIssue, remote, pr, head } = await notCleanPullRequest('verification found failures this change caused', { verify: true });
+    let asked = '';
+    const { outcome, faux } = await runIssue(
+      1,
+      [
+        ...specFinding(FRESH_FINDING),
+        verificationReport({ status: 'failed', detail: 'The greeting is missing.' }),
+        (request) => {
+          asked = textOf(request.messages.at(-1) as { content: unknown });
+          return write('hello.txt', 'hello, world\n');
+        },
+        done(),
+        ...approve(),
+        verificationReport(),
+        describePr(),
+      ],
+      'repair',
+    );
+
+    assert.deepEqual(repaired(outcome), { status: 'repaired', url: pr.url });
+    assert.equal(faux.getPendingResponseCount(), 0);
+    assert.ok(asked.includes(FRESH_FINDING), 'the review’s must-fix finding');
+    assert.ok(asked.includes('The greeting is missing.'), 'and the verification’s failure, in one request');
+    const pushed = await branchHead(remote, 1);
+    assert.notEqual(pushed, head);
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'clean', sha: pushed });
+  });
+
+  test('verification was the reason, and the fresh review and verification find nothing: clean on the same head', async () => {
+    const { runIssue, remote, pr, head } = await notCleanPullRequest('the verifier did not report', { verify: true });
+    const { outcome, faux } = await runIssue(1, [...approve(), verificationReport(), describePr()], 'repair');
+    assert.deepEqual(repaired(outcome), { status: 'repaired', url: pr.url });
+    assert.equal(faux.getPendingResponseCount(), 0);
+    assert.equal(await branchHead(remote, 1), head);
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'clean', sha: head });
+  });
+
+  test('a fresh maxReviewRounds: with one round and a must-fix finding, it ends not clean on the same head, and the next look gives up', async () => {
+    const { github, config, runIssue, remote, pr, head } = await notCleanPullRequest('code review has open findings');
+    config.limits.maxReviewRounds = 1;
+    const { outcome, faux } = await runIssue(1, [...specFinding(FRESH_FINDING), describePr()], 'repair');
+
+    assert.deepEqual(repaired(outcome), { status: 'repaired', url: pr.url });
+    assert.equal(faux.getPendingResponseCount(), 0, 'no implementer run');
+    assert.equal(await branchHead(remote, 1), head);
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'not-clean', sha: head, reason: 'code review has open findings' });
+    const [comment] = repairComments(github, pr.number);
+    assert.match(comment!.body, /\*\*Outcome:\*\* repaired: no new commit, verdict not clean \(code review has open findings\)/);
+    const next = await lookAtPullRequest(github, pr, { maxRepairs: 3, now: new Date(), baseBranch: 'main' });
+    assert.deepEqual(next, { kind: 'give_up', cause: 'not-clean', reason: `gave up: a repair already ran on ${head}`, head, round: 1 });
+  });
+
+  test('a repair that pushes a new head still not clean counts as an attempt: the next look is the next repair', async () => {
+    const { github, config, runIssue, remote, pr, head } = await notCleanPullRequest('code review has open findings');
+    config.limits.maxReviewRounds = 2;
+    const { outcome } = await runIssue(
+      1,
+      [...specFinding(FRESH_FINDING), write('hello.txt', 'hello, world\n'), done(), ...specFinding('Still wrong.'), describePr()],
+      'repair',
+    );
+
+    assert.deepEqual(repaired(outcome), { status: 'repaired', url: pr.url });
+    const pushed = await branchHead(remote, 1);
+    assert.notEqual(pushed, head);
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'not-clean', sha: pushed, reason: 'code review has open findings' });
+    github.statuses.get(pr.number)!.head = { sha: pushed, committedAt: '2026-10-31T11:30:00Z' };
+    const next = await lookAtPullRequest(github, pr, { maxRepairs: 3, now: new Date(), baseBranch: 'main' });
+    assert.equal(next.kind, 'repair');
+    assert.deepEqual(next.kind === 'repair' && [next.cause, next.n, next.head], ['not-clean', 2, pushed]);
+  });
+
+  test('a crash just after update merged a newer main: resumed, the merge is checked, reviewed and verified before publishing', async () => {
+    const { github, checks, config, services, open, remote, advanceMain, pr, head } = await notCleanPullRequest(
+      'verification found failures this change caused',
+      { verify: true },
+    );
+    const checked = checks.runs;
+    // First process: the fresh review and verification find nothing; main moves on meanwhile. The process dies just
+    // after update merged main in, before it saved where it was.
+    let merged!: () => void;
+    let die!: (error: Error) => void;
+    const reached = new Promise<void>((resolve) => (merged = resolve));
+    const dying = new Proxy(services.workspaces, {
+      get(target, key) {
+        if (key === 'updateBranch') {
+          return async (...args: Parameters<typeof target.updateBranch>) => {
+            await target.updateBranch(...args);
+            merged();
+            return new Promise<never>((_resolve, reject) => (die = reject));
+          };
+        }
+        const value = Reflect.get(target, key, target) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const first = await open(
+      [...approveAfter(async () => void (await advanceMain({ 'other.txt': 'from main\n' }))), verificationReport(), describePr()],
+      async () => ({ ...services, workspaces: dying }),
+    );
+    const { taskId } = await first.phat.start({ repo: config.repo, issue: 1 }, context, 'repair');
+    first.phat.harness.resume();
+    await reached;
+    const closing = first.phat.close(context);
+    die(new Error('aborted'));
+    await closing;
+
+    // Second process: the merged head is checked, reviewed and verified before it is published.
+    const second = await open([...approve(), verificationReport(), describePr()]);
+    assert.deepEqual(await second.phat.start({ repo: config.repo, issue: 1 }, context, 'repair'), { taskId, resumed: true });
+    second.phat.harness.resume();
+    const { outcome } = (await second.phat.harness.waitForTask(taskId, context)).state;
+    await second.phat.close(context);
+
+    assert.deepEqual(repaired(outcome as { status: string; result?: RunResult }), { status: 'repaired', url: pr.url });
+    assert.equal(second.faux.getPendingResponseCount(), 0, 'the merge is reviewed and verified');
+    assert.equal(checks.runs, checked + 1, 'the merge is checked');
+    const pushed = await branchHead(remote, 1);
+    assert.notEqual(pushed, head, 'main merged in');
+    assert.deepEqual(readYoloMarker(pr.body), { verdict: 'clean', sha: pushed });
+    assert.equal(repairComments(github, pr.number).length, 1);
+  });
+
+  test('budget spent: stuck at once, the issue failed, without asking any agent', async () => {
+    const { github, runIssue, pr } = await notCleanPullRequest('code review has open findings');
+    for (const [n, sha] of [[1, 'aaa1111'], [2, 'bbb2222'], [3, 'ccc3333']] as const) {
+      await github.upsertComment(pr.number, repairMarker({ n, sha, cause: 'not-clean', round: 1 }), `Repair ${n}.\n\n**Outcome:** repaired`);
+    }
+    const { outcome, faux } = await runIssue(1, [], 'repair');
+
+    assert.deepEqual(repaired(outcome), { status: 'stuck', url: pr.url, reason: 'gave up: 3 repairs spent' });
+    assert.equal(faux.getPendingResponseCount(), 0);
+    assert.equal(repairComments(github, pr.number).length, 3, 'no fourth repair');
+    assert.deepEqual(github.labels(pr.number), ['phat-mode:stuck', 'ready-for-human']);
+    assert.deepEqual(github.labels(1), ['enhancement', 'phat-mode:failed', 'ready-for-human']);
   });
 });

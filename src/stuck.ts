@@ -16,12 +16,6 @@ import { clock, readYoloMarker, SETTLE_MS } from './yolo.ts';
 export type RepairCause = 'conflicts' | 'checks' | 'not-clean';
 const CAUSES: readonly RepairCause[] = ['conflicts', 'checks', 'not-clean'];
 
-/**
- * The causes repair handles so far. Not clean is reported as stuck, but those pull requests wait as before, until
- * repair handles them.
- */
-export const REPAIRED_CAUSES: readonly RepairCause[] = ['conflicts', 'checks'];
-
 /** One repair, as its comment's marker records it. `round`: repairs since the last give-up are in the same round. */
 export type RepairMarker = { n: number; sha: string; cause: RepairCause; round: number };
 

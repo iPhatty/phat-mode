@@ -220,6 +220,16 @@ ${
 ${scratchNote(scratch)} The planner may have left files there already.`;
 }
 
+/** A pull request description without one of its `## ` sections, up to the next section, footer or marker. */
+function withoutSection(body: string, heading: string): string {
+  const start = body.startsWith(`## ${heading}\n`) ? 0 : body.indexOf(`\n\n## ${heading}\n`);
+  if (start === -1) return body;
+  const from = start === 0 ? 0 : start + 2;
+  const rest = body.slice(from + 3);
+  const end = rest.search(/\n\n## |\n\n---\n|\n\n<!-- phat-mode:/);
+  return end === -1 ? body.slice(0, from).trim() : `${body.slice(0, from)}${rest.slice(end + 2)}`.trim();
+}
+
 /**
  * The implementer's instructions in a Repair: its role, then what it is repairing. A repair's conversations are fresh,
  * so this carries what the build knew: the spec, the pull request's description, the agreed decisions and the
@@ -238,13 +248,17 @@ export function repairInstructions(
   },
 ): string {
   const departures = departureLines({ departures: repair.departures });
-  const description = repair.pr.body.replace(/\n*<!-- phat-mode:yolo [^]*?-->\s*$/, '').trim();
+  const verdictless = repair.pr.body.replace(/\n*<!-- phat-mode:yolo [^]*?-->\s*$/, '').trim();
+  // Not clean: the original run's review findings are not trusted, so they are left out; a fresh review's go instead.
+  const description = repair.cause === 'not-clean' ? withoutSection(verdictless, 'Code review') : verdictless;
   // For failed checks, the reason names checks, which come from CI: the request quotes them, as untrusted input.
   const stuck = repair.cause === 'checks' ? 'checks failed on it on GitHub (your request lists them, quoted from CI)' : repair.reason;
   const work =
     repair.cause === 'checks'
       ? "Checks failed on it on GitHub, and a diagnosis found this change caused it. You fix the failure in the change. Then the change is checked, reviewed and verified again, as in the original build, and you write its description again. If the base branch moved on meanwhile, phat-mode merges it in; when that leaves conflicts, you resolve them."
-      : "phat-mode merges the base branch into it; when that leaves conflicts, you resolve them, keeping both what the pull request does and what the base branch changed. Then the change is checked, reviewed and verified again, as in the original build, and you write its description again.";
+      : repair.cause === 'not-clean'
+        ? "phat-mode does not trust the original run's findings: it reviews the change afresh against its base branch (and verifies it again, when verification was the reason). You fix only the must-fix findings that fresh review and verification report, as your requests list them. Then the change is checked, reviewed and verified again, as in the original build, and you write its description again. If the base branch moved on meanwhile, phat-mode merges it in; when that leaves conflicts, you resolve them."
+        : "phat-mode merges the base branch into it; when that leaves conflicts, you resolve them, keeping both what the pull request does and what the base branch changed. Then the change is checked, reviewed and verified again, as in the original build, and you write its description again.";
   return `${roleInstructions(checkCommand).implement}
 
 This conversation is a Repair. phat-mode built this issue earlier and opened pull request ${repair.pr.url}, which is now stuck: ${stuck}.

@@ -3,7 +3,7 @@ import { commentMarker, type GitHub, type ListedIssue, mergeLabels, PROGRESS_LAB
 import type { Logger } from './log.ts';
 import { handedBackComment, parentClosedComment, shapeRefusedComment } from './messages.ts';
 import { eligibility, MARKER_SHAPE_REFUSED, shapingEligibility } from './spec.ts';
-import { lookAtPullRequest, REPAIRED_CAUSES } from './stuck.ts';
+import { lookAtPullRequest } from './stuck.ts';
 import { yoloMerge } from './yolo.ts';
 
 /**
@@ -72,7 +72,7 @@ export async function nextStep(
     await github.closeIssue(parent.number, MARKER_PARENT_CLOSED, parentClosedComment(parent.number, tickets));
   }
 
-  // 1. Repair comes first: the lowest issue whose pull request is stuck in a way repair handles. Why repair leaves one
+  // 1. Repair comes first: the lowest issue whose pull request is stuck (conflicts, failed checks or not clean). Why repair leaves one
   //    alone (a review paused it, it is phat-mode:stuck, or its failed checks fail on the base branch too or are flaky)
   //    goes on that pull request's waiting line. Waiting for checks takes no run.
   const open = (await github.openPullRequests())
@@ -89,7 +89,7 @@ export async function nextStep(
         now,
         baseBranch: config.baseBranch,
       });
-      if ((outcome.kind === 'repair' || outcome.kind === 'give_up') && REPAIRED_CAUSES.includes(outcome.cause)) {
+      if (outcome.kind === 'repair' || outcome.kind === 'give_up') {
         return { kind: 'repair', issue: pr.issue, url: pr.url, reason: outcome.reason };
       }
       if (outcome.kind === 'paused' || outcome.kind === 'stuck' || (outcome.kind === 'wait' && outcome.onWaitingLine)) {
