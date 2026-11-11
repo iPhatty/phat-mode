@@ -40,7 +40,8 @@ import {
 import { consoleLogger, consoleLoggerFor } from './log.ts';
 import type { Services } from './pipeline.ts';
 import { currentRepo, loadRepoConfig, NotSetUpError, parseIssueRef, watchScope } from './repos.ts';
-import { describeResult } from './runs.ts';
+import type { RepairResult } from './repair.ts';
+import { describeResult, kindOfTask, needsYou } from './runs.ts';
 import { MATTPOCOCK_SKILLS, PSTACK_SKILLS, VERIFICATION_SKILLS } from './skills.ts';
 import { type ProjectQueue, watchProjects } from './scheduler.ts';
 import { describeStep, nextStep } from './watch.ts';
@@ -59,8 +60,10 @@ Usage:
   phat-mode login [--from-pi]   Sign in to GitHub Copilot (or copy the pi coding agent's login)
   phat-mode doctor [repo]       Check that everything phat-mode needs is set up
   phat-mode run <issue>         Work on a ready-for-agent issue until a PR is open, or shape an agent-mode
-                                issue (resumes if interrupted)
-                                --yolo: then merge the PR once it is clean and every check passed
+                                issue (resumes if interrupted). With its PR open: repair the PR if it is stuck,
+                                or say why not
+                                --yolo: then merge the PR once it is clean and every check passed, repairing it
+                                while it waits
   phat-mode resume              Continue every run that was interrupted, in every project no other process holds
   phat-mode watch [repo...]     Keep going: work on the next ready issue each time you merge a PR (Ctrl-C to stop).
                                 In a set-up repo, asks whether to watch it alone or all your repos.
@@ -271,15 +274,37 @@ async function watch(machine: MachineConfig, repos: string[], yolo: boolean): Pr
   return 0;
 }
 
-/** `run --yolo`, once the pull request is open: wait until it merges (0) or only you can move it on (1). */
-async function yoloWait(github: GhGitHub, issue: number, intervalMs: number): Promise<number> {
+/**
+ * `run --yolo`, once the pull request is open: wait until it merges (0) or only you can move it on (1). `repair`: with
+ * repair on, a stuck pull request is repaired by the durable Repair task meanwhile (Ctrl-C, then `run --yolo` again,
+ * resumes it), and the wait goes on.
+ */
+async function yoloWait(
+  phat: PhatMode,
+  github: GhGitHub,
+  issue: number,
+  intervalMs: number,
+  repair: { maxRepairs: number; baseBranch: string } | undefined,
+): Promise<number> {
   const minutes = Math.round(intervalMs / 60_000) || 1;
+  const key = `${phat.repo}#${issue}`;
   consoleLogger.step(issue, `Waiting to merge, looking every ${minutes} min. Ctrl-C to stop; \`phat-mode run --yolo ${issue}\` waits again.`);
+  const runRepair = async (pr: { url: string }): Promise<RepairResult> => {
+    const { taskId } = await phat.start({ repo: phat.repo, issue }, context, 'repair');
+    resumeOnce(phat);
+    await waitAndReport(phat, taskId, key);
+    const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
+    if (outcome.status === 'completed') return outcome.result as RepairResult;
+    // A repair that failed or was aborted: only a human can move it on now.
+    const reason = outcome.status === 'failed' ? `the repair failed: ${outcome.error.message.split('\n')[0]}` : `the repair was ${outcome.status}`;
+    return { status: 'stuck', url: pr.url, reason };
+  };
   const outcome = await waitToMerge(github, issue, {
     intervalMs,
     now: () => new Date(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     say: (reason) => consoleLogger.step(issue, `Not merged yet: ${reason}`),
+    ...(repair === undefined ? {} : { repair: { ...repair, run: runRepair } }),
   });
   if (outcome.merged) {
     console.log(`\n✓ Merged ${outcome.url}`);
@@ -703,17 +728,50 @@ async function main(argv: string[]): Promise<number> {
       const phat = await open(machine, repo, configFor);
       closeOnCtrlC(() => [phat]);
       if (yolo) consoleLogger.info(YOLO_WARNING);
+      const config = await configFor(repo);
+      // Repair on (the default): `run` repairs the issue's stuck pull request, and `run --yolo` repairs while it waits.
+      const repair = config.repair !== false ? { maxRepairs: config.limits.maxRepairs, baseBranch: config.baseBranch } : undefined;
       const runAndWait = async () => {
         const runGoing = (await liveRuns(phat, context)).some((run) => run.key === `${repo}#${issue}`);
-        if (!yolo || (await runOrWait(github, issue, { runGoing })) === 'run') {
-          const { taskId, resumed } = await phat.start({ repo, issue }, context, kind);
-          consoleLogger.info(`${resumed ? 'Resuming' : kind === 'shape' ? 'Shaping' : 'Starting'} ${repo}#${issue}`);
-          phat.harness.resume();
-          const code = await waitAndReport(phat, taskId, `${repo}#${issue}`);
-          const { outcome } = (await phat.harness.waitForTask(taskId, context)).state;
-          if (!yolo || code !== 0 || outcome.status !== 'completed' || outcome.result.status !== 'pr_opened') return code;
+        const step = await runOrWait(github, issue, {
+          runGoing,
+          yolo,
+          ...(repair === undefined ? {} : { repair: { ...repair, now: new Date() } }),
+        });
+        if (step.kind === 'open') {
+          if (step.needsYou) {
+            console.log(`✖ Not repairing ${step.url}: ${step.reason}. It is yours to look at.`);
+            return 1;
+          }
+          console.log(`${step.url} is open: ${step.reason}. Nothing to repair; waiting for you to merge it.`);
+          return 0;
         }
-        return yoloWait(github, issue, machine.watchIntervalMs);
+        if (step.kind !== 'wait') {
+          // A run still going is resumed whatever its kind, e.g. a repair stopped by Ctrl-C.
+          const start: RunKind = step.kind === 'repair' ? 'repair' : kind;
+          const { taskId, resumed } = await phat.start({ repo, issue }, context, start);
+          const verb = resumed ? 'Resuming' : start === 'repair' ? 'Repairing' : start === 'shape' ? 'Shaping' : 'Starting';
+          consoleLogger.info(`${verb} ${repo}#${issue}${step.kind === 'repair' && !resumed ? ` (${step.reason})` : ''}`);
+          resumeOnce(phat);
+          const code = await waitAndReport(phat, taskId, `${repo}#${issue}`);
+          const settled = await phat.harness.waitForTask(taskId, context);
+          const { outcome } = settled.state;
+          if (outcome.status !== 'completed') return code;
+          if (!yolo) {
+            // A repair that ended ignored: look at the pull request again, as that also happens when its trigger went
+            // away before it looked; it needs you only if repair now leaves it alone.
+            const again =
+              repair !== undefined && kindOfTask(settled.kind) === 'repair' && outcome.result.status === 'ignored'
+                ? await runOrWait(github, issue, { runGoing: false, yolo: false, repair: { ...repair, now: new Date() } })
+                : undefined;
+            if (again?.kind === 'open' && again.needsYou) console.log(`✖ Not repairing ${again.url}: ${again.reason}. It is yours to look at.`);
+            return needsYou(outcome.result, settled.kind, again) ? 1 : code;
+          }
+          // --yolo goes on waiting to merge after a build opened the pull request, or a repair that did not give up.
+          const waitOn = kindOfTask(settled.kind) === 'repair' ? outcome.result.status !== 'stuck' : outcome.result.status === 'pr_opened';
+          if (code !== 0 || !waitOn) return needsYou(outcome.result, settled.kind) ? 1 : code;
+        }
+        return yoloWait(phat, github, issue, machine.watchIntervalMs, repair);
       };
       try {
         return await runAndWait();

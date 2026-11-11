@@ -3,6 +3,7 @@ import type { RunKind } from './harness.ts';
 import type { PipelineResult } from './pipeline.ts';
 import { REPAIR_TASK, type RepairResult } from './repair.ts';
 import { SHAPING_TASK, type ShapingResult } from './shaping.ts';
+import type { RunStep } from './yolo.ts';
 
 /**
  * How the CLI describes runs, of any kind: building an issue into a pull request (`phat.pipeline`), shaping an
@@ -69,6 +70,24 @@ export function describeResult(result: PipelineResult | ShapingResult | RepairRe
       return '🧑 phat-mode decided a human should do this and moved the issue to ready-for-human.';
   }
   return `${result.status}`;
+}
+
+/**
+ * Whether how a run ended leaves the next move to a human, so `run` exits 1. A repair that gave up (`stuck`) does. A
+ * repair that ended `ignored` does only when `pr`, the pull request looked at again afterwards (`runOrWait`), is one
+ * repair leaves alone (paused by a review, `phat-mode:stuck`, human commits, no verdict): the repair also ends ignored
+ * when its trigger went away before it looked (checks running again, or passed), which needs nobody. A repair that
+ * published, or that only waits (reran jobs, base red, flaky), does not; nor does any build or shaping, whose exit
+ * codes stay as they were.
+ */
+export function needsYou(
+  result: PipelineResult | ShapingResult | RepairResult,
+  taskKind?: string,
+  pr?: RunStep,
+): boolean {
+  if (taskKind !== REPAIR_TASK) return false;
+  if (result.status === 'stuck') return true;
+  return result.status === 'ignored' && pr?.kind === 'open' && pr.needsYou;
 }
 
 /** What `status` needs of a task record. */
