@@ -132,9 +132,11 @@ Parallel runs mean parallel verifications. Each project's [verify skill](#verifi
 
 ### Repair
 
-phat-mode **repairs** its own stuck pull requests before handing them to you. Repair is a third durable task kind, next to building and shaping: it survives crashes and Ctrl-C, and `status`, `resume` and `abort` cover it (`status` says e.g. `repairing: running (diagnose)`, and for a held project `doing #12 repair (update)`). Only `watch` starts repairs; `"repair": false` in your [config.json](#yours-phat-modeconfigjson) turns it off. Why it works this way: [ADR 0006](docs/adr/0006-repair-is-its-own-task-kind.md).
+phat-mode **repairs** its own stuck pull requests before handing them to you. Repair is a third durable task kind, next to building and shaping: it survives crashes and Ctrl-C, and `status`, `resume` and `abort` cover it (`status` says e.g. `repairing: running (diagnose)`, and for a held project `doing #12 repair (update)`). `watch` and `run` start repairs; `"repair": false` in your [config.json](#yours-phat-modeconfigjson) turns it off. Why it works this way: [ADR 0006](docs/adr/0006-repair-is-its-own-task-kind.md).
 
 It repairs **conflicts**, **failed checks** and **not clean**.
+
+**From `run`**: `phat-mode run <issue>`, when the issue's PR is open and no run is going, looks at the PR first. Stuck in a way repair handles: it runs a repair, and exits 0 once the repair has published (or only waits, e.g. on rerun jobs or a base branch that is red too). A PR repair leaves alone (paused by a review, `phat-mode:stuck`, commits added after phat-mode, no verdict): it says why, e.g. `✖ Not repairing <url>: repair paused: changes requested by @bob. It is yours to look at.`, and exits 1, as it does when the repair gives up. A PR that is not stuck: it says so and that it waits for you to merge it (exit 0), without starting a new build. Ctrl-C during a repair is safe: `run <issue>` again resumes the repair. With `"repair": false`, `run` starts a new build, as before.
 
 **Conflicts**: a phat-mode PR that conflicts with its base branch, or is behind it where GitHub won't merge it until it's updated. The repair resets the issue's workspace to the PR's head, merges the base branch in, and gives any conflicts to a fresh implementer, told the spec, the PR's description, the plan's agreed decisions and the build's departures (read back from that description). Then check, code review and verification run again, as for a build, the implementer writes the description again, and the PR gets the new description and a new verdict for its new head, so [`--yolo`](#yolo) merges it as usual once it is clean and green. Each repair posts one comment on the PR, saying what failed, the cause and the outcome.
 
@@ -215,7 +217,7 @@ $ phat-mode watch                      # terminal 2
 
 Checks running or settling: it waits. Anything else is yours, with one line saying why: `not merging: checks failed: ci/test`, `code review has open findings`, `commits added after phat-mode`, `GitHub refused: …`. It never bypasses branch protection (no `--admin`) and only squash-merges. Each merge gets a comment on the PR.
 
-`run --yolo` opens the PR as `run` does, then looks every `watchIntervalMs` (or as soon as the commit has settled, if that is all it waits for) until it merges (exit 0) or something needs you (exit 1, with the reason). Ctrl-C is safe: `run --yolo <issue>` again goes straight back to waiting when the PR is open and no run is going. Why it works this way: [ADR 0002](docs/adr/0002-yolo-merges.md).
+`run --yolo` opens the PR as `run` does, then looks every `watchIntervalMs` (or as soon as the commit has settled, if that is all it waits for) until it merges (exit 0) or something needs you (exit 1, with the reason). While it waits, it [repairs](#repair) what it can (conflicts, failed checks once they have all finished, not clean) and goes on waiting; it waits too while the failed checks also fail on the base branch. It exits 1 only when a human must act: the PR is `phat-mode:stuck` or a repair gave up, a review paused repair, commits were added after phat-mode, phat-mode left no verdict, or GitHub refused the merge. Ctrl-C is safe: `run --yolo <issue>` again goes straight back to waiting when the PR is open and no run is going, and resumes a repair stopped mid-way before waiting again. With `"repair": false`, it waits as before: failed checks and not clean are yours. Why it works this way: [ADR 0002](docs/adr/0002-yolo-merges.md).
 
 ## Code review
 
@@ -308,7 +310,7 @@ A repo without a `.phat-mode.json` on its default branch is refused: phat-mode n
 |---|---|
 | `phat-mode init` | Set up the repo in this folder. See [Setup](#setup). |
 | `phat-mode watch [--yolo] [repo…]` | Shape the `agent-mode` issues and work through the ready ones, up to `maxParallelRuns` runs at once (default 1), one per project, until Ctrl-C. In a set-up repo, asks: this repo or all. Skips projects another watch holds and takes them over when it stops. `--yolo` merges the clean PRs itself. See [Watch](#watch). |
-| `phat-mode run [--yolo] <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. `--yolo` then waits and merges the PR. See [Yolo](#yolo). |
+| `phat-mode run [--yolo] <issue>` | Work on one issue until a PR is open, or shape it if it is labelled `agent-mode`. Run it again to resume. With the issue's PR open, it [repairs](#repair) the PR if it is stuck, and says why when repair leaves it alone (exit 1). `--yolo` then waits and merges the PR, repairing it meanwhile. See [Repair](#repair) and [Yolo](#yolo). |
 | `phat-mode resume` | Continue every interrupted run, building or shaping, in every project no other process holds (a held one is named and skipped, and the exit code is 1). |
 | `phat-mode status` | List every project (your `repos`, and any other with runs) and its runs: shaping, building or repairing, and where they are (e.g. `repairing: running (update)`). For a project another process holds, what that process is doing, from its lock file. |
 | `phat-mode abort <issue>` | Stop a run. |
@@ -398,7 +400,7 @@ Optional; anything left out uses the defaults in [`src/config.ts`](src/config.ts
 
 - `repos`: what `watch` works on when no repos are named (inside a set-up repo, it asks: that one or all). `init` adds to it.
 - `allowedAuthors`: trusted on every repo that does not list its own. Default: you, the `gh` user.
-- `repair`: whether `watch` [repairs](#repair) phat-mode's stuck PRs. Default `true`; `false` keeps them waiting for you, as before.
+- `repair`: whether `watch` and `run` [repair](#repair) phat-mode's stuck PRs. Default `true`; `false` keeps them waiting for you, and `watch` and `run` (with or without `--yolo`) as before.
 - `limits.maxRepairs`: repairs of one PR before phat-mode gives up and labels it `phat-mode:stuck`. Default 3; removing the label gives a fresh budget.
 - `maxParallelRuns`: how many runs (builds, shapings and repairs, not waiting for a merge) one `watch` does at once, at most one per project. Default 1: one at a time. A whole number of 1 or more; the cap is per watch process. Each project's verify skill must keep parallel runs from colliding (ports, simulators, fixed paths): see [Parallel runs](#parallel-runs).
 - Repo settings (`checkCommand`, `repo`, …) here are an error, pointing to `.phat-mode.json`.

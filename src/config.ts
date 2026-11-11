@@ -63,7 +63,10 @@ export type MachineConfig = {
    * request to be merged is not a run. Per process: two watches each have their own.
    */
   maxParallelRuns: number;
-  /** Whether `phat-mode watch` repairs its own stuck pull requests (conflicts with the base branch, failed checks). Default: true. */
+  /**
+   * Whether `phat-mode watch` and `phat-mode run` (also while `run --yolo` waits to merge) repair phat-mode's own stuck
+   * pull requests (conflicts with the base branch, failed checks, not clean). Default: true.
+   */
   repair: boolean;
   /** Repos `phat-mode watch` works on ("owner/name"), when none are named on the command line. */
   repos: string[];

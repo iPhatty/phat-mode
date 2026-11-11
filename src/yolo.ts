@@ -1,6 +1,8 @@
 import type { CodeReview } from './code-review.ts';
 import { branchFor } from './config.ts';
 import type { CheckState, GitHub } from './github.ts';
+import type { RepairResult } from './repair.ts';
+import { lookAtPullRequest } from './stuck.ts';
 import type { Verification } from './verify.ts';
 
 /**
@@ -153,32 +155,119 @@ export async function yoloMerge(
  * `run --yolo`, once the pull request for `issue` is open: look every `intervalMs` until it merges, or until only a
  * human can move it on; when only settling is left, look again as soon as it has settled instead. `say`: each new
  * reason it is not merged yet.
+ *
+ * `repair`: with repair on, each look first decides whether the pull request is stuck (src/stuck.ts). One repair can
+ * fix is repaired by `repair.run` (the durable Repair task), and the loop looks again at once; it merges only once
+ * nothing is stuck. It stops, with the reason, when repair leaves the pull request alone (`phat-mode:stuck`, paused by
+ * a review, human commits, no verdict) or the repair gave up. Without it, failed checks and not clean stop the wait.
  */
 export async function waitToMerge(
   github: GitHub,
   issue: number,
-  options: { intervalMs: number; now: () => Date; sleep: (ms: number) => Promise<void>; say: (text: string) => void },
+  options: {
+    intervalMs: number;
+    now: () => Date;
+    sleep: (ms: number) => Promise<void>;
+    say: (text: string) => void;
+    repair?: RepairLook & { run: (pr: { number: number; url: string }) => Promise<RepairResult> };
+  },
 ): Promise<{ merged: true; url: string } | { merged: false; reason: string; url?: string }> {
   let said: string | undefined;
+  const say = (text: string) => {
+    if (text !== said) options.say(text);
+    said = text;
+  };
+  const sleepUntil = (settlesAt: Date | undefined) => {
+    const untilSettled = settlesAt && settlesAt.getTime() - options.now().getTime() + SETTLE_SLACK_MS;
+    return options.sleep(Math.min(options.intervalMs, untilSettled ?? Infinity));
+  };
+  /** The head the last repair ran on, when it published nothing: a repair on it again waits an interval first. */
+  let unchanged: string | undefined;
   for (;;) {
     const pr = await github.findPullRequest(branchFor(issue));
     if (pr === undefined) return { merged: false, reason: 'no open pull request' };
+    if (options.repair !== undefined) {
+      const { run, ...look } = options.repair;
+      const stuck = await lookAtPullRequest(github, pr, { ...look, now: options.now() });
+      if (stuck.kind === 'leave' || stuck.kind === 'paused' || stuck.kind === 'stuck') {
+        return { merged: false, reason: stuck.reason, url: pr.url };
+      }
+      if (stuck.kind === 'repair' || stuck.kind === 'give_up') {
+        if (stuck.head === unchanged) await options.sleep(options.intervalMs);
+        say(`repairing: ${stuck.reason}`);
+        const result = await run(pr);
+        if (result.status === 'stuck') return { merged: false, reason: result.reason, url: pr.url };
+        say(result.status === 'repaired' ? `repaired: ${result.url}` : `${result.status === 'waiting' ? 'waiting' : 'not repaired'}: ${result.reason}`);
+        unchanged = result.status === 'repaired' ? undefined : stuck.head;
+        continue;
+      }
+      if (stuck.kind === 'wait') {
+        say(stuck.reason);
+        await sleepUntil(stuck.settlesAt);
+        continue;
+      }
+    }
     const outcome = await yoloMerge(github, { ...pr, issue }, { command: 'run', now: options.now() });
     if (outcome.merged) return { merged: true, url: pr.url };
-    if (outcome.needsYou) return { merged: false, reason: outcome.reason, url: pr.url };
-    if (outcome.reason !== said) options.say(outcome.reason);
-    said = outcome.reason;
-    const untilSettled = outcome.settlesAt && outcome.settlesAt.getTime() - options.now().getTime() + SETTLE_SLACK_MS;
-    await options.sleep(Math.min(options.intervalMs, untilSettled ?? Infinity));
+    if (outcome.needsYou) {
+      // yoloMerge reads GitHub again: a check may have failed, or the base branch moved on, since the look. With repair
+      // on, it is yours only if the pull request, looked at again, is still not stuck; otherwise the next look acts.
+      if (options.repair !== undefined) {
+        const { run: _run, ...look } = options.repair;
+        if ((await lookAtPullRequest(github, pr, { ...look, now: options.now() })).kind !== 'not_stuck') continue;
+      }
+      return { merged: false, reason: outcome.reason, url: pr.url };
+    }
+    say(outcome.reason);
+    await sleepUntil(outcome.settlesAt);
   }
 }
 
+/** How `run` and `run --yolo` look at an open pull request with repair on: `repair` in config.json, the default. */
+export type RepairLook = { maxRepairs: number; baseBranch: string };
+
 /**
- * What `run --yolo` does first. A run that is going is resumed (it opens or updates the pull request). Otherwise, if the
- * issue's pull request is already open, e.g. after Ctrl-C while waiting, or from a run without --yolo, it only waits
- * for the merge: a new run would redo the work just to update the same pull request.
+ * What `run` does first:
+ * - run: start a run, or resume the one going (whatever its kind, e.g. a repair stopped by Ctrl-C);
+ * - wait: `--yolo` with the pull request open: wait to merge it (the wait repairs what it can);
+ * - repair: the pull request is stuck in a way repair handles: repair it;
+ * - open: the pull request is open and there is nothing to repair; `needsYou`: repair leaves it alone (paused by a
+ *   review, `phat-mode:stuck`, human commits, no verdict), otherwise it only waits (checks running, settling, base red).
  */
-export async function runOrWait(github: GitHub, issue: number, { runGoing }: { runGoing: boolean }): Promise<'run' | 'wait'> {
-  if (runGoing) return 'run';
-  return (await github.findPullRequest(branchFor(issue))) === undefined ? 'run' : 'wait';
+export type RunStep =
+  | { kind: 'run' }
+  | { kind: 'wait' }
+  | { kind: 'repair'; url: string; reason: string }
+  | { kind: 'open'; url: string; reason: string; needsYou: boolean };
+
+/**
+ * What `run` does first. A run that is going is resumed (it opens, updates or repairs the pull request). Otherwise, if
+ * the issue's pull request is already open, e.g. after Ctrl-C while waiting, or from a run without --yolo: with --yolo
+ * it only waits for the merge, as a new run would redo the work just to update the same pull request; without, it
+ * repairs the pull request if it is stuck, and says why not otherwise. `repair`: absent with `repair: false`, which
+ * starts a new run, as before.
+ */
+export async function runOrWait(
+  github: GitHub,
+  issue: number,
+  { runGoing, yolo, repair }: { runGoing: boolean; yolo: boolean; repair?: RepairLook & { now: Date } },
+): Promise<RunStep> {
+  if (runGoing) return { kind: 'run' };
+  const pr = await github.findPullRequest(branchFor(issue));
+  if (pr === undefined) return { kind: 'run' };
+  if (yolo) return { kind: 'wait' };
+  if (repair === undefined) return { kind: 'run' };
+  const outcome = await lookAtPullRequest(github, pr, repair);
+  switch (outcome.kind) {
+    case 'repair':
+    case 'give_up':
+      return { kind: 'repair', url: pr.url, reason: outcome.reason };
+    case 'leave':
+    case 'paused':
+    case 'stuck':
+      return { kind: 'open', url: pr.url, reason: outcome.reason, needsYou: true };
+    case 'wait':
+    case 'not_stuck':
+      return { kind: 'open', url: pr.url, reason: outcome.reason, needsYou: false };
+  }
 }

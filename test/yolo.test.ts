@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import type { CheckState } from '../src/github.ts';
+import type { RepairResult } from '../src/repair.ts';
+import { baseRedMarker, rerunMarker } from '../src/stuck.ts';
 import { runOrWait, waitToMerge, yoloMarker, yoloMerge, type YoloVerdict } from '../src/yolo.ts';
 import { FakeGitHub } from './fakes.ts';
 
@@ -19,7 +21,7 @@ function pullRequest(
   } = {},
 ) {
   const github = new FakeGitHub();
-  const pr = github.addPullRequest({ branch: 'phat-mode/issue-7' });
+  const pr: FakeGitHub['prs'][number] = github.addPullRequest({ branch: 'phat-mode/issue-7' });
   const verdict = options.verdict === undefined ? { verdict: 'clean' as const, sha: SHA } : options.verdict;
   pr.body = `## Summary\n\nAdds hello.${verdict === null ? '' : `\n\n${yoloMarker(verdict)}`}`;
   github.statuses.set(pr.number, {
@@ -165,17 +167,277 @@ describe('run --yolo: waiting to merge', () => {
     assert.deepEqual(outcome, { merged: false, reason: 'no open pull request' });
   });
 
-  test('the pull request is already open and no run is going: straight to the wait, no new run', async () => {
-    const { github } = pullRequest();
-    assert.equal(await runOrWait(github, 7, { runGoing: false }), 'wait');
+});
+
+describe('run --yolo: repairing while it waits to merge', () => {
+  const REPAIRED = 'fed987';
+
+  /** A clock that sleeping moves on. */
+  function clock() {
+    let now = NOW.getTime();
+    const sleeps: number[] = [];
+    return {
+      now: () => new Date(now),
+      sleep: async (ms: number) => {
+        now += ms;
+        sleeps.push(ms);
+      },
+      sleeps,
+    };
+  }
+
+  /** What a published repair leaves on GitHub: a new head, phat-mode's clean verdict for it, no conflicts. */
+  function publishRepair(github: FakeGitHub, pr: { number: number; body: string }, checks: [string, CheckState][] = [['test', 'passed']]) {
+    pr.body = `## Summary\n\nAdds hello, repaired.\n\n${yoloMarker({ verdict: 'clean', sha: REPAIRED })}`;
+    github.statuses.set(pr.number, {
+      head: { sha: REPAIRED, committedAt: '2026-10-31T11:55:00Z' },
+      checks: checks.map(([name, state]) => ({ name, state })),
+    });
+  }
+
+  test('a pull request that conflicts: repaired once, then merged at the repaired head', async () => {
+    const { github, pr } = pullRequest();
+    github.statuses.get(pr.number)!.mergeable = 'CONFLICTING';
+    let repairs = 0;
+    const said: string[] = [];
+    const outcome = await waitToMerge(github, 7, {
+      ...clock(),
+      intervalMs: 60_000,
+      say: (text) => said.push(text),
+      repair: {
+        maxRepairs: 3,
+        baseBranch: 'main',
+        run: async () => {
+          repairs++;
+          publishRepair(github, pr);
+          return { status: 'repaired', url: pr.url };
+        },
+      },
+    });
+    assert.deepEqual(outcome, { merged: true, url: pr.url });
+    assert.equal(repairs, 1);
+    assert.deepEqual(github.merges, [{ pr: pr.number, sha: REPAIRED }]);
+    assert.equal(said[0], 'repairing: conflicts with main');
   });
 
-  test('a run is going: it is resumed first, even with its pull request open', async () => {
-    const { github } = pullRequest();
-    assert.equal(await runOrWait(github, 7, { runGoing: true }), 'run');
+  /** waitToMerge with a repair callback; `run` stands in for the Repair task. */
+  function waitWithRepair(
+    github: FakeGitHub,
+    run: () => Promise<RepairResult>,
+    time: ReturnType<typeof clock> = clock(),
+  ) {
+    const said: string[] = [];
+    let repairs = 0;
+    const outcome = waitToMerge(github, 7, {
+      ...time,
+      intervalMs: 60_000,
+      say: (text) => said.push(text),
+      repair: {
+        maxRepairs: 3,
+        baseBranch: 'main',
+        run: () => {
+          repairs++;
+          return run();
+        },
+      },
+    });
+    return { outcome, said, repairs: () => repairs };
+  }
+
+  const never = async (): Promise<RepairResult> => assert.fail('repair must not run');
+
+  test('failed checks: repair reruns the failed jobs, the wait goes on, and it merges once they pass', async () => {
+    const { github, pr } = pullRequest({ checks: [['test', 'failed']] });
+    const time = clock();
+    const wait = waitWithRepair(
+      github,
+      async () => {
+        await github.upsertComment(pr.number, rerunMarker(SHA), 'Reran the failed jobs.');
+        github.statuses.get(pr.number)!.checks = [{ name: 'test', state: 'running' }];
+        return { status: 'waiting', url: pr.url, reason: 'reran the failed jobs of test' };
+      },
+      { ...time, sleep: async (ms) => {
+        await time.sleep(ms);
+        github.statuses.get(pr.number)!.checks = [{ name: 'test', state: 'passed' }];
+      } },
+    );
+    assert.deepEqual(await wait.outcome, { merged: true, url: pr.url });
+    assert.equal(wait.repairs(), 1);
+    assert.deepEqual(github.merges, [{ pr: pr.number, sha: SHA }]);
+    assert.deepEqual(wait.said, ['repairing: checks failed: test', 'waiting: reran the failed jobs of test', 'checks running: test']);
+  });
+
+  test('the repair gives up: stops with its reason', async () => {
+    const { github, pr } = pullRequest();
+    github.statuses.get(pr.number)!.mergeable = 'CONFLICTING';
+    const wait = waitWithRepair(github, async () => ({ status: 'stuck', url: pr.url, reason: 'gave up: 3 repairs spent' }));
+    assert.deepEqual(await wait.outcome, { merged: false, reason: 'gave up: 3 repairs spent', url: pr.url });
+    assert.deepEqual(github.merges, []);
+  });
+
+  test('labelled phat-mode:stuck: stops with the reason, no repair', async () => {
+    const { github, pr } = pullRequest({ checks: [['test', 'failed']] });
+    pr.labels.push('phat-mode:stuck');
+    const wait = waitWithRepair(github, never);
+    assert.deepEqual(await wait.outcome, { merged: false, reason: 'phat-mode:stuck: waiting for you', url: pr.url });
+  });
+
+  test('changes requested after phat-mode pushed: paused, stops with the reason, no repair', async () => {
+    const { github, pr } = pullRequest();
+    const status = github.statuses.get(pr.number)!;
+    status.mergeable = 'CONFLICTING';
+    status.reviews = [{ author: 'bob', state: 'CHANGES_REQUESTED', submittedAt: '2026-10-31T11:55:00Z' }];
+    const wait = waitWithRepair(github, never);
+    assert.deepEqual(await wait.outcome, { merged: false, reason: 'repair paused: changes requested by @bob', url: pr.url });
+  });
+
+  test('commits added after phat-mode: stops with the reason, no repair', async () => {
+    const { github, pr } = pullRequest({ head: 'def456', checks: [['test', 'failed']] });
+    const wait = waitWithRepair(github, never);
+    assert.deepEqual(await wait.outcome, { merged: false, reason: 'commits added after phat-mode', url: pr.url });
+  });
+
+  test('no verdict from phat-mode: stops with the reason, no repair', async () => {
+    const { github, pr } = pullRequest({ verdict: null, checks: [['test', 'failed']] });
+    const wait = waitWithRepair(github, never);
+    assert.deepEqual(await wait.outcome, { merged: false, reason: 'phat-mode left no verdict on it', url: pr.url });
+  });
+
+  test('failed checks that fail on the base branch too: keeps waiting, says why once, spends no repair', async () => {
+    const { github, pr } = pullRequest({ checks: [['test', 'failed']] });
+    github.commits.set('main', { sha: 'ba5e01', checks: [] });
+    await github.upsertComment(pr.number, rerunMarker(SHA), 'Reran the failed jobs.');
+    await github.upsertComment(pr.number, baseRedMarker({ head: SHA, base: 'ba5e01', cause: 'base-red' }), 'Fails on main too.');
+    const time = clock();
+    let looks = 0;
+    const wait = waitWithRepair(github, never, {
+      ...time,
+      sleep: async (ms) => {
+        await time.sleep(ms);
+        // Someone fixes the check meanwhile, e.g. a rerun by hand once main is green.
+        if (++looks === 3) github.statuses.get(pr.number)!.checks = [{ name: 'test', state: 'passed' }];
+      },
+    });
+    assert.deepEqual(await wait.outcome, { merged: true, url: pr.url });
+    assert.deepEqual(wait.said, ['test fails on main too']);
+    assert.deepEqual(time.sleeps, [60_000, 60_000, 60_000]);
+  });
+
+  test('a check fails between the look and the merge: repaired, not handed to you', async () => {
+    const { github, pr } = pullRequest();
+    // GitHub's answer changes right after the first look: the merge sees the failure, which repair handles.
+    const read = github.pullRequestStatus.bind(github);
+    let reads = 0;
+    github.pullRequestStatus = async (number) => {
+      const status = await read(number);
+      if (++reads === 1) github.statuses.get(pr.number)!.checks = [{ name: 'test', state: 'failed' }];
+      return status;
+    };
+    const wait = waitWithRepair(github, async () => {
+      publishRepair(github, pr);
+      return { status: 'repaired', url: pr.url };
+    });
+    assert.deepEqual(await wait.outcome, { merged: true, url: pr.url });
+    assert.equal(wait.repairs(), 1);
+    assert.deepEqual(github.merges, [{ pr: pr.number, sha: REPAIRED }]);
+  });
+
+  test('GitHub refuses because the base branch moved on meanwhile: repaired, then merged', async () => {
+    const { github, pr } = pullRequest();
+    github.mergePullRequest = async (number) => {
+      // main moved on just now, and GitHub requires the branch up to date.
+      github.statuses.get(number)!.mergeState = 'BEHIND';
+      throw new Error('gh pr merge exited with 1: the head branch is not up to date with the base branch');
+    };
+    const merge = FakeGitHub.prototype.mergePullRequest.bind(github);
+    const wait = waitWithRepair(github, async () => {
+      publishRepair(github, pr);
+      github.mergePullRequest = merge;
+      return { status: 'repaired', url: pr.url };
+    });
+    assert.deepEqual(await wait.outcome, { merged: true, url: pr.url });
+    assert.equal(wait.repairs(), 1);
+    assert.deepEqual(github.merges, [{ pr: pr.number, sha: REPAIRED }]);
+  });
+
+  test('nothing stuck, but GitHub refuses the merge: stops with GitHub’s reason', async () => {
+    const { github, pr } = pullRequest();
+    github.refuseMerge.set(pr.number, 'At least 1 approving review is required by reviewers with write access.');
+    const wait = waitWithRepair(github, never);
+    assert.deepEqual(await wait.outcome, {
+      merged: false,
+      reason: 'GitHub refused: At least 1 approving review is required by reviewers with write access.',
+      url: pr.url,
+    });
+  });
+});
+
+describe('run: what it does first', () => {
+  const repair = { maxRepairs: 3, baseBranch: 'main', now: NOW };
+
+  test('a run is going: it is resumed first, even with its pull request open (e.g. a repair stopped by Ctrl-C)', async () => {
+    const { github, pr } = pullRequest();
+    github.statuses.get(pr.number)!.mergeable = 'CONFLICTING';
+    assert.deepEqual(await runOrWait(github, 7, { runGoing: true, yolo: false, repair }), { kind: 'run' });
+    assert.deepEqual(await runOrWait(github, 7, { runGoing: true, yolo: true, repair }), { kind: 'run' });
   });
 
   test('no pull request yet: run', async () => {
-    assert.equal(await runOrWait(new FakeGitHub(), 7, { runGoing: false }), 'run');
+    assert.deepEqual(await runOrWait(new FakeGitHub(), 7, { runGoing: false, yolo: false, repair }), { kind: 'run' });
+    assert.deepEqual(await runOrWait(new FakeGitHub(), 7, { runGoing: false, yolo: true }), { kind: 'run' });
+  });
+
+  test('--yolo with the pull request already open and no run going: straight to the wait, no new run', async () => {
+    const { github } = pullRequest();
+    assert.deepEqual(await runOrWait(github, 7, { runGoing: false, yolo: true }), { kind: 'wait' });
+    assert.deepEqual(await runOrWait(github, 7, { runGoing: false, yolo: true, repair }), { kind: 'wait' });
+  });
+
+  test('repair off, pull request open: a new run, as before', async () => {
+    const { github, pr } = pullRequest();
+    github.statuses.get(pr.number)!.mergeable = 'CONFLICTING';
+    assert.deepEqual(await runOrWait(github, 7, { runGoing: false, yolo: false }), { kind: 'run' });
+  });
+
+  test('a pull request that conflicts with its base: repair it', async () => {
+    const { github, pr } = pullRequest();
+    github.statuses.get(pr.number)!.mergeable = 'CONFLICTING';
+    assert.deepEqual(await runOrWait(github, 7, { runGoing: false, yolo: false, repair }), {
+      kind: 'repair',
+      url: pr.url,
+      reason: 'conflicts with main',
+    });
+  });
+
+  test('a pull request repair leaves alone: says why, and it needs you', async () => {
+    const paused = pullRequest({ checks: [['test', 'failed']] });
+    paused.github.statuses.get(paused.pr.number)!.reviews = [
+      { author: 'bob', state: 'CHANGES_REQUESTED', submittedAt: '2026-10-31T11:55:00Z' },
+    ];
+    assert.deepEqual(await runOrWait(paused.github, 7, { runGoing: false, yolo: false, repair }), {
+      kind: 'open',
+      url: paused.pr.url,
+      reason: 'repair paused: changes requested by @bob',
+      needsYou: true,
+    });
+    const stuck = pullRequest({ checks: [['test', 'failed']] });
+    stuck.pr.labels.push('phat-mode:stuck');
+    assert.deepEqual(await runOrWait(stuck.github, 7, { runGoing: false, yolo: false, repair }), {
+      kind: 'open',
+      url: stuck.pr.url,
+      reason: 'phat-mode:stuck: waiting for you',
+      needsYou: true,
+    });
+  });
+
+  test('a clean, green pull request: nothing to repair, it waits for you to merge it', async () => {
+    const { github, pr } = pullRequest();
+    assert.deepEqual(await runOrWait(github, 7, { runGoing: false, yolo: false, repair }), {
+      kind: 'open',
+      url: pr.url,
+      reason: 'not stuck',
+      needsYou: false,
+    });
+    assert.equal(github.writes, 0);
   });
 });

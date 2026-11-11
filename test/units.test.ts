@@ -8,7 +8,7 @@ import { agentEnv } from '../src/exec.ts';
 import { planRejection, type PlanReport } from '../src/agents.ts';
 import { breakdownCriteria, evidence, planComment, pullRequestBody, shapedCriteria } from '../src/messages.ts';
 import { describePrompt, implementPrompt, planPrompt, roleInstructions, specReviewPrompt } from '../src/prompts.ts';
-import { describeResult, runStatus } from '../src/runs.ts';
+import { describeResult, needsYou, runStatus } from '../src/runs.ts';
 import { dependencyOrder } from '../src/shaping.ts';
 
 const ROLE_INSTRUCTIONS = roleInstructions('npm run check');
@@ -444,6 +444,32 @@ describe('run status', () => {
       'repairing: 🛑 Gave up on https://github.test/pull/100: gave up: 3 repairs spent. It is labelled phat-mode:stuck; remove the label to let phat-mode repair it again.',
     );
     assert.equal(runStatus(done({ status: 'ignored', reason: 'phat-mode:stuck: waiting for you' })), 'repairing: ⏭️  Ignored: phat-mode:stuck: waiting for you');
+  });
+
+  test('a repair that gave up needs you; one that published or only waits does not', () => {
+    const url = 'https://github.test/pull/100';
+    assert.equal(needsYou({ status: 'stuck', url, reason: 'gave up: 3 repairs spent' }, 'phat.repair'), true);
+    assert.equal(needsYou({ status: 'repaired', url }, 'phat.repair'), false);
+    assert.equal(needsYou({ status: 'waiting', url, reason: 'ci/test fails on main too' }, 'phat.repair'), false);
+  });
+
+  test('a repair that ended ignored needs you only when the pull request, looked at again, is one repair leaves alone', () => {
+    const url = 'https://github.test/pull/100';
+    const paused = { status: 'ignored' as const, reason: 'repair paused: changes requested by @bob' };
+    assert.equal(needsYou(paused, 'phat.repair', { kind: 'open', url, reason: paused.reason, needsYou: true }), true);
+    // The trigger went away before the task looked, e.g. the failed checks were rerun by hand and now run or passed.
+    const gone = { status: 'ignored' as const, reason: 'checks running: test' };
+    assert.equal(needsYou(gone, 'phat.repair', { kind: 'open', url, reason: 'checks running: test', needsYou: false }), false);
+    assert.equal(needsYou(gone, 'phat.repair', { kind: 'open', url, reason: 'not stuck', needsYou: false }), false);
+    // Merged or closed meanwhile: nothing left for anyone to do here.
+    assert.equal(needsYou({ status: 'ignored', reason: 'the pull request is no longer open' }, 'phat.repair', { kind: 'run' }), false);
+  });
+
+  test('builds and shapings never need you by how they ended: their exit codes are unchanged', () => {
+    assert.equal(needsYou({ status: 'ignored', reason: 'not ready-for-agent' }, 'phat.pipeline'), false);
+    assert.equal(needsYou({ status: 'pr_opened', url: 'https://github.test/pull/100' }, 'phat.pipeline'), false);
+    assert.equal(needsYou({ status: 'ignored', reason: 'not agent-mode' }, 'phat.shape'), false);
+    assert.equal(needsYou({ status: 'needs_info' }, 'phat.shape'), false);
   });
 });
 
