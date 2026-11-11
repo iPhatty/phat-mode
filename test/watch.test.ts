@@ -72,8 +72,8 @@ describe('watch --yolo', () => {
     const second = judged(github, 4);
     const running = judged(github, 3, 'clean', [{ name: 'build', state: 'running' }]);
     const first = judged(github, 5);
-    // Opened in another order: still merged lowest issue first.
-    const step = await yoloStep(github);
+    // Opened in another order: still merged lowest issue first. Without repair, the not clean one only waits.
+    const step = await nextStep(github, { ...config, repair: false }, silentLogger, { yolo: true, now: NOW });
     assert.deepEqual(github.merges.map((merge) => merge.pr), [second.number, first.number]);
     assert.deepEqual(step, {
       kind: 'wait_for_merge',
@@ -293,10 +293,18 @@ describe('watch, repair', () => {
     assert.match(describeStep(waiting), /^Waiting for you to merge #2: .* \(not merging: .*\) \(phat-mode:stuck: waiting for you\)$/);
   });
 
-  test('failed checks, once settled, are repaired; not clean still waits as today', async () => {
+  test('not clean and failed checks are both repaired, lowest issue first', async () => {
     const github = repo({ 2: {}, 3: {} });
     const findings = judged(github, 2, { verdict: 'not-clean', sha: 'cafe2', reason: 'code review has open findings' });
     const failed = judged(github, 3, 'clean', [{ name: 'ci/test', state: 'failed' }]);
+    assert.deepEqual(await step(github), {
+      kind: 'repair',
+      issue: 2,
+      url: findings.url,
+      reason: 'not clean: code review has open findings',
+    });
+    // The repair ended clean on the same head: the failed checks come next.
+    findings.body = `Adds it.\n\n${yoloMarker({ verdict: 'clean', sha: 'cafe2' })}`;
     assert.deepEqual(await step(github), { kind: 'repair', issue: 3, url: failed.url, reason: 'checks failed: ci/test' });
     github.statuses.get(failed.number)!.checks = [{ name: 'ci/test', state: 'passed' }];
     assert.deepEqual(await step(github), {
@@ -305,6 +313,15 @@ describe('watch, repair', () => {
         { issue: 2, url: findings.url },
         { issue: 3, url: failed.url },
       ],
+    });
+  });
+
+  test('"repair": false leaves a not clean pull request waiting, as before', async () => {
+    const github = repo({ 2: {} });
+    const findings = judged(github, 2, { verdict: 'not-clean', sha: 'cafe2', reason: 'code review has open findings' });
+    assert.deepEqual(await nextStep(github, { ...config, repair: false }, silentLogger), {
+      kind: 'wait_for_merge',
+      prs: [{ issue: 2, url: findings.url }],
     });
   });
 

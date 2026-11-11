@@ -134,7 +134,7 @@ Parallel runs mean parallel verifications. Each project's [verify skill](#verifi
 
 phat-mode **repairs** its own stuck pull requests before handing them to you. Repair is a third durable task kind, next to building and shaping: it survives crashes and Ctrl-C, and `status`, `resume` and `abort` cover it (`status` says e.g. `repairing: running (diagnose)`, and for a held project `doing #12 repair (update)`). Only `watch` starts repairs; `"repair": false` in your [config.json](#yours-phat-modeconfigjson) turns it off. Why it works this way: [ADR 0006](docs/adr/0006-repair-is-its-own-task-kind.md).
 
-It repairs **conflicts** and **failed checks**.
+It repairs **conflicts**, **failed checks** and **not clean**.
 
 **Conflicts**: a phat-mode PR that conflicts with its base branch, or is behind it where GitHub won't merge it until it's updated. The repair resets the issue's workspace to the PR's head, merges the base branch in, and gives any conflicts to a fresh implementer, told the spec, the PR's description, the plan's agreed decisions and the build's departures (read back from that description). Then check, code review and verification run again, as for a build, the implementer writes the description again, and the PR gets the new description and a new verdict for its new head, so [`--yolo`](#yolo) merges it as usual once it is clean and green. Each repair posts one comment on the PR, saying what failed, the cause and the outcome.
 
@@ -148,7 +148,7 @@ It repairs **conflicts** and **failed checks**.
    - `base-red` (the same check fails on the base branch) or `flaky`: no repair is spent. A hidden marker records the PR's head and the base branch's head (`<!-- phat-mode:base-red head=<head> base=<base head> cause=base-red -->`), and the PR waits, e.g. `Waiting for you to merge #12: <url> (ci/test fails on main too)`. Once the base branch has moved on, repair looks again and diagnoses afresh.
    - `out-of-reach` (secrets, external services, permissions): repair gives up at once, labelling the PR `phat-mode:stuck` with the reason, and the issue `phat-mode:failed`.
 
-A `not-clean` verdict is reported as stuck but not repaired yet: those PRs wait as before.
+**Not clean**: phat-mode's own verdict on the PR is `not-clean`: open code review findings, a reviewer or the verifier that did not report, verification failures this change caused, verification that could not run, or the implementer having changed the verification skill. The repair doesn't trust the original run's findings: it starts with a fresh code review of the head against its base branch, and, when verification was the reason, a fresh verification too, both before anything goes to the implementer. Only their must-fix findings (and new verification failures) go to a fresh implementer, with a fresh `limits.maxReviewRounds`; the original run's Code review section is left out of what it is told. Then check, code review and verification run again as for any repair. When the fresh review finds nothing must-fix (and the fresh verification nothing new), the PR gets a `clean` verdict on the same head, with no new commit, and [`--yolo`](#yolo) merges it. The repair comment says `cause=not-clean`. A repair that still ends `not-clean` counts as an attempt: a new head is repaired again on a later look, up to `limits.maxRepairs`; the same head is never repaired twice, so then repair gives up and the PR is `phat-mode:stuck`.
 
 Repair never overrides you. It leaves a PR alone when:
 

@@ -288,6 +288,37 @@ describe('why a pull request is stuck', () => {
       assert.equal(whyStuck({ status: status({ checks: [['test', 'running']] }), comments }, options).kind, 'wait');
     });
 
+    describe('not clean', () => {
+      const notClean = () => status({ verdict: { verdict: 'not-clean', sha: SHA, reason: 'code review has open findings' } });
+
+      test('a repair that pushed a new head that is still not clean: repaired again, as the next repair', () => {
+        const outcome = whyStuck({ status: notClean(), comments: [repaired(1, 'aaa', 1, 'not-clean')] }, options);
+        assert.equal(outcome.kind, 'repair');
+        assert.deepEqual(outcome.kind === 'repair' && [outcome.cause, outcome.n, outcome.round], ['not-clean', 2, 1]);
+      });
+
+      test('a repair that ended not clean on the same head: gives up, never twice on one head', () => {
+        assert.deepEqual(whyStuck({ status: notClean(), comments: [repaired(1, SHA, 1, 'not-clean')] }, options), {
+          kind: 'give_up',
+          cause: 'not-clean',
+          reason: `gave up: a repair already ran on ${SHA}`,
+          head: SHA,
+          round: 1,
+        });
+      });
+
+      test('maxRepairs heads repaired and still not clean: gives up', () => {
+        const comments = [repaired(1, 'aaa', 1, 'not-clean'), repaired(2, 'bbb', 1, 'not-clean'), repaired(3, 'ccc', 1, 'not-clean')];
+        assert.deepEqual(whyStuck({ status: notClean(), comments }, options), {
+          kind: 'give_up',
+          cause: 'not-clean',
+          reason: 'gave up: 3 repairs spent',
+          head: SHA,
+          round: 1,
+        });
+      });
+    });
+
     test('only phat-mode’s own comments count: a stranger’s forged marker is ignored', async () => {
       const github = new FakeGitHub();
       const pr = github.addPullRequest({ branch: 'phat-mode/issue-7' });

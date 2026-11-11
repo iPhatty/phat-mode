@@ -42,7 +42,6 @@ import {
   giveUpMarker,
   lookAtPullRequest,
   type RepairCause,
-  REPAIRED_CAUSES,
   repairHistory,
   repairMarker,
   rerunMarker,
@@ -50,7 +49,7 @@ import {
 } from './stuck.ts';
 import { askForReport, failureGuard, type OnPhase, perRepo, phasesWith, type Services, StepFailure } from './task-kit.ts';
 import { scratchFor } from './workspace.ts';
-import { readYoloMarker } from './yolo.ts';
+import { readYoloMarker, verificationWasTheReason } from './yolo.ts';
 
 /**
  * Repair: a durable run on one of phat-mode's own open pull requests that is stuck, ending in a new verdict or a
@@ -67,11 +66,13 @@ import { readYoloMarker } from './yolo.ts';
  * `prepare` posts the repair's comment (which counts it), resets the issue's workspace to the pull request's head and
  * starts fresh conversations. Then the build's finishing steps (src/build-steps.ts): for conflicts entered at `update`,
  * where the base branch is merged in and conflicts go to the implementer; for failed checks at `implement`, with the
- * failures and the diagnosis. Check, review, verify, describe and publish run again. A failure in any of them goes to
+ * failures and the diagnosis; for not clean at `review`, a fresh code review of the head against its base (and a fresh
+ * verification before any fix, when verification was the verdict's reason), whose must-fix findings alone go to the
+ * implementer, with a fresh `maxReviewRounds`. Check, review, verify, describe and publish run again. A failure in any of them goes to
  * `fail`, and then `give-up`, which labels the pull request `phat-mode:stuck` with a summary and fails the issue.
  * Before it starts work, merges, publishes or gives up (also after a resume) it checks again that no human acted on the
  * pull request, and stops if one did; it only pushes over the head it started from. Repair handles conflicts (and a
- * branch behind its base where GitHub requires it up to date) and failed checks.
+ * branch behind its base where GitHub requires it up to date), failed checks, and not clean.
  */
 
 export const REPAIR_TASK = 'phat.repair';
@@ -242,7 +243,10 @@ function repoPhases(services: Services) {
   const steps = buildSteps<RepairResult>(services, {
     published: async ({ number, url, head, verdict }: Published): Promise<RepairResult> => {
       const judged = verdict.verdict === 'clean' ? 'verdict clean' : `verdict not clean (${verdict.reason})`;
-      await recordOutcome(number, `repaired: pushed ${shortSha(head)}, ${judged}`);
+      // A not clean pull request whose fresh review found nothing to fix keeps its head: only the verdict is new.
+      const attempt = repairHistory(await github.phatModeComments(number)).attempts.at(-1);
+      const pushed = attempt?.sha === head ? 'no new commit' : `pushed ${shortSha(head)}`;
+      await recordOutcome(number, `repaired: ${pushed}, ${judged}`);
       return { status: 'repaired', url };
     },
     guard: {
@@ -270,7 +274,7 @@ function repoPhases(services: Services) {
         now: new Date(),
         baseBranch: config.baseBranch,
       });
-      if (outcome.kind === 'give_up' && REPAIRED_CAUSES.includes(outcome.cause)) {
+      if (outcome.kind === 'give_up') {
         logger.step(number, `Repair: ${outcome.reason}`);
         await go(
           runtime,
@@ -287,7 +291,7 @@ function repoPhases(services: Services) {
         );
         return;
       }
-      if (outcome.kind !== 'repair' || !REPAIRED_CAUSES.includes(outcome.cause)) {
+      if (outcome.kind !== 'repair') {
         logger.step(number, `Not repairing ${pr.url}: ${outcome.reason}`);
         await finish(runtime, { status: 'ignored', reason: outcome.reason }, context);
         return;
@@ -509,6 +513,9 @@ function repoPhases(services: Services) {
         plan,
         departures,
       });
+      // Not clean: the base the head is reviewed against, saved with the entry, so `update` can tell a merge of a newer
+      // base apart, even one made just before a crash, and send it through check, review and verify.
+      const base = target.cause === 'not-clean' ? await workspaces.base(workspace) : undefined;
       await runtime.commit(async (tx) => {
         const conversations = await createConversations(tx, {
           taskId: runtime.taskId,
@@ -543,6 +550,23 @@ function repoPhases(services: Services) {
             runs: 1,
             baseline: 0,
             prompt: fixFailedChecksPrompt(checks.failures, checks.diagnosis, config.checkCommand),
+          };
+          return { status: 'running', checkpoint: entry };
+        }
+        // Not clean: the steps' `review` entry, with what `steps.start` adds for it (the first round, and baselines of
+        // no reports, as the conversations are new), here in the same transaction as the conversations. The original
+        // run's findings are not trusted: a fresh review comes first, and a fresh verification too when verification was
+        // the reason. Nothing is checked first: check runs once the implementer changes something.
+        if (target.cause === 'not-clean') {
+          const { unchecked: _unchecked, ...reviewing } = work;
+          const verdict = readYoloMarker(body);
+          const entry: BuildStepsState = {
+            ...reviewing,
+            base: base!,
+            phase: 'review',
+            reviewRounds: 1,
+            baseline: { standards: 0, spec: 0 },
+            ...(verdict?.verdict === 'not-clean' && verificationWasTheReason(verdict.reason) ? { verifyFirst: true as const } : {}),
           };
           return { status: 'running', checkpoint: entry };
         }
