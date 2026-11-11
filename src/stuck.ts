@@ -17,10 +17,10 @@ export type RepairCause = 'conflicts' | 'checks' | 'not-clean';
 const CAUSES: readonly RepairCause[] = ['conflicts', 'checks', 'not-clean'];
 
 /**
- * The causes repair handles so far. Failed checks and not clean are reported as stuck, but those pull requests wait as
- * before, until repair handles them.
+ * The causes repair handles so far. Not clean is reported as stuck, but those pull requests wait as before, until
+ * repair handles them.
  */
-export const REPAIRED_CAUSES: readonly RepairCause[] = ['conflicts'];
+export const REPAIRED_CAUSES: readonly RepairCause[] = ['conflicts', 'checks'];
 
 /** One repair, as its comment's marker records it. `round`: repairs since the last give-up are in the same round. */
 export type RepairMarker = { n: number; sha: string; cause: RepairCause; round: number };
@@ -46,6 +46,54 @@ const GIVE_UP = /<!-- phat-mode:repair-gave-up round=(\d+) -->/;
 export function readGiveUpMarker(body: string): number | undefined {
   const match = GIVE_UP.exec(body);
   return match === null ? undefined : Number(match[1]);
+}
+
+/**
+ * The marker on the comment repair posts when it reruns a head's failed GitHub Actions jobs: once per head, and not a
+ * repair, so it spends no attempt.
+ */
+export const rerunMarker = (sha: string) => `<!-- phat-mode:rerun sha=${sha} -->`;
+
+const RERUN = /<!-- phat-mode:rerun sha=([0-9a-f]+) -->/;
+
+/** The head a rerun marker names; undefined if there is none. */
+export function readRerunMarker(body: string): string | undefined {
+  return RERUN.exec(body)?.[1];
+}
+
+/** Why diagnose judged that failed checks are not this change's: they fail on the base branch too, or are flaky. */
+export type BaseRedCause = 'base-red' | 'flaky';
+const BASE_RED_CAUSES: readonly BaseRedCause[] = ['base-red', 'flaky'];
+
+/**
+ * A head whose failed checks are not this change's, and the base branch's head when diagnose said so: repair waits,
+ * spending no attempt, until the base branch moves on.
+ */
+export type BaseRed = { head: string; base: string; cause: BaseRedCause };
+
+export const baseRedMarker = ({ head, base, cause }: BaseRed) => `<!-- phat-mode:base-red head=${head} base=${base} cause=${cause} -->`;
+
+const BASE_RED = /<!-- phat-mode:base-red head=([0-9a-f]+) base=([0-9a-f]+) cause=([a-z-]+) -->/;
+
+export function readBaseRedMarker(body: string): BaseRed | undefined {
+  const match = BASE_RED.exec(body);
+  if (match === null || !BASE_RED_CAUSES.includes(match[3] as BaseRedCause)) return undefined;
+  return { head: match[1]!, base: match[2]!, cause: match[3] as BaseRedCause };
+}
+
+/** The newest base-red marker for `head`, if any. */
+const baseRedFor = (comments: readonly PostedComment[], head: string) =>
+  comments.flatMap((comment) => {
+    const marker = readBaseRedMarker(comment.body);
+    return marker?.head === head ? [marker] : [];
+  }).at(-1);
+
+/** Why repair waits on a head diagnose judged base red or flaky, e.g. `ci/test fails on main too`. */
+export function baseRedReason(cause: BaseRedCause, failed: readonly string[], baseBranch: string): string {
+  const names = failed.join(', ');
+  return cause === 'base-red'
+    ? `${names} ${failed.length === 1 ? 'fails' : 'fail'} on ${baseBranch} too`
+    : `${names} failed, judged flaky: waiting for ${baseBranch} to move on`;
 }
 
 /** A repair comment and its marker. */
@@ -79,8 +127,11 @@ export function attemptsOf(comments: readonly PostedComment[], round: number): A
   });
 }
 
-/** What GitHub says about a pull request, and the comments phat-mode posted on it (the `gh` user's only). */
-export type StuckFacts = { status: PullRequestStatus; comments: readonly PostedComment[] };
+/**
+ * What GitHub says about a pull request, and the comments phat-mode posted on it (the `gh` user's only). `baseHead`: the
+ * base branch's head commit, when a base-red marker holds the pull request's head.
+ */
+export type StuckFacts = { status: PullRequestStatus; comments: readonly PostedComment[]; baseHead?: string };
 
 export type StuckOptions = { maxRepairs: number; now: Date; baseBranch: string };
 
@@ -89,17 +140,20 @@ export type StuckOptions = { maxRepairs: number; now: Date; baseBranch: string }
  * - leave: not phat-mode's to repair (no verdict, or a human pushed commits);
  * - paused: a human requested changes after phat-mode's last push;
  * - stuck: labelled `phat-mode:stuck`, waiting for a human;
- * - wait: checks are running or the head has not settled;
- * - repair: stuck by `cause`, with budget left: repair `n` of `round`, on `head`;
- * - give_up: stuck by `cause`, and the budget is spent or this head was repaired already;
+ * - wait: checks are running, the head has not settled, failed jobs were just rerun, or its failed checks are not
+ *   this change's (base red or flaky) and the base branch has not moved on since; `onWaitingLine`: watch says why;
+ * - repair: stuck by `cause`, with budget left: repair `n` of `round`, on `head`; `rerun`: failed checks whose GitHub
+ *   Actions jobs were not rerun on this head yet, which repair does first; `giveUp`: for failed checks, the budget is
+ *   spent or this head was repaired already, so repair gives up if diagnose finds the change caused them;
+ * - give_up: stuck by `cause` (not failed checks), and the budget is spent or this head was repaired already;
  * - not_stuck.
  */
 export type StuckOutcome =
   | { kind: 'leave'; reason: string }
   | { kind: 'paused'; reason: string }
   | { kind: 'stuck'; reason: string }
-  | { kind: 'wait'; reason: string; settlesAt?: Date }
-  | { kind: 'repair'; cause: RepairCause; reason: string; head: string; n: number; round: number }
+  | { kind: 'wait'; reason: string; settlesAt?: Date; onWaitingLine?: true }
+  | { kind: 'repair'; cause: RepairCause; reason: string; head: string; n: number; round: number; rerun?: true; giveUp?: string }
   | { kind: 'give_up'; cause: RepairCause; reason: string; head: string; round: number }
   | { kind: 'not_stuck'; reason: string };
 
@@ -135,25 +189,56 @@ export function whyLeftAlone(
 }
 
 /** Why a pull request is stuck, decided from GitHub alone. */
-export function whyStuck({ status, comments }: StuckFacts, { maxRepairs, now, baseBranch }: StuckOptions): StuckOutcome {
+export function whyStuck({ status, comments, baseHead }: StuckFacts, { maxRepairs, now, baseBranch }: StuckOptions): StuckOutcome {
   const left = whyLeftAlone(status);
   if (left !== undefined) return left;
   const verdict = readYoloMarker(status.body)!;
   // 6–10: what is wrong, if anything.
   const stuck = causeOf(status, verdict, now, baseBranch);
   if (stuck.kind !== 'stuck') return stuck;
+  const head = status.head.sha;
+  let rerun = false;
+  if (stuck.cause === 'checks') {
+    // A rerun spends no attempt; until its checks show up as running, GitHub may still report the old failures.
+    const reran = comments.filter((comment) => readRerunMarker(comment.body) === head).at(-1);
+    if (reran !== undefined) {
+      const settlesAt = new Date(Date.parse(reran.createdAt) + SETTLE_MS);
+      if (now < settlesAt) return { kind: 'wait', reason: `rerunning failed jobs (until ${clock(settlesAt)})`, settlesAt };
+    }
+    rerun = reran === undefined;
+    // Not this change's failures: wait, without spending an attempt or giving up, until the base branch moves on.
+    const red = baseRedFor(comments, head);
+    if (red !== undefined && red.base === baseHead) {
+      const failed = status.checks.filter((check) => check.state === 'failed').map((check) => check.name);
+      return { kind: 'wait', reason: baseRedReason(red.cause, failed, baseBranch), onWaitingLine: true };
+    }
+  }
   // 5. The budget: only for a pull request that is stuck.
   const { round, attempts } = repairHistory(comments);
   const { cause } = stuck;
-  if (attempts.some((attempt) => attempt.sha === status.head.sha)) {
-    return { kind: 'give_up', cause, reason: `gave up: a repair already ran on ${status.head.sha}`, head: status.head.sha, round };
-  }
   const spent = new Set(attempts.map((attempt) => attempt.sha)).size;
-  if (spent >= maxRepairs) {
-    return { kind: 'give_up', cause, reason: `gave up: ${spent} repair${spent === 1 ? '' : 's'} spent`, head: status.head.sha, round };
-  }
+  const exhausted = attempts.some((attempt) => attempt.sha === head)
+    ? `gave up: a repair already ran on ${head}`
+    : spent >= maxRepairs
+      ? `gave up: ${spent} repair${spent === 1 ? '' : 's'} spent`
+      : undefined;
   const n = Math.max(0, ...attempts.map((attempt) => attempt.n)) + 1;
-  return { kind: 'repair', cause, reason: stuck.reason, head: status.head.sha, n, round };
+  // Failed checks still get their rerun and diagnosis, which spend no attempt: the budget applies only once diagnose
+  // finds the change caused them, and then `giveUp` says why repair gives up instead.
+  if (cause === 'checks') {
+    return {
+      kind: 'repair',
+      cause,
+      reason: stuck.reason,
+      head,
+      n,
+      round,
+      ...(rerun ? { rerun: true as const } : {}),
+      ...(exhausted === undefined ? {} : { giveUp: exhausted }),
+    };
+  }
+  if (exhausted !== undefined) return { kind: 'give_up', cause, reason: exhausted, head, round };
+  return { kind: 'repair', cause, reason: stuck.reason, head, n, round };
 }
 
 /** Rules 6–10: conflicts, not clean, still waiting, failed checks, or nothing wrong. */
@@ -182,10 +267,13 @@ function causeOf(
 
 /** Read what `whyStuck` needs of pull request `pr` from GitHub, and decide. */
 export async function lookAtPullRequest(
-  github: Pick<GitHub, 'pullRequestStatus' | 'phatModeComments'>,
+  github: Pick<GitHub, 'pullRequestStatus' | 'phatModeComments' | 'commitChecks'>,
   pr: { number: number },
   options: StuckOptions,
 ): Promise<StuckOutcome> {
   const [status, comments] = await Promise.all([github.pullRequestStatus(pr.number), github.phatModeComments(pr.number)]);
-  return whyStuck({ status, comments }, options);
+  // The base branch's head only matters while a base-red marker holds this head.
+  const baseHead =
+    baseRedFor(comments, status.head.sha) === undefined ? undefined : (await github.commitChecks(options.baseBranch)).sha;
+  return whyStuck({ status, comments, ...(baseHead === undefined ? {} : { baseHead }) }, options);
 }

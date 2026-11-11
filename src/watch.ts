@@ -33,7 +33,10 @@ export type WatchStep =
   /** Nothing can start. `waiting`: why each ready or `agent-mode` issue cannot, one line each. */
   | { kind: 'idle'; waiting: string[] };
 
-/** `repair`: why repair leaves it alone (paused by a review, or `phat-mode:stuck`), when it does. */
+/**
+ * `repair`: why repair leaves it alone (paused by a review, `phat-mode:stuck`, or failed checks that are not this
+ * change's), when it does.
+ */
 export type WaitingPullRequest = { issue: number; url: string; notMerging?: { needsYou: boolean; reason: string }; repair?: string };
 
 
@@ -70,7 +73,8 @@ export async function nextStep(
   }
 
   // 1. Repair comes first: the lowest issue whose pull request is stuck in a way repair handles. Why repair leaves one
-  //    alone (a review paused it, or it is phat-mode:stuck) goes on that pull request's waiting line.
+  //    alone (a review paused it, it is phat-mode:stuck, or its failed checks fail on the base branch too or are flaky)
+  //    goes on that pull request's waiting line. Waiting for checks takes no run.
   const open = (await github.openPullRequests())
     .flatMap((pr) => {
       const match = PR_BRANCH.exec(pr.branch);
@@ -88,7 +92,9 @@ export async function nextStep(
       if ((outcome.kind === 'repair' || outcome.kind === 'give_up') && REPAIRED_CAUSES.includes(outcome.cause)) {
         return { kind: 'repair', issue: pr.issue, url: pr.url, reason: outcome.reason };
       }
-      if (outcome.kind === 'paused' || outcome.kind === 'stuck') repairNotes.set(pr.issue, outcome.reason);
+      if (outcome.kind === 'paused' || outcome.kind === 'stuck' || (outcome.kind === 'wait' && outcome.onWaitingLine)) {
+        repairNotes.set(pr.issue, outcome.reason);
+      }
     }
   }
 

@@ -23,6 +23,16 @@ const stdin = () => fs.readFileSync(0, 'utf8');
 const [a, b, c] = args;
 const path = args.find((arg) => arg.startsWith('repos/')) ?? '';
 if (a === 'api' && b === 'user') process.stdout.write(state.viewer + '\\n');
+else if (a === 'api' && /\\/commits\\/[^/]+$/.test(path) && flag('--jq') === '.sha') process.stdout.write(state.commits[path.split('/').pop()] + '\\n');
+else if (a === 'api' && args.includes('--slurp') && path.includes('/check-runs')) {
+  log({ checkRuns: path });
+  process.stdout.write(JSON.stringify(state.checkRunPages));
+} else if (a === 'api' && path.endsWith('/status') || a === 'api' && path.includes('/status?')) {
+  log({ status: path });
+  process.stdout.write(JSON.stringify({ statuses: state.statuses }));
+} else if (a === 'api' && path.endsWith('/logs')) process.stdout.write(state.logs[path.split('/')[5]]);
+else if (a === 'api' && flag('--method') === 'POST' && path.endsWith('/rerun-failed-jobs')) log({ rerun: path });
+else if (a === 'api' && /\\/actions\\/runs\\/\\d+$/.test(path) && flag('--jq') === '.run_attempt') process.stdout.write(state.attempts[path.split('/').pop()] + '\\n');
 else if (a === 'api' && args.includes('--slurp') && path.includes('/sub_issues?')) {
   log({ subIssues: path });
   process.stdout.write(JSON.stringify(state.subIssuePages));
@@ -88,10 +98,15 @@ async function gitHubWith(state: {
   blockedBy?: Record<string, { number: number; state: string }[]>;
   issueStates?: Record<string, 'open' | 'closed'>;
   subIssuePages?: { number: number; title: string; state: string }[][];
+  commits?: Record<string, string>;
+  checkRunPages?: { check_runs: unknown[] }[];
+  statuses?: unknown[];
+  logs?: Record<string, string>;
+  attempts?: Record<string, number>;
 }) {
   await writeFile(
     join(dir, 'state.json'),
-    JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], views: {}, issues: [], ids: {}, parents: {}, blockedBy: {}, issueStates: {}, subIssuePages: [], ...state }),
+    JSON.stringify({ viewer: 'iPhatty', prs: [], comments: [], labels: [], views: {}, issues: [], ids: {}, parents: {}, blockedBy: {}, issueStates: {}, subIssuePages: [], commits: {}, checkRunPages: [], statuses: [], logs: {}, attempts: {}, ...state }),
   );
   await writeFile(join(dir, 'log.jsonl'), '');
 }
@@ -206,6 +221,85 @@ describe('GhGitHub, on a public repo', () => {
         { name: 'ci/red', state: 'failed' },
       ],
     });
+  });
+
+  test('commitChecks: a branch or sha’s commit, with every check run and status, each with its description, link, and Actions job', async () => {
+    const actions = (id: number, name: string, status: string, conclusion: string | null, output = { title: null as string | null, summary: null as string | null }) => ({
+      id,
+      name,
+      status,
+      conclusion,
+      details_url: `https://github.com/iPhatty/phat-mode/actions/runs/77/job/${id}`,
+      html_url: `https://github.com/iPhatty/phat-mode/runs/${id}`,
+      app: { slug: 'github-actions' },
+      output,
+    });
+    await gitHubWith({
+      commits: { main: 'f00d' },
+      checkRunPages: [
+        { check_runs: [actions(11, 'test', 'completed', 'failure', { title: 'Process completed with exit code 1.', summary: 'ignored' }), actions(12, 'lint', 'completed', 'success')] },
+        {
+          check_runs: [
+            actions(13, 'build', 'in_progress', null),
+            {
+              id: 99,
+              name: 'codecov',
+              status: 'completed',
+              conclusion: 'failure',
+              details_url: null,
+              html_url: 'https://codecov.test/99',
+              app: { slug: 'codecov' },
+              output: { title: null, summary: 'Coverage dropped' },
+            },
+          ],
+        },
+      ],
+      statuses: [
+        { context: 'ci/legacy', state: 'success', description: 'All good', target_url: 'https://ci.test/1' },
+        { context: 'ci/pending', state: 'pending', description: null, target_url: null },
+        { context: 'ci/broken', state: 'error', description: 'Could not start', target_url: 'https://ci.test/3' },
+        { context: 'ci/red', state: 'failure', description: 'Tests failed', target_url: 'https://ci.test/4' },
+      ],
+    });
+    assert.deepEqual(await github.commitChecks('main'), {
+      sha: 'f00d',
+      checks: [
+        {
+          name: 'test',
+          state: 'failed',
+          description: 'Process completed with exit code 1.',
+          url: 'https://github.com/iPhatty/phat-mode/actions/runs/77/job/11',
+          job: { id: 11, runId: 77 },
+        },
+        { name: 'lint', state: 'passed', description: '', url: 'https://github.com/iPhatty/phat-mode/actions/runs/77/job/12', job: { id: 12, runId: 77 } },
+        { name: 'build', state: 'running', description: '', url: 'https://github.com/iPhatty/phat-mode/actions/runs/77/job/13', job: { id: 13, runId: 77 } },
+        { name: 'codecov', state: 'failed', description: 'Coverage dropped', url: 'https://codecov.test/99' },
+        { name: 'ci/legacy', state: 'passed', description: 'All good', url: 'https://ci.test/1' },
+        { name: 'ci/pending', state: 'running', description: '', url: '' },
+        { name: 'ci/broken', state: 'failed', description: 'Could not start', url: 'https://ci.test/3' },
+        { name: 'ci/red', state: 'failed', description: 'Tests failed', url: 'https://ci.test/4' },
+      ],
+    });
+    // The checks of the commit itself, every page of them.
+    assert.deepEqual(await writes(), [
+      { checkRuns: 'repos/iPhatty/phat-mode/commits/f00d/check-runs?per_page=100' },
+      { status: 'repos/iPhatty/phat-mode/commits/f00d/status?per_page=100' },
+    ]);
+  });
+
+  test('jobLog: the full log of an Actions job', async () => {
+    await gitHubWith({ logs: { '11': 'line 1\nline 2\n' } });
+    assert.equal(await github.jobLog(11), 'line 1\nline 2\n');
+  });
+
+  test('rerunFailedJobs: asks GitHub to rerun the failed jobs of one workflow run', async () => {
+    await github.rerunFailedJobs(77);
+    assert.deepEqual(await writes(), [{ rerun: 'repos/iPhatty/phat-mode/actions/runs/77/rerun-failed-jobs' }]);
+  });
+
+  test('runAttempt: a workflow run’s attempt, one more after each rerun', async () => {
+    await gitHubWith({ attempts: { '77': 2 } });
+    assert.equal(await github.runAttempt(77), 2);
   });
 
   test('a pull request’s mergeability, merge state, labels and reviews, with each review’s author, state and time', async () => {

@@ -10,9 +10,9 @@ export type ModelChoice = {
   thinkingLevel: ThinkingLevel;
 };
 
-/** The agents phat-mode runs. */
-export type Role = 'plan' | 'implement' | 'review' | 'verify' | 'grill' | 'shape';
-export const ROLES: readonly Role[] = ['plan', 'implement', 'review', 'verify', 'grill', 'shape'];
+/** The agents phat-mode runs. `diagnose`: Repair's read-only agent that works out why checks failed. */
+export type Role = 'plan' | 'implement' | 'review' | 'verify' | 'grill' | 'shape' | 'diagnose';
+export const ROLES: readonly Role[] = ['plan', 'implement', 'review', 'verify', 'grill', 'shape', 'diagnose'];
 
 export type Labels = {
   needsTriage: string;
@@ -63,7 +63,7 @@ export type MachineConfig = {
    * request to be merged is not a run. Per process: two watches each have their own.
    */
   maxParallelRuns: number;
-  /** Whether `phat-mode watch` repairs its own stuck pull requests (conflicts with the base branch). Default: true. */
+  /** Whether `phat-mode watch` repairs its own stuck pull requests (conflicts with the base branch, failed checks). Default: true. */
   repair: boolean;
   /** Repos `phat-mode watch` works on ("owner/name"), when none are named on the command line. */
   repos: string[];

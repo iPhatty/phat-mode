@@ -115,6 +115,7 @@ export const STANDING_SKILLS: Record<Agent, readonly StandingSkill[]> = {
   standards: [],
   spec: [],
   verify: [],
+  diagnose: [],
 };
 
 const standingCache = new Map<Agent, Promise<PinnedSkill[]>>();

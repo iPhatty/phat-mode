@@ -419,12 +419,38 @@ const REPAIR_CAUSES: Record<string, string> = {
 };
 
 /** The comment of one repair on the pull request; its `Outcome` line is updated as the repair ends. */
-export function repairComment(repair: { n: number; maxRepairs: number; reason: string; cause: string; outcome: string }): string {
+export function repairComment(repair: {
+  n: number;
+  maxRepairs: number;
+  reason: string;
+  cause: string;
+  outcome: string;
+  /** For failed checks: what diagnose found. */
+  diagnosis?: string;
+}): string {
   return `🤖 **phat-mode repair ${repair.n} of ${repair.maxRepairs}** on this pull request.
 
 **What failed:** ${item(repair.reason)}
 **Cause:** ${REPAIR_CAUSES[repair.cause] ?? repair.cause}
-**Outcome:** ${item(repair.outcome)}`;
+${repair.diagnosis === undefined ? '' : `**Diagnosis:** ${item(repair.diagnosis)}\n`}**Outcome:** ${item(repair.outcome)}`;
+}
+
+/** On the pull request, when repair reruns its failed GitHub Actions jobs: not a repair, and only once per head. */
+export function rerunComment(head: string, jobs: readonly string[]): string {
+  return `🤖 **phat-mode reran the failed jobs** on ${shortSha(head)}: ${jobs.map((job) => `\`${job}\``).join(', ')}.
+
+This is not a repair and spends none. phat-mode repairs the pull request only if they fail again.`;
+}
+
+/** On the pull request, when diagnose finds its failed checks are not this change's: repair waits for the base branch. */
+export function baseRedComment(options: { head: string; base: string; baseBranch: string; cause: 'base-red' | 'flaky'; reason: string }): string {
+  const why =
+    options.cause === 'base-red'
+      ? `The failed checks fail on \`${options.baseBranch}\` too (at ${shortSha(options.base)}), so this change did not cause them.`
+      : 'The failed checks look flaky: they fail now and then, whatever the change.';
+  return `🤖 **phat-mode is not repairing** ${shortSha(options.head)}: ${item(options.reason)}
+
+${why} No repair is spent. phat-mode looks again once \`${options.baseBranch}\` moves on.`;
 }
 
 const OUTCOME_LINE = /^\*\*Outcome:\*\* (.*)$/m;

@@ -5,7 +5,7 @@ import type { CheckState } from '../src/github.ts';
 import { silentLogger } from '../src/log.ts';
 import { MARKER_SHAPE_REFUSED } from '../src/spec.ts';
 import { describeStep, MARKER_HANDED_BACK, MARKER_PARENT_CLOSED, nextStep } from '../src/watch.ts';
-import { repairMarker } from '../src/stuck.ts';
+import { baseRedMarker, repairMarker } from '../src/stuck.ts';
 import { yoloMarker, type YoloVerdict } from '../src/yolo.ts';
 import { FakeGitHub, testConfig } from './fakes.ts';
 
@@ -293,17 +293,51 @@ describe('watch, repair', () => {
     assert.match(describeStep(waiting), /^Waiting for you to merge #2: .* \(not merging: .*\) \(phat-mode:stuck: waiting for you\)$/);
   });
 
-  test('failed checks and not clean are not repaired yet: they wait as today', async () => {
+  test('failed checks, once settled, are repaired; not clean still waits as today', async () => {
     const github = repo({ 2: {}, 3: {} });
-    const failed = judged(github, 2, 'clean', [{ name: 'test', state: 'failed' }]);
-    const findings = judged(github, 3, { verdict: 'not-clean', sha: 'cafe3', reason: 'code review has open findings' });
+    const findings = judged(github, 2, { verdict: 'not-clean', sha: 'cafe2', reason: 'code review has open findings' });
+    const failed = judged(github, 3, 'clean', [{ name: 'ci/test', state: 'failed' }]);
+    assert.deepEqual(await step(github), { kind: 'repair', issue: 3, url: failed.url, reason: 'checks failed: ci/test' });
+    github.statuses.get(failed.number)!.checks = [{ name: 'ci/test', state: 'passed' }];
     assert.deepEqual(await step(github), {
       kind: 'wait_for_merge',
       prs: [
-        { issue: 2, url: failed.url },
-        { issue: 3, url: findings.url },
+        { issue: 2, url: findings.url },
+        { issue: 3, url: failed.url },
       ],
     });
+  });
+
+  test('checks still running, or the head not settled: it waits, with no repair to start', async () => {
+    const github = repo({ 2: {} });
+    const pr = judged(github, 2, 'clean', [{ name: 'ci/test', state: 'failed' }, { name: 'ci/e2e', state: 'running' }]);
+    assert.deepEqual(await step(github), { kind: 'wait_for_merge', prs: [{ issue: 2, url: pr.url }] });
+    github.statuses.get(pr.number)!.checks = [{ name: 'ci/test', state: 'failed' }];
+    github.statuses.get(pr.number)!.head.committedAt = new Date().toISOString();
+    assert.deepEqual(await step(github), { kind: 'wait_for_merge', prs: [{ issue: 2, url: pr.url }] });
+  });
+
+  test('checks that fail on main too: it waits, saying why, until main moves on', async () => {
+    const github = repo({ 2: {} });
+    const pr = judged(github, 2, 'clean', [{ name: 'ci/test', state: 'failed' }]);
+    github.commits.set('main', { sha: 'ba5e1', checks: [{ name: 'ci/test', state: 'failed', description: '', url: '' }] });
+    await github.upsertComment(pr.number, baseRedMarker({ head: 'cafe2', base: 'ba5e1', cause: 'base-red' }), 'Fails on main too.');
+    const waiting = await step(github);
+    assert.deepEqual(waiting, { kind: 'wait_for_merge', prs: [{ issue: 2, url: pr.url, repair: 'ci/test fails on main too' }] });
+    assert.equal(describeStep(waiting), `Waiting for you to merge #2: ${pr.url} (ci/test fails on main too)`);
+    github.commits.set('main', { sha: 'ba5e2', checks: [] });
+    assert.deepEqual(await step(github), { kind: 'repair', issue: 2, url: pr.url, reason: 'checks failed: ci/test' });
+  });
+
+  test('judged flaky: the waiting line says it waits for main to move on', async () => {
+    const github = repo({ 2: {} });
+    const pr = judged(github, 2, 'clean', [{ name: 'ci/test', state: 'failed' }]);
+    await github.upsertComment(pr.number, baseRedMarker({ head: 'cafe2', base: 'ba5e1', cause: 'flaky' }), 'Flaky.');
+    github.commits.set('main', { sha: 'ba5e1', checks: [] });
+    assert.equal(
+      describeStep(await step(github)),
+      `Waiting for you to merge #2: ${pr.url} (ci/test failed, judged flaky: waiting for main to move on)`,
+    );
   });
 
   test('not phat-mode’s to repair: another branch, human commits, or no verdict', async () => {
