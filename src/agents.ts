@@ -28,7 +28,12 @@ export const AGENTS: readonly BuildAgent[] = ['plan', 'implement', 'standards', 
  */
 export type ShapeAgent = 'answer' | 'question';
 export const SHAPE_AGENTS: readonly ShapeAgent[] = ['answer', 'question'];
-export type Agent = BuildAgent | ShapeAgent;
+/**
+ * Repair's own agent: the read-only diagnoser, which works out why checks failed on a pull request (`diagnose` model).
+ * Not a build agent, so a build never creates its conversation.
+ */
+export type RepairAgent = 'diagnose';
+export type Agent = BuildAgent | ShapeAgent | RepairAgent;
 export const modelRole = (agent: Agent): Role =>
   agent === 'standards' || agent === 'spec'
     ? 'review'
@@ -194,6 +199,14 @@ export type TicketsReport = {
   tickets: { title: string; whatToBuild: string; acceptanceCriteria: string[]; blockedBy: number[] }[];
 };
 
+/**
+ * Why checks failed on a pull request, as the diagnose agent judged it. this-change: this change caused it; base-red:
+ * the same check fails on the base branch; flaky: it fails now and then, whatever the change; out-of-reach: no code
+ * change can fix it (secrets, external services, permissions).
+ */
+export type DiagnosisCause = 'this-change' | 'base-red' | 'flaky' | 'out-of-reach';
+export type DiagnosisReport = { cause: DiagnosisCause; reason: string; detail: string };
+
 export type Report =
   | { type: 'plan'; data: PlanReport }
   | { type: 'triage'; data: TriageReport }
@@ -205,7 +218,8 @@ export type Report =
   | { type: 'pr'; data: PrReport }
   | { type: 'standards'; data: StandardsReport }
   | { type: 'spec'; data: SpecReport }
-  | { type: 'verification'; data: VerificationReport };
+  | { type: 'verification'; data: VerificationReport }
+  | { type: 'diagnosis'; data: DiagnosisReport };
 
 /** Each report's data, by its type. */
 export type ReportData = { [T in Report['type']]: Extract<Report, { type: T }>['data'] };
@@ -598,6 +612,30 @@ export const reportVerification = defineTool({
   },
 });
 
+export const reportDiagnosis = defineTool({
+  name: 'report_diagnosis',
+  description: 'Report why the checks failed. Call this exactly once, as your final action. Your turn ends when you call it.',
+  parameters: Type.Object({
+    cause: StringEnum(['this-change', 'base-red', 'flaky', 'out-of-reach'], {
+      description:
+        'this-change: the pull request\'s change caused the failure, and a code change in it can fix it. ' +
+        'base-red: the same check fails on the base branch too, so the change did not cause it. ' +
+        'flaky: it fails now and then whatever the change (timing, network, a flaky test). ' +
+        'out-of-reach: no code change can fix it: missing secrets, an external service, permissions.',
+    }),
+    reason: Type.String({ description: 'One line: why, e.g. "ci/test fails on main too".' }),
+    detail: Type.String({
+      description: 'For the implementer: what failed and why, with the failing tests, files and lines you found. Markdown.',
+    }),
+  }),
+  execute: async (args, api, context) => {
+    await api.commit(async (tx) => {
+      (await tx.doc(ReportsDoc, api.conversationId)).items.push({ type: 'diagnosis', data: { ...args } as DiagnosisReport });
+    }, context);
+    return recorded('Diagnosis recorded.');
+  },
+});
+
 export const tools = {
   read: createReadTool(),
   bash: createBashTool(),
@@ -605,7 +643,10 @@ export const tools = {
   edit: createEditTool(),
 };
 
-/** The tools each role may use. Only the implementer can change files; shaping's agents only read and run commands. */
+/**
+ * The tools each role may use. Only the implementer can change files; shaping's agents and Repair's diagnoser only read
+ * and run commands.
+ */
 export const ROLE_TOOLS: Record<Agent, ToolRegistration[]> = {
   answer: [tools.read, tools.bash, reportTriage, reportAnswers, reportShapeSpec, reportTickets],
   question: [tools.read, tools.bash, reportQuestions],
@@ -614,6 +655,7 @@ export const ROLE_TOOLS: Record<Agent, ToolRegistration[]> = {
   standards: [tools.read, tools.bash, reportStandards],
   spec: [tools.read, tools.bash, reportSpec],
   verify: [tools.read, tools.bash, reportVerification],
+  diagnose: [tools.read, tools.bash, reportDiagnosis],
 };
 
 let logger: Logger = consoleLogger;
@@ -665,5 +707,5 @@ export const guardFor = (repo?: string) =>
 
 export const Tools: Extension = defineExtension({
   name: 'phat.tools',
-  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportTriage, reportQuestions, reportAnswers, reportShapeSpec, reportTickets, reportDone, reportPr, reportStandards, reportSpec, reportVerification],
+  tools: [tools.read, tools.bash, tools.write, tools.edit, reportPlan, reportTriage, reportQuestions, reportAnswers, reportShapeSpec, reportTickets, reportDone, reportPr, reportStandards, reportSpec, reportVerification, reportDiagnosis],
 });

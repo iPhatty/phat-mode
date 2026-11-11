@@ -52,6 +52,22 @@ export type PullRequestStatus = {
 
 export type Mergeable = 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
 
+/**
+ * A check on a commit, with what describes it: a check run (GitHub Actions or another app) or a commit status.
+ * `description`: its title or summary (a check run) or description (a status); `url`: where to read more. `job`: set
+ * only for a GitHub Actions job, whose log can be fetched and whose run can be rerun.
+ */
+export type CheckDetail = {
+  name: string;
+  state: CheckState;
+  description: string;
+  url: string;
+  job?: { id: number; runId: number };
+};
+
+/** A commit (as its sha, from a branch name or a sha) and every check on it. */
+export type CommitChecks = { sha: string; checks: CheckDetail[] };
+
 /** A review of a pull request. `state`: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED or PENDING. */
 export type Review = { author: string; state: string; submittedAt: string };
 
@@ -175,6 +191,14 @@ export interface GitHub {
    * so closing again after a crash never posts it twice.
    */
   closeIssue(issue: number, marker: string, body: string): Promise<void>;
+  /** The commit `ref` (a branch name or a sha) is at, and every check run and commit status on it. */
+  commitChecks(ref: string): Promise<CommitChecks>;
+  /** The full log of a GitHub Actions job. */
+  jobLog(jobId: number): Promise<string>;
+  /** Rerun the failed jobs of a GitHub Actions workflow run. */
+  rerunFailedJobs(runId: number): Promise<void>;
+  /** A GitHub Actions workflow run's attempt: 1, and one more for each rerun. */
+  runAttempt(runId: number): Promise<number>;
 }
 
 /** A native sub-issue as listed under its parent. */
@@ -214,6 +238,38 @@ function checkState(check: RolledUpCheck): { name: string; state: CheckState } {
   }
   const state = check.state === 'SUCCESS' ? 'passed' : ['PENDING', 'EXPECTED'].includes(check.state) ? 'running' : 'failed';
   return { name: check.context, state };
+}
+
+/** A check run, as the REST API lists it for a commit. */
+type RestCheckRun = {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  details_url: string | null;
+  html_url: string | null;
+  app: { slug: string } | null;
+  output: { title: string | null; summary: string | null } | null;
+};
+
+/** A commit status, as the REST API's combined status lists it. */
+type RestStatus = { context: string; state: string; description: string | null; target_url: string | null };
+
+/** An Actions job's details URL: `…/actions/runs/<run>/job/<job>`. */
+const ACTIONS_JOB = /\/actions\/runs\/(\d+)\/job\/(\d+)/;
+
+function checkRunDetail(run: RestCheckRun): CheckDetail {
+  const state =
+    run.status !== 'completed' ? 'running' : PASSED_CONCLUSIONS.includes((run.conclusion ?? '').toUpperCase()) ? 'passed' : 'failed';
+  const url = run.details_url || run.html_url || '';
+  const detail: CheckDetail = { name: run.name, state, description: run.output?.title || run.output?.summary || '', url };
+  const job = run.app?.slug === 'github-actions' ? ACTIONS_JOB.exec(url) : null;
+  return job === null ? detail : { ...detail, job: { id: Number(job[2]), runId: Number(job[1]) } };
+}
+
+function statusDetail(status: RestStatus): CheckDetail {
+  const state = status.state === 'success' ? 'passed' : status.state === 'pending' ? 'running' : 'failed';
+  return { name: status.context, state, description: status.description ?? '', url: status.target_url ?? '' };
 }
 
 /**
@@ -475,6 +531,35 @@ export class GhGitHub implements GitHub {
   async closeIssue(issue: number, marker: string, body: string): Promise<void> {
     await this.upsertComment(issue, marker, body);
     await this.#gh(['issue', 'close', String(issue), '-R', this.#repo, '--reason', 'completed']);
+  }
+
+  async commitChecks(ref: string): Promise<CommitChecks> {
+    const sha = (await this.#gh(['api', `repos/${this.#repo}/commits/${ref}`, '--jq', '.sha'])).trim();
+    const pages = JSON.parse(
+      await this.#gh(['api', '--paginate', '--slurp', `repos/${this.#repo}/commits/${sha}/check-runs?per_page=100`]),
+    ) as { check_runs: RestCheckRun[] }[];
+    const combined = JSON.parse(await this.#gh(['api', `repos/${this.#repo}/commits/${sha}/status?per_page=100`])) as {
+      statuses: RestStatus[] | null;
+    };
+    return {
+      sha,
+      checks: [...pages.flatMap((page) => page.check_runs.map(checkRunDetail)), ...(combined.statuses ?? []).map(statusDetail)],
+    };
+  }
+
+  async jobLog(jobId: number): Promise<string> {
+    // GitHub answers with a redirect to the log, which the CLI follows.
+    return this.#gh(['api', `repos/${this.#repo}/actions/jobs/${jobId}/logs`]);
+  }
+
+  async rerunFailedJobs(runId: number): Promise<void> {
+    await this.#gh(['api', '--method', 'POST', `repos/${this.#repo}/actions/runs/${runId}/rerun-failed-jobs`]);
+  }
+
+  async runAttempt(runId: number): Promise<number> {
+    const attempt = Number((await this.#gh(['api', `repos/${this.#repo}/actions/runs/${runId}`, '--jq', '.run_attempt'])).trim());
+    if (!Number.isInteger(attempt) || attempt <= 0) throw new Error(`No attempt for workflow run ${runId}`);
+    return attempt;
   }
 
   /** Create the labels that are missing (never edit existing ones). Says which it created and which it could not. */

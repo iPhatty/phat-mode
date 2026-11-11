@@ -35,6 +35,8 @@ export function describeResult(result: PipelineResult | ShapingResult | RepairRe
         return `🔧 Repaired: ${repair.url}`;
       case 'stuck':
         return `🛑 Gave up on ${repair.url}: ${repair.reason.replace(/\.$/, '')}. It is labelled ${PROGRESS_LABELS.stuck.name}; remove the label to let phat-mode repair it again.`;
+      case 'waiting':
+        return `⏳ Waiting: ${repair.url}: ${repair.reason}. No repair spent.`;
     }
   }
   if (isShaping(taskKind)) {

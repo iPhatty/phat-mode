@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, test } from 'node:test';
-import { defaultMachineConfig, loadMachineConfig, modelFor, parseRepoSettings, repoConfig } from '../src/config.ts';
+import { defaultMachineConfig, loadMachineConfig, modelFor, parseRepoSettings, repoConfig, ROLES } from '../src/config.ts';
 
 const dirs: string[] = [];
 after(async () => {
@@ -69,6 +69,17 @@ describe('models', () => {
     assert.deepEqual(modelFor(config, 'shape'), { ...opus, thinkingLevel: 'high' });
     const followed = await withConfig({ models: { grill: null } });
     assert.deepEqual(modelFor(followed, 'grill'), opus);
+  });
+
+  test('repair: diagnose follows defaultModel, can be overridden, and is a role doctor lists', async () => {
+    assert.ok(ROLES.includes('diagnose'));
+    assert.deepEqual(modelFor(defaultMachineConfig('/tmp/unused'), 'diagnose'), opus);
+    const changed = await withConfig({ defaultModel: { modelId: 'claude-sonnet-5.5' } });
+    assert.deepEqual(modelFor(changed, 'diagnose'), { ...opus, modelId: 'claude-sonnet-5.5' });
+    const own = await withConfig({ models: { diagnose: { modelId: 'x', thinkingLevel: 'high' } } });
+    assert.deepEqual(modelFor(own, 'diagnose'), { ...opus, modelId: 'x', thinkingLevel: 'high' });
+    const followed = await withConfig({ models: { diagnose: null } });
+    assert.deepEqual(modelFor(followed, 'diagnose'), opus);
   });
 
   test('other settings keep their defaults when config.json sets only models', async () => {

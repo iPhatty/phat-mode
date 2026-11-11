@@ -1,5 +1,5 @@
 import { branchFor, type Config, defaultMachineConfig, repoConfig } from '../src/config.ts';
-import type { GitHub, Issue, LabelChange, PullRequest, PullRequestState, PullRequestStatus, SubIssue } from '../src/github.ts';
+import type { CommitChecks, GitHub, Issue, LabelChange, PullRequest, PullRequestState, PullRequestStatus, SubIssue } from '../src/github.ts';
 
 /** What a test sets of a pull request's status: its head and checks; mergeability and reviews when they matter. */
 export type FakeStatus = Omit<PullRequestStatus, 'body' | 'labels' | 'mergeable' | 'mergeState' | 'reviews'> &
@@ -217,6 +217,30 @@ export class FakeGitHub implements GitHub {
       // As the real one: a blocker whose phat-mode pull request has merged is finished, however long GitHub takes to close its issue.
       .filter((n) => this.prs.filter((pr) => pr.branch === branchFor(n)).at(-1)?.state !== 'MERGED')
       .sort();
+  }
+  /** Commits by ref (a branch name or a sha): the sha it is at and its checks. Any other ref is a commit with no checks. */
+  commits = new Map<string, CommitChecks>();
+  async commitChecks(ref: string) {
+    return structuredClone(this.commits.get(ref) ?? { sha: ref, checks: [] });
+  }
+  /** Actions job logs, by job id; a job without one fails to fetch, as GitHub does once logs expire. */
+  jobLogs = new Map<number, string>();
+  async jobLog(jobId: number) {
+    const log = this.jobLogs.get(jobId);
+    if (log === undefined) throw new Error(`gh api exited with 1: HTTP 410: Gone (job ${jobId})`);
+    return log;
+  }
+  /** Workflow runs whose failed jobs were rerun, in order. */
+  reruns: number[] = [];
+  async rerunFailedJobs(runId: number) {
+    this.writes++;
+    this.reruns.push(runId);
+    this.runAttempts.set(runId, (this.runAttempts.get(runId) ?? 1) + 1);
+  }
+  /** Workflow runs' attempts, by run id: 1 unless rerun. */
+  runAttempts = new Map<number, number>();
+  async runAttempt(runId: number) {
+    return this.runAttempts.get(runId) ?? 1;
   }
   async editLabels(number: number, change: LabelChange) {
     this.writes++;
